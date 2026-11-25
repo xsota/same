@@ -2,9 +2,11 @@ use anyhow::{anyhow, Context, Result};
 use same_acp::exec::{build_command, ExecTarget};
 use same_core::{EventBus, ProviderConfig, SameEvent, ToolCallRecord, ToolCallStatus};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Child;
 use tokio::sync::oneshot;
 
 /// Collects a command line so it can be launched in any [`ExecTarget`].
@@ -21,6 +23,86 @@ impl ArgList {
     }
 }
 
+/// Sends `prompt` to the child's stdin and closes it, so the CLI sees the
+/// end of input. Written in the background: a large prompt must not block
+/// reading the child's output. The returned handle resolves to any I/O error
+/// so the caller can surface incomplete writes when the child exits zero.
+fn write_prompt_to_stdin(child: &mut Child, prompt: &str) -> Result<tokio::task::JoinHandle<Result<()>>> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture agent stdin"))?;
+    let prompt = prompt.to_string();
+    Ok(tokio::spawn(async move {
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .context("Failed to write prompt to agent stdin")?;
+        stdin
+            .shutdown()
+            .await
+            .context("Failed to close agent stdin")?;
+        Ok(())
+    }))
+}
+
+/// Lines of stderr kept to explain a failed run.
+const STDERR_TAIL_LINES: usize = 20;
+
+/// How one `claude -p` process ended.
+enum ClaudeRun {
+    Completed,
+    Cancelled,
+    Failed {
+        code: Option<i32>,
+        /// `errors` of an `is_error` result line.
+        errors: Vec<String>,
+        stderr_tail: Vec<String>,
+        /// True if the turn already emitted assistant output or tool activity.
+        did_work: bool,
+    },
+}
+
+impl ClaudeRun {
+    /// Claude Code could not find the conversation passed to `--resume`
+    /// (deleted, or created in another directory or environment) before doing
+    /// any work on this turn.
+    fn is_missing_conversation(&self, resume_id: &str) -> bool {
+        match self {
+            ClaudeRun::Failed {
+                errors,
+                stderr_tail,
+                did_work: false,
+                ..
+            } => errors
+                .iter()
+                .chain(stderr_tail)
+                .any(|l| l.contains("No conversation found") && l.contains(resume_id)),
+            _ => false,
+        }
+    }
+}
+
+/// Builds the user-facing error of a failed run, with the reason Claude
+/// Code gave.
+fn claude_failure_message(code: Option<i32>, errors: &[String], stderr_tail: &[String]) -> String {
+    let mut msg = format!("Claude CLI exited with status {}", code.unwrap_or(-1));
+    let detail: Vec<&str> = if errors.is_empty() {
+        stderr_tail
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect()
+    } else {
+        errors.iter().map(String::as_str).collect()
+    };
+    if !detail.is_empty() {
+        msg.push_str(": ");
+        msg.push_str(&detail.join("\n"));
+    }
+    msg
+}
+
 pub async fn run_claude_cli(
     provider: &ProviderConfig,
     session_id: &str,
@@ -34,6 +116,75 @@ pub async fn run_claude_cli(
     events: EventBus,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
+    let mut resume = external_session_id.filter(|s| !s.trim().is_empty());
+    loop {
+        let run = run_claude_once(
+            provider,
+            session_id,
+            resume,
+            model,
+            effort,
+            cwd,
+            target,
+            prompt,
+            auto_approve,
+            &events,
+            &mut cancel_rx,
+        )
+        .await?;
+        match run {
+            ClaudeRun::Completed => {
+                events.publish(SameEvent::SessionCompleted {
+                    session_id: session_id.to_string(),
+                    stop_reason: Some("end_turn".to_string()),
+                });
+                return Ok(());
+            }
+            ClaudeRun::Cancelled => {
+                events.publish(SameEvent::SessionCancelled {
+                    session_id: session_id.to_string(),
+                });
+                return Ok(());
+            }
+            ref failed
+                if resume.is_some_and(|id| failed.is_missing_conversation(id)) =>
+            {
+                // The stored conversation is gone: start a fresh one. Its
+                // new id replaces the stale one through ExternalSessionBound.
+                events.publish(SameEvent::AgentLog {
+                    session_id: Some(session_id.to_string()),
+                    provider_id: provider.id.clone(),
+                    line: format!(
+                        "Conversation {} not found; starting a new Claude session",
+                        resume.unwrap_or_default()
+                    ),
+                });
+                resume = None;
+            }
+            ClaudeRun::Failed {
+                code,
+                errors,
+                stderr_tail,
+                ..
+            } => return Err(anyhow!(claude_failure_message(code, &errors, &stderr_tail))),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_claude_once(
+    provider: &ProviderConfig,
+    session_id: &str,
+    resume: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    cwd: &Path,
+    target: &ExecTarget,
+    prompt: &str,
+    auto_approve: bool,
+    events: &EventBus,
+    cancel_rx: &mut oneshot::Receiver<()>,
+) -> Result<ClaudeRun> {
     let mut cmd = ArgList::new(&provider.args);
     cmd.arg("-p")
         .arg("--output-format")
@@ -49,13 +200,14 @@ pub async fn run_claude_cli(
     if let Some(e) = effort.filter(|s| !s.trim().is_empty()) {
         cmd.arg("--effort").arg(e);
     }
-    if let Some(ext) = external_session_id.filter(|s| !s.trim().is_empty()) {
+    if let Some(ext) = resume {
         cmd.arg("--resume").arg(ext);
     }
 
-    cmd.arg(prompt);
+    // The prompt goes through stdin: as an argument, text starting with
+    // `-` would be parsed as an option.
     let mut cmd = build_command(target, &provider.command, &cmd.0, cwd, &provider.env).await;
-    cmd.stdin(Stdio::null())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -63,6 +215,7 @@ pub async fn run_claude_cli(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn '{}'", provider.command))?;
+    let stdin_task = write_prompt_to_stdin(&mut child, prompt)?;
 
     let stdout = child
         .stdout
@@ -73,33 +226,39 @@ pub async fn run_claude_cli(
         .take()
         .ok_or_else(|| anyhow!("Failed to capture Claude stderr"))?;
 
-    {
+    let stderr_tail_buf = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    let mut stderr_task = {
         let events = events.clone();
         let sid = session_id.to_string();
         let pid = provider.id.clone();
+        let tail_buf = stderr_tail_buf.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
+                {
+                    let mut tail = tail_buf.lock().unwrap();
+                    if tail.len() == STDERR_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line.clone());
+                }
                 events.publish(SameEvent::AgentLog {
                     session_id: Some(sid.clone()),
                     provider_id: pid.clone(),
                     line,
                 });
             }
-        });
-    }
+        })
+    };
 
     let mut lines = BufReader::new(stdout).lines();
-    let mut emitted_any_text = false;
+    let mut state = ClaudeStreamState::default();
 
     loop {
         tokio::select! {
-            _ = &mut cancel_rx => {
+            _ = &mut *cancel_rx => {
                 let _ = child.kill().await;
-                events.publish(SameEvent::SessionCancelled {
-                    session_id: session_id.to_string(),
-                });
-                return Ok(());
+                return Ok(ClaudeRun::Cancelled);
             }
             line_res = lines.next_line() => {
                 match line_res? {
@@ -109,7 +268,7 @@ pub async fn run_claude_cli(
                             continue;
                         }
                         if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                            handle_claude_json(&val, session_id, &events, &mut emitted_any_text);
+                            handle_claude_json(&val, session_id, events, &mut state);
                         } else {
                             events.publish(SameEvent::AgentLog {
                                 session_id: Some(session_id.to_string()),
@@ -125,25 +284,45 @@ pub async fn run_claude_cli(
     }
 
     let status = child.wait().await?;
-    if !status.success() {
-        return Err(anyhow!(
-            "Claude CLI exited with status {}",
-            status.code().unwrap_or(-1)
-        ));
+    // Give stderr a brief moment to drain after the child exits, without
+    // hanging indefinitely if a background subprocess inherited the pipe.
+    if tokio::time::timeout(std::time::Duration::from_millis(200), &mut stderr_task)
+        .await
+        .is_err()
+    {
+        stderr_task.abort();
     }
+    let stderr_tail: Vec<String> = stderr_tail_buf.lock().unwrap().iter().cloned().collect();
+    // An error result with a zero exit still failed the turn.
+    if !status.success() || state.is_error || !state.errors.is_empty() {
+        return Ok(ClaudeRun::Failed {
+            code: status.code(),
+            errors: state.errors,
+            stderr_tail,
+            did_work: state.did_work,
+        });
+    }
+    if let Ok(Err(err)) = stdin_task.await {
+        return Err(err);
+    }
+    Ok(ClaudeRun::Completed)
+}
 
-    events.publish(SameEvent::SessionCompleted {
-        session_id: session_id.to_string(),
-        stop_reason: Some("end_turn".to_string()),
-    });
-    Ok(())
+/// What a `stream-json` run has reported so far.
+#[derive(Default)]
+struct ClaudeStreamState {
+    emitted_any_text: bool,
+    did_work: bool,
+    is_error: bool,
+    /// `errors` of an `is_error` result line.
+    errors: Vec<String>,
 }
 
 fn handle_claude_json(
     val: &Value,
     session_id: &str,
     events: &EventBus,
-    emitted_any_text: &mut bool,
+    state: &mut ClaudeStreamState,
 ) {
     if let Some(ext_id) = val.get("session_id").and_then(Value::as_str) {
         if !ext_id.is_empty() {
@@ -167,7 +346,8 @@ fn handle_claude_json(
                     match btype {
                         "text" => {
                             if let Some(text) = block.get("text").and_then(Value::as_str) {
-                                *emitted_any_text = true;
+                                state.emitted_any_text = true;
+                                state.did_work = true;
                                 events.publish(SameEvent::MessageDelta {
                                     session_id: session_id.to_string(),
                                     text: text.to_string(),
@@ -176,6 +356,7 @@ fn handle_claude_json(
                         }
                         "thinking" => {
                             if let Some(t) = block.get("thinking").and_then(Value::as_str) {
+                                state.did_work = true;
                                 events.publish(SameEvent::ThinkingDelta {
                                     session_id: session_id.to_string(),
                                     text: t.to_string(),
@@ -183,6 +364,7 @@ fn handle_claude_json(
                             }
                         }
                         "tool_use" => {
+                            state.did_work = true;
                             let id = block
                                 .get("id")
                                 .and_then(Value::as_str)
@@ -258,10 +440,27 @@ fn handle_claude_json(
             }
         }
         "result" => {
-            if !*emitted_any_text {
+            if val.get("is_error").and_then(Value::as_bool) == Some(true) {
+                state.is_error = true;
+                if let Some(errs) = val.get("errors").and_then(Value::as_array) {
+                    state
+                        .errors
+                        .extend(errs.iter().filter_map(Value::as_str).map(str::to_string));
+                }
+                // A failed run's `result` is the error text, not a reply.
+                if state.errors.is_empty() {
+                    if let Some(res) = val.get("result").and_then(Value::as_str) {
+                        if !res.trim().is_empty() {
+                            state.errors.push(res.to_string());
+                        }
+                    }
+                }
+                return;
+            }
+            if !state.emitted_any_text {
                 if let Some(res) = val.get("result").and_then(Value::as_str) {
                     if !res.is_empty() {
-                        *emitted_any_text = true;
+                        state.emitted_any_text = true;
                         events.publish(SameEvent::MessageDelta {
                             session_id: session_id.to_string(),
                             text: res.to_string(),
@@ -306,9 +505,11 @@ pub async fn run_codex_cli(
         cmd.arg("-c").arg(format!("model_reasoning_effort=\"{e}\""));
     }
 
-    cmd.arg(prompt);
+    // `-` reads the prompt from stdin, so prompt text starting with `-` is
+    // never parsed as an option.
+    cmd.arg("-");
     let mut cmd = build_command(target, &provider.command, &cmd.0, cwd, &provider.env).await;
-    cmd.stdin(Stdio::null())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -316,6 +517,7 @@ pub async fn run_codex_cli(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn '{}'", provider.command))?;
+    let stdin_task = write_prompt_to_stdin(&mut child, prompt)?;
 
     let stdout = child
         .stdout
@@ -382,6 +584,9 @@ pub async fn run_codex_cli(
             "Codex CLI exited with status {}",
             status.code().unwrap_or(-1)
         ));
+    }
+    if let Ok(Err(err)) = stdin_task.await {
+        return Err(err);
     }
 
     events.publish(SameEvent::SessionCompleted {
@@ -544,8 +749,61 @@ fn summarize_tool_call(name: &str, input: Option<&Value>) -> String {
 
 #[cfg(test)]
 mod summarize_tests {
-    use super::summarize_tool_call;
+    use super::{
+        claude_failure_message, handle_claude_json, summarize_tool_call, ClaudeRun,
+        ClaudeStreamState,
+    };
+    use same_core::EventBus;
     use serde_json::json;
+
+    #[test]
+    fn claude_failure_message_prefers_result_errors() {
+        let msg = claude_failure_message(
+            Some(1),
+            &["No conversation found with session ID: x".into()],
+            &["noise".into()],
+        );
+        assert_eq!(
+            msg,
+            "Claude CLI exited with status 1: No conversation found with session ID: x"
+        );
+        let msg = claude_failure_message(Some(1), &[], &["".into(), "boom".into()]);
+        assert_eq!(msg, "Claude CLI exited with status 1: boom");
+        assert_eq!(
+            claude_failure_message(None, &[], &[]),
+            "Claude CLI exited with status -1"
+        );
+    }
+
+    #[test]
+    fn error_result_is_collected_not_shown_as_reply() {
+        let events = EventBus::default();
+        let mut state = ClaudeStreamState::default();
+        let val = serde_json::json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "errors": ["No conversation found with session ID: x"],
+        });
+        handle_claude_json(&val, "s", &events, &mut state);
+        assert!(!state.emitted_any_text);
+        let run = ClaudeRun::Failed {
+            code: Some(1),
+            errors: state.errors.clone(),
+            stderr_tail: vec![],
+            did_work: state.did_work,
+        };
+        assert!(state.is_error);
+        assert!(run.is_missing_conversation("x"));
+        assert!(!run.is_missing_conversation("other"));
+        let worked = ClaudeRun::Failed {
+            code: Some(1),
+            errors: state.errors,
+            stderr_tail: vec![],
+            did_work: true,
+        };
+        assert!(!worked.is_missing_conversation("x"));
+    }
 
     #[test]
     fn summarizes_common_tool_inputs() {
