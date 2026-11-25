@@ -424,17 +424,41 @@ impl AcpClient {
     }
 
     pub async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptResult> {
+        self.prompt_with_files(session_id, text, &[]).await
+    }
+
+    /// Sends `text` followed by one `resource_link` block per file.
+    /// `files` are paths as the agent sees them; resource links are part of
+    /// the baseline every ACP agent must accept.
+    pub async fn prompt_with_files(
+        &self,
+        session_id: &str,
+        text: &str,
+        files: &[String],
+    ) -> Result<PromptResult> {
+        let mut prompt = vec![json!({
+            "type": "text",
+            "text": text
+        })];
+        for path in files {
+            let name = if is_windows_path(path) {
+                path.rsplit(['/', '\\']).find(|s| !s.is_empty())
+            } else {
+                path.rsplit('/').find(|s| !s.is_empty())
+            }
+            .unwrap_or(path);
+            prompt.push(json!({
+                "type": "resource_link",
+                "uri": file_uri(path),
+                "name": name,
+            }));
+        }
         let val = self
             .request(
                 "session/prompt",
                 json!({
                     "sessionId": session_id,
-                    "prompt": [
-                        {
-                            "type": "text",
-                            "text": text
-                        }
-                    ]
+                    "prompt": prompt
                 }),
             )
             .await?;
@@ -923,5 +947,62 @@ rl.on('line', (line) => {
         assert!(saw_text);
         client.shutdown().await;
         Ok(())
+    }
+}
+
+fn is_windows_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || path.starts_with(r"\\")
+}
+
+/// A `file://` URI for an absolute Unix (`/home/x`), Windows (`C:\\x`), or
+/// UNC (`\\\\server\\share\\x`) path, percent-encoding everything but
+/// unreserved characters and `/`.
+pub fn file_uri(path: &str) -> String {
+    let encode = |s: &str, out: &mut String| {
+        for b in s.bytes() {
+            let c = b as char;
+            if c.is_ascii_alphanumeric() || "-._~/:".contains(c) {
+                out.push(c);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    };
+    if let Some(unc) = path.strip_prefix(r"\\") {
+        let mut out = String::from("file://");
+        encode(&unc.replace('\\', "/"), &mut out);
+        return out;
+    }
+    let mut p = if is_windows_path(path) {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
+    if !p.starts_with('/') {
+        p.insert(0, '/');
+    }
+    let mut out = String::from("file://");
+    encode(&p, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod file_uri_tests {
+    use super::file_uri;
+
+    #[test]
+    fn encodes_unix_and_windows_paths() {
+        assert_eq!(file_uri("/home/a b/x.png"), "file:///home/a%20b/x.png");
+        assert_eq!(file_uri(r"/tmp/a\b.txt"), "file:///tmp/a%5Cb.txt");
+        assert_eq!(
+            file_uri(r"C:\Users\me\メモ.txt"),
+            "file:///C:/Users/me/%E3%83%A1%E3%83%A2.txt"
+        );
+        assert_eq!(
+            file_uri(r"\\server\share\a b.txt"),
+            "file://server/share/a%20b.txt"
+        );
     }
 }

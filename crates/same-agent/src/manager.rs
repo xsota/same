@@ -1,4 +1,7 @@
-use crate::adapters::{run_claude_cli, run_codex_cli};
+use crate::adapters::{
+    claude_prompt_with_attachments, codex_prompt_with_attachments, is_image_path, run_claude_cli,
+    run_codex_cli,
+};
 use anyhow::{Context, Result};
 use same_acp::exec::{
     self, build_command, build_console_command, resolve_target, ConsoleScript, ExecPreference,
@@ -28,6 +31,9 @@ pub struct PromptRequest {
     pub effort: Option<String>,
     pub cwd: PathBuf,
     pub prompt: String,
+    /// Files attached to the prompt, as host paths. Each agent kind gets
+    /// them in its own form, converted to the paths its target sees.
+    pub attachments: Vec<PathBuf>,
     /// Where the project's agents should run (see [`ExecPreference`]).
     pub exec: ExecPreference,
 }
@@ -446,40 +452,70 @@ impl AgentManager {
                 .insert(sid.clone(), cancel_tx);
 
             let target = resolve_target(req.exec, &req.cwd).await;
-            let res = match req.provider.kind {
-                ProviderKind::Acp => manager.run_acp_prompt(req, target, cancel_rx).await,
-                ProviderKind::ClaudeCli => {
-                    run_claude_cli(
-                        &req.provider,
-                        &req.session_id,
-                        req.external_session_id.as_deref(),
-                        req.model.as_deref(),
-                        req.effort.as_deref(),
-                        &req.cwd,
-                        &target,
-                        &req.prompt,
-                        cli_auto_approve,
-                        manager.events.clone(),
-                        cancel_rx,
-                    )
-                    .await
-                }
-                ProviderKind::CodexCli => {
-                    run_codex_cli(
-                        &req.provider,
-                        &req.session_id,
-                        req.external_session_id.as_deref(),
-                        req.model.as_deref(),
-                        req.effort.as_deref(),
-                        &req.cwd,
-                        &target,
-                        &req.prompt,
-                        cli_auto_approve,
-                        manager.events.clone(),
-                        cancel_rx,
-                    )
-                    .await
-                }
+            let files_res: Result<Vec<String>> = req
+                .attachments
+                .iter()
+                .map(|p| {
+                    if p.to_str().is_none() {
+                        anyhow::bail!(
+                            "Attachment path is not valid UTF-8 and cannot be passed to the agent: {}",
+                            p.display()
+                        );
+                    }
+                    let translated = target.to_target_path(p);
+                    if let ExecTarget::Wsl { distro } = &target {
+                        if !translated.starts_with('/') {
+                            anyhow::bail!(
+                                "Attachment is not accessible from WSL distro '{distro}': {}",
+                                p.display()
+                            );
+                        }
+                    }
+                    Ok(translated)
+                })
+                .collect();
+            let res = match files_res {
+                Err(err) => Err(err),
+                Ok(files) => match req.provider.kind {
+                    ProviderKind::Acp => {
+                        manager.run_acp_prompt(req, target, files, cancel_rx).await
+                    }
+                    ProviderKind::ClaudeCli => {
+                        run_claude_cli(
+                            &req.provider,
+                            &req.session_id,
+                            req.external_session_id.as_deref(),
+                            req.model.as_deref(),
+                            req.effort.as_deref(),
+                            &req.cwd,
+                            &target,
+                            &claude_prompt_with_attachments(&req.prompt, &files),
+                            cli_auto_approve,
+                            manager.events.clone(),
+                            cancel_rx,
+                        )
+                        .await
+                    }
+                    ProviderKind::CodexCli => {
+                        let images: Vec<String> =
+                            files.iter().filter(|f| is_image_path(f)).cloned().collect();
+                        run_codex_cli(
+                            &req.provider,
+                            &req.session_id,
+                            req.external_session_id.as_deref(),
+                            req.model.as_deref(),
+                            req.effort.as_deref(),
+                            &req.cwd,
+                            &target,
+                            &codex_prompt_with_attachments(&req.prompt, &files),
+                            &images,
+                            cli_auto_approve,
+                            manager.events.clone(),
+                            cancel_rx,
+                        )
+                        .await
+                    }
+                },
             };
 
             manager.cancellers.lock().await.remove(&sid);
@@ -501,6 +537,7 @@ impl AgentManager {
         &self,
         req: PromptRequest,
         target: ExecTarget,
+        files: Vec<String>,
         mut cancel_rx: oneshot::Receiver<()>,
     ) -> Result<()> {
         let (client, acp_session_id, model_state) = self.ensure_acp_session(&req, target).await?;
@@ -509,7 +546,7 @@ impl AgentManager {
         self.apply_acp_effort(&req, &client, &acp_session_id, &model_state)
             .await;
 
-        let prompt_fut = client.prompt(&acp_session_id, &req.prompt);
+        let prompt_fut = client.prompt_with_files(&acp_session_id, &req.prompt, &files);
         tokio::pin!(prompt_fut);
 
         tokio::select! {
@@ -1034,6 +1071,7 @@ mod tests {
             effort: other_effort.clone(),
             cwd: cwd.clone(),
             prompt: String::new(),
+            attachments: Vec::new(),
             exec: ExecPreference::Auto,
         };
         let apply = |req: PromptRequest| {
@@ -1090,6 +1128,7 @@ mod tests {
                 effort: None,
                 cwd: dir.clone(),
                 prompt: "Reply with just the word OK.".to_string(),
+                attachments: Vec::new(),
                 exec: ExecPreference::Auto,
             });
             async move {

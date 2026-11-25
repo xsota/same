@@ -27,7 +27,10 @@ impl ArgList {
 /// end of input. Written in the background: a large prompt must not block
 /// reading the child's output. The returned handle resolves to any I/O error
 /// so the caller can surface incomplete writes when the child exits zero.
-fn write_prompt_to_stdin(child: &mut Child, prompt: &str) -> Result<tokio::task::JoinHandle<Result<()>>> {
+fn write_prompt_to_stdin(
+    child: &mut Child,
+    prompt: &str,
+) -> Result<tokio::task::JoinHandle<Result<()>>> {
     let mut stdin = child
         .stdin
         .take()
@@ -44,6 +47,48 @@ fn write_prompt_to_stdin(child: &mut Child, prompt: &str) -> Result<tokio::task:
             .context("Failed to close agent stdin")?;
         Ok(())
     }))
+}
+
+/// Whether an attachment is an image the agent can look at directly.
+pub fn is_image_path(path: &str) -> bool {
+    let ext = path
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    )
+}
+
+/// Appends attachments as Claude Code `@path` mentions, which it expands
+/// into the files' contents (images included). `paths` are in the agent's
+/// terms (see [`ExecTarget::to_target_path`]).
+pub fn claude_prompt_with_attachments(prompt: &str, paths: &[String]) -> String {
+    if paths.is_empty() {
+        return prompt.to_string();
+    }
+    let mentions: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            if p.contains(char::is_whitespace) {
+                format!("@\"{p}\"")
+            } else {
+                format!("@{p}")
+            }
+        })
+        .collect();
+    format!("{prompt}\n\n{}", mentions.join("\n"))
+}
+
+/// Appends the attachment paths for Codex, which reads files with its own
+/// tools; images are also passed with `--image`.
+pub fn codex_prompt_with_attachments(prompt: &str, paths: &[String]) -> String {
+    if paths.is_empty() {
+        return prompt.to_string();
+    }
+    let list: Vec<String> = paths.iter().map(|p| format!("- {p}")).collect();
+    format!("{prompt}\n\nAttached files:\n{}", list.join("\n"))
 }
 
 /// Lines of stderr kept to explain a failed run.
@@ -146,9 +191,7 @@ pub async fn run_claude_cli(
                 });
                 return Ok(());
             }
-            ref failed
-                if resume.is_some_and(|id| failed.is_missing_conversation(id)) =>
-            {
+            ref failed if resume.is_some_and(|id| failed.is_missing_conversation(id)) => {
                 // The stored conversation is gone: start a fresh one. Its
                 // new id replaces the stale one through ExternalSessionBound.
                 events.publish(SameEvent::AgentLog {
@@ -482,6 +525,7 @@ pub async fn run_codex_cli(
     cwd: &Path,
     target: &ExecTarget,
     prompt: &str,
+    images: &[String],
     auto_approve: bool,
     events: EventBus,
     mut cancel_rx: oneshot::Receiver<()>,
@@ -496,13 +540,20 @@ pub async fn run_codex_cli(
     cmd.arg("--json").arg("--skip-git-repo-check");
 
     if auto_approve {
-        cmd.arg("--full-auto");
+        // What `--full-auto` did before Codex removed it; a config override
+        // also works for `exec resume`, which has no `--sandbox` flag.
+        cmd.arg("-c").arg("sandbox_mode=\"workspace-write\"");
     }
     if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
         cmd.arg("-m").arg(m);
     }
     if let Some(e) = effort.filter(|s| !s.trim().is_empty()) {
         cmd.arg("-c").arg(format!("model_reasoning_effort=\"{e}\""));
+    }
+    // `--image=<path>`: the spaced form takes several values and would
+    // swallow the `-` below.
+    for img in images {
+        cmd.arg(format!("--image={img}"));
     }
 
     // `-` reads the prompt from stdin, so prompt text starting with `-` is

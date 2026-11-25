@@ -1,23 +1,26 @@
-use gpui_component::Selectable;
 use crate::i18n::t;
 use crate::theme::{
-    accent, accent_foreground, accent_text, apply_gpui_theme, default_font_size,
-    default_mono_font, default_ui_font, status_amber, status_green, status_red,
+    accent, accent_foreground, accent_text, apply_gpui_theme, default_font_size, default_mono_font,
+    default_ui_font, status_amber, status_green, status_red,
 };
 use crate::workspace_fs::{load_git_info, scan_directory, FileEntry, GitInfo};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
     actions, div, list, prelude::FluentBuilder as _, px, AnyElement, App, AppContext, ClickEvent,
-    ClipboardItem, Context, Div, ElementId, Entity, FocusHandle, Focusable, FollowMode, FontWeight,
-    Hsla, InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState, ParentElement,
-    PathPromptOptions, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    Subscription, Window,
+    ClipboardItem, Context, Div, ElementId, Entity, ExternalPaths, FocusHandle, Focusable,
+    FollowMode, FontWeight, Hsla, InteractiveElement, IntoElement, KeyBinding, ListAlignment,
+    ListState, ParentElement, PathPromptOptions, Render, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Subscription, Window,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::button::{Button, ButtonRounded, ButtonVariants as _};
+use gpui_component::input::{
+    Input, InputEvent, InputState, MoveDown, MoveUp, Textarea, TextareaState,
+};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::notification::Notification;
+use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarMode};
 use gpui_component::text::TextView;
+use gpui_component::Selectable;
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
     TitleBar, WindowExt as _,
@@ -28,21 +31,44 @@ use same_agent::{
 };
 use same_core::paths::simplify_path;
 use same_core::{
-    AccentColor, AppConfig, AppPaths, EventBus, ExecMode, Language, Message, MessageRole, ModelInfo,
-    SubmitKey, MAX_FONT_SIZE, MIN_FONT_SIZE,
-    PermissionRequest, Project, ProviderConfig, ProviderKind, Quest, SameEvent, Session,
-    SessionStatus, SlashCommandInfo, Storage, ThemeMode, ToolCallRecord, ToolCallStatus, Workspace,
+    AccentColor, AppConfig, AppPaths, EventBus, ExecMode, Language, Message, MessageRole,
+    ModelInfo, PermissionRequest, Project, ProviderConfig, ProviderKind, Quest, SameEvent, Session,
+    SessionStatus, SlashCommandInfo, Storage, SubmitKey, ThemeMode, ToolCallRecord, ToolCallStatus,
+    Workspace, MAX_FONT_SIZE, MIN_FONT_SIZE,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Removes the `📎 \`name\`` line that [`SameAppView::send_current_prompt`]
+/// appends to a stored prompt with attachments.
+fn strip_attachment_note(content: &str) -> &str {
+    match content.rsplit_once("\n\n") {
+        Some((text, last)) if last.starts_with("📎 `") => text,
+        _ if content.starts_with("📎 `") => "",
+        _ => content,
+    }
+}
+
+/// The file name shown for an attachment.
+fn attachment_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
 use uuid::Uuid;
 
 actions!(
     same,
-    [NewSession, SaveFile, FocusPrompt, ToggleRightPanel, SendPrompt]
+    [
+        NewSession,
+        SaveFile,
+        FocusPrompt,
+        ToggleRightPanel,
+        SendPrompt
+    ]
 );
 
 /// Registers the application-wide keyboard shortcuts.
@@ -215,6 +241,11 @@ pub struct SameAppView {
     // Chat
     prompt_input: Entity<TextareaState>,
     prompt_empty: bool,
+    /// Files attached to the next prompt (host paths).
+    attachments: Vec<PathBuf>,
+    /// The earlier prompt recalled with Up: (index from the newest, its
+    /// text). Browsing continues only while the input still shows it.
+    history_recall: Option<(usize, String)>,
     /// The prompt is a `/command` being typed: show suggestions.
     prompt_is_command: bool,
     /// Virtualized chat feed: one item per stored message, plus a trailing
@@ -517,6 +548,8 @@ impl SameAppView {
             confirm_delete: None,
             prompt_input,
             prompt_empty: true,
+            attachments: Vec::new(),
+            history_recall: None,
             prompt_is_command: false,
             feed: {
                 let feed = ListState::new(0, ListAlignment::Top, px(1000.0));
@@ -721,6 +754,7 @@ impl SameAppView {
     fn select_session(&mut self, session_id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
             self.commit_rename(cx);
+            self.attachments.clear();
         }
         self.selected_session_id = Some(session_id);
         self.active_view = MainView::Chat;
@@ -784,6 +818,7 @@ impl SameAppView {
             self.quests.clear();
             self.sessions.clear();
             self.selected_session_id = None;
+            self.attachments.clear();
             self.messages.clear();
             self.file_entries.clear();
             self.git_info = GitInfo::default();
@@ -811,6 +846,7 @@ impl SameAppView {
             .is_some_and(|id| self.sessions.iter().any(|s| s.id == id));
         if !keep_selected {
             self.selected_session_id = self.sessions.first().map(|s| s.id.clone());
+            self.attachments.clear();
         }
 
         self.expanded_dirs.clear();
@@ -1081,6 +1117,7 @@ impl SameAppView {
         self.sessions.retain(|x| x.id != sid);
         if self.selected_session_id.as_deref() == Some(sid.as_str()) {
             self.selected_session_id = self.sessions.first().map(|x| x.id.clone());
+            self.attachments.clear();
             if self.selected_session_id.is_none() {
                 // Always keep a session to type into.
                 self.reload_project_state(window, cx);
@@ -1094,6 +1131,7 @@ impl SameAppView {
         self.selected_project_id = Some(pid);
         self.selected_quest_filter = None;
         self.selected_session_id = None;
+        self.attachments.clear();
         self.opened_file_path = None;
         self.file_dirty = false;
         self.active_view = MainView::Chat;
@@ -1944,11 +1982,11 @@ impl SameAppView {
     fn send_current_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let lang = self.config.language;
         let text = self.prompt_input.read(cx).value().trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
         // Local commands never reach the agent (and work while it runs).
-        if self.try_model_command(&text, window, cx) {
+        if !text.is_empty() && self.try_model_command(&text, window, cx) {
             return;
         }
         let Some(project) = self.current_project().cloned() else {
@@ -2004,9 +2042,17 @@ impl SameAppView {
         });
         self.prompt_empty = true;
         self.prompt_is_command = false;
+        let attachments = std::mem::take(&mut self.attachments);
+        let attachment_names: Vec<String> =
+            attachments.iter().map(|p| attachment_name(p)).collect();
 
         if session.title == DEFAULT_SESSION_TITLE {
-            let first_line = text.lines().next().unwrap_or("");
+            let first_line = text
+                .lines()
+                .next()
+                .map(str::to_string)
+                .unwrap_or_else(|| attachment_names.join(", "));
+            let first_line = first_line.as_str();
             let mut new_title: String = first_line.chars().take(40).collect();
             if first_line.chars().count() > 40 {
                 new_title.push('…');
@@ -2034,7 +2080,22 @@ impl SameAppView {
             id: Uuid::new_v4().to_string(),
             session_id: session.id.clone(),
             role: MessageRole::User,
-            content: text.clone(),
+            // Attachments are noted in the stored text; the agent gets the
+            // files themselves.
+            content: if attachment_names.is_empty() {
+                text.clone()
+            } else {
+                let list = attachment_names
+                    .iter()
+                    .map(|n| format!("📎 `{n}`"))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                if text.is_empty() {
+                    list
+                } else {
+                    format!("{text}\n\n{list}")
+                }
+            },
             thinking: None,
             tool_calls: vec![],
             provider_id: Some(provider.id.clone()),
@@ -2075,8 +2136,131 @@ impl SameAppView {
             effort: session.effort.clone().filter(|e| !e.trim().is_empty()),
             cwd: PathBuf::from(&project.workdir),
             prompt: full_prompt,
+            attachments,
             exec: self.exec_pref(),
         });
+    }
+
+    /// The current session's earlier prompts, newest first, without the
+    /// attachment note added when they were stored.
+    fn prompt_history(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for m in self.messages.iter().rev() {
+            if m.role != MessageRole::User {
+                continue;
+            }
+            let text = strip_attachment_note(&m.content).trim().to_string();
+            if text.is_empty() || out.last() == Some(&text) {
+                continue;
+            }
+            out.push(text);
+        }
+        out
+    }
+
+    /// Up / Down in the prompt: walks through earlier prompts, like a shell.
+    /// Starts only from an empty prompt, and only moves on while the input
+    /// still shows the recalled text with the cursor on its first (Up) or
+    /// last (Down) line, so ordinary editing of multi-line text keeps
+    /// working. Returns whether the key was used.
+    fn recall_prompt_history(
+        &mut self,
+        older: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (value, line) = {
+            let state = self.prompt_input.read(cx);
+            (
+                state.value().to_string(),
+                state.cursor_position().line as usize,
+            )
+        };
+        let browsing = self
+            .history_recall
+            .as_ref()
+            .filter(|(_, text)| *text == value)
+            .map(|(i, _)| *i);
+        if browsing.is_none() {
+            self.history_recall = None;
+        }
+        let last_line = value.split('\n').count().saturating_sub(1);
+        let next = if older {
+            if line != 0 || !(value.is_empty() || browsing.is_some()) {
+                return false;
+            }
+            browsing.map_or(0, |i| i + 1)
+        } else {
+            match browsing {
+                Some(i) if line == last_line => {
+                    if i == 0 {
+                        // Past the newest: back to an empty prompt.
+                        self.history_recall = None;
+                        self.set_prompt_text(String::new(), window, cx);
+                        return true;
+                    }
+                    i - 1
+                }
+                _ => return false,
+            }
+        };
+        let Some(text) = self.prompt_history().into_iter().nth(next) else {
+            return false;
+        };
+        self.history_recall = Some((next, text.clone()));
+        self.set_prompt_text(text, window, cx);
+        true
+    }
+
+    /// Replaces the prompt text, keeping the derived flags in sync.
+    fn set_prompt_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_empty = text.trim().is_empty();
+        self.prompt_is_command = text.starts_with('/') && !text.contains('\n');
+        self.prompt_input.update(cx, |ta, cx| {
+            ta.set_value(text, window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Opens the file picker and adds the chosen files to the next prompt.
+    fn pick_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lang = self.config.language;
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(t(lang, "添付", "Attach").into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(Ok(Some(paths))) => this.add_attachments(paths),
+                    Ok(Ok(None)) => {}
+                    _ => this.note(
+                        NoteKind::Warning,
+                        t(
+                            lang,
+                            "ファイル選択ダイアログを開けませんでした。ファイルを入力欄にドラッグ＆ドロップしてください",
+                            "Could not open the file picker. Drag and drop files onto the prompt instead",
+                        ),
+                    ),
+                }
+                this.prompt_input.update(cx, |ta, cx| ta.focus(window, cx));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Adds regular files to the next prompt, skipping directories and ones
+    /// already attached.
+    fn add_attachments(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for p in paths {
+            if p.is_file() && !self.attachments.contains(&p) {
+                self.attachments.push(p);
+            }
+        }
     }
 
     fn cancel_current(&mut self) {
@@ -2137,7 +2321,12 @@ impl SameAppView {
         self.save_config();
     }
 
-    fn set_accent(&mut self, accent_color: AccentColor, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_accent(
+        &mut self,
+        accent_color: AccentColor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.config.accent == accent_color {
             return;
         }
@@ -2277,9 +2466,7 @@ impl SameAppView {
                 let is_command = value.starts_with('/') && !value.contains('\n');
                 // Suggestions filter on every keystroke while a command is
                 // typed, so notify for those too.
-                if empty != self.prompt_empty
-                    || is_command
-                    || is_command != self.prompt_is_command
+                if empty != self.prompt_empty || is_command || is_command != self.prompt_is_command
                 {
                     self.prompt_empty = empty;
                     self.prompt_is_command = is_command;
@@ -2298,8 +2485,9 @@ impl SameAppView {
         }
         self.config.submit_key = key;
         self.save_config();
-        self.prompt_input
-            .update(cx, |ta, cx| ta.set_submit_on_enter(key == SubmitKey::Enter, cx));
+        self.prompt_input.update(cx, |ta, cx| {
+            ta.set_submit_on_enter(key == SubmitKey::Enter, cx)
+        });
         self.apply_placeholders(window, cx);
     }
 
@@ -3768,23 +3956,20 @@ impl SameAppView {
         let theme = cx.theme().clone();
         let lang = self.config.language;
 
-        let language_control = div()
-            .h_flex()
-            .gap_1()
-            .children([(Language::Ja, "日本語"), (Language::En, "English")].map(
-                |(value, label)| {
-                    Button::new(SharedString::from(format!("set-lang-{label}")))
-                        .small()
-                        .label(label)
-                        .toggled(self.config.language == value)
-                        .when(self.config.language == value, |b| b.primary())
-                        .when(self.config.language != value, |b| b.ghost())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.set_language(value, window, cx);
-                            cx.notify();
-                        }))
-                },
-            ));
+        let language_control = div().h_flex().gap_1().children(
+            [(Language::Ja, "日本語"), (Language::En, "English")].map(|(value, label)| {
+                Button::new(SharedString::from(format!("set-lang-{label}")))
+                    .small()
+                    .label(label)
+                    .toggled(self.config.language == value)
+                    .when(self.config.language == value, |b| b.primary())
+                    .when(self.config.language != value, |b| b.ghost())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_language(value, window, cx);
+                        cx.notify();
+                    }))
+            }),
+        );
 
         let view = cx.entity().downgrade();
         let default_id = self.config.default_provider_id.clone();
@@ -3835,32 +4020,37 @@ impl SameAppView {
             });
 
         let auto_approve = self.config.auto_approve_tools;
-        let auto_approve_control = div()
-            .h_flex()
-            .gap_1()
-            .children([(false, t(lang, "確認する", "Ask")), (true, t(lang, "自動承認", "Auto-approve"))].map(
-                |(value, label)| {
-                    Button::new(SharedString::from(format!("set-auto-approve-{value}")))
-                        .small()
-                        .label(label)
-                        .toggled(auto_approve == value)
-                        .when(auto_approve == value, |b| {
-                            if value {
-                                b.warning()
-                            } else {
-                                b.primary()
-                            }
-                        })
-                        .when(auto_approve != value, |b| b.ghost())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_auto_approve(value);
-                            cx.notify();
-                        }))
-                },
-            ));
+        let auto_approve_control = div().h_flex().gap_1().children(
+            [
+                (false, t(lang, "確認する", "Ask")),
+                (true, t(lang, "自動承認", "Auto-approve")),
+            ]
+            .map(|(value, label)| {
+                Button::new(SharedString::from(format!("set-auto-approve-{value}")))
+                    .small()
+                    .label(label)
+                    .toggled(auto_approve == value)
+                    .when(auto_approve == value, |b| {
+                        if value {
+                            b.warning()
+                        } else {
+                            b.primary()
+                        }
+                    })
+                    .when(auto_approve != value, |b| b.ghost())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_auto_approve(value);
+                        cx.notify();
+                    }))
+            }),
+        );
 
         let submit_key = self.config.submit_key;
-        let mod_key = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+        let mod_key = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
         let submit_key_control = div().h_flex().gap_1().children(
             [
                 (SubmitKey::Enter, "Enter".to_string()),
@@ -3960,79 +4150,80 @@ impl SameAppView {
         let theme = cx.theme().clone();
         let lang = self.config.language;
 
-        let mode_control = div()
-            .h_flex()
-            .gap_1()
-            .children(
-                [
-                    (ThemeMode::Dark, t(lang, "ダーク", "Dark")),
-                    (ThemeMode::Light, t(lang, "ライト", "Light")),
-                ]
-                .map(|(value, label)| {
-                    Button::new(SharedString::from(format!("set-theme-{label}")))
-                        .small()
-                        .label(label)
-                        .toggled(self.config.theme == value)
-                        .when(self.config.theme == value, |b| b.primary())
-                        .when(self.config.theme != value, |b| b.ghost())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.set_theme_mode(value, window, cx);
-                            cx.notify();
-                        }))
-                }),
-            );
-
-        let swatches = div()
-            .h_flex()
-            .flex_wrap()
-            .gap_2()
-            .children(AccentColor::ALL.into_iter().map(|value| {
-                let selected = self.config.accent == value;
-                let (ja, en) = value.label();
-                let color: Hsla = gpui::rgb(value.hex()).into();
-                Button::new(SharedString::from(format!("set-accent-{en}")))
-                    .ghost()
-                    .selected(selected)
-                    .toggled(selected)
-                    .h_auto()
-                    .w(px(76.0))
-                    .py_2()
-                    .rounded(px(8.0))
-                    .border_1()
-                    .border_color(if selected { color } else { theme.border })
-                    .child(
-                        div()
-                            .v_flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .size(px(28.0))
-                                    .rounded_full()
-                                    .bg(color)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_color(accent_foreground())
-                                    .when(selected, |el| el.child(Icon::new(IconName::Check).small())),
-                            )
-                            .child(div().text_xs().child(t(lang, ja, en))),
-                    )
+        let mode_control = div().h_flex().gap_1().children(
+            [
+                (ThemeMode::Dark, t(lang, "ダーク", "Dark")),
+                (ThemeMode::Light, t(lang, "ライト", "Light")),
+            ]
+            .map(|(value, label)| {
+                Button::new(SharedString::from(format!("set-theme-{label}")))
+                    .small()
+                    .label(label)
+                    .toggled(self.config.theme == value)
+                    .when(self.config.theme == value, |b| b.primary())
+                    .when(self.config.theme != value, |b| b.ghost())
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_accent(value, window, cx);
+                        this.set_theme_mode(value, window, cx);
                         cx.notify();
                     }))
-            }));
+            }),
+        );
+
+        let swatches =
+            div()
+                .h_flex()
+                .flex_wrap()
+                .gap_2()
+                .children(AccentColor::ALL.into_iter().map(|value| {
+                    let selected = self.config.accent == value;
+                    let (ja, en) = value.label();
+                    let color: Hsla = gpui::rgb(value.hex()).into();
+                    Button::new(SharedString::from(format!("set-accent-{en}")))
+                        .ghost()
+                        .selected(selected)
+                        .toggled(selected)
+                        .h_auto()
+                        .w(px(76.0))
+                        .py_2()
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(if selected { color } else { theme.border })
+                        .child(
+                            div()
+                                .v_flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .size(px(28.0))
+                                        .rounded_full()
+                                        .bg(color)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(accent_foreground())
+                                        .when(selected, |el| {
+                                            el.child(Icon::new(IconName::Check).small())
+                                        }),
+                                )
+                                .child(div().text_xs().child(t(lang, ja, en))),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_accent(value, window, cx);
+                            cx.notify();
+                        }))
+                }));
 
         let preview = div()
             .h_flex()
             .items_center()
             .gap_2()
-            .child(Button::new("accent-preview-primary").small().primary().label(t(
-                lang,
-                "プライマリ",
-                "Primary",
-            )))
+            .child(
+                Button::new("accent-preview-primary")
+                    .small()
+                    .primary()
+                    .label(t(lang, "プライマリ", "Primary")),
+            )
             .child(
                 div()
                     .text_xs()
@@ -4084,18 +4275,21 @@ impl SameAppView {
                                     .v_flex()
                                     .gap_0p5()
                                     .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(t(lang, "テーマカラー", "Accent colour")),
-                                    )
-                                    .child(div().text_xs().text_color(theme.muted_foreground).child(
-                                        t(
+                                        div().text_sm().font_weight(FontWeight::MEDIUM).child(t(
                                             lang,
-                                            "ボタン・選択状態・強調表示に使う色",
-                                            "Used for buttons, selection and highlights",
+                                            "テーマカラー",
+                                            "Accent colour",
+                                        )),
+                                    )
+                                    .child(
+                                        div().text_xs().text_color(theme.muted_foreground).child(
+                                            t(
+                                                lang,
+                                                "ボタン・選択状態・強調表示に使う色",
+                                                "Used for buttons, selection and highlights",
+                                            ),
                                         ),
-                                    )),
+                                    ),
                             )
                             .child(swatches)
                             .child(preview),
@@ -4204,7 +4398,11 @@ impl SameAppView {
         } else {
             (
                 t(lang, "UI フォント", "UI font"),
-                t(lang, "メニュー・チャット・ボタンなど", "Menus, chat, buttons and so on"),
+                t(
+                    lang,
+                    "メニュー・チャット・ボタンなど",
+                    "Menus, chat, buttons and so on",
+                ),
                 "あいうえお 漢字 カタカナ — The quick brown fox 0123",
             )
         };
@@ -4227,12 +4425,7 @@ impl SameAppView {
                             .v_flex()
                             .gap_0p5()
                             .min_w_0()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(label),
-                            )
+                            .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(label))
                             .child(
                                 div()
                                     .text_xs()
@@ -4400,29 +4593,33 @@ impl SameAppView {
         div()
             .py(px(1.0))
             .child(
-                list_row(SharedString::from(format!("font-opt-{ix}")), selected, &theme)
-                    .justify_between()
-                    .font_family(family)
-                    .child(div().min_w_0().truncate().child(label))
-                    .child(
-                        div()
-                            .h_flex()
-                            .items_center()
-                            .gap_2()
-                            .flex_shrink_0()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(sample),
-                            )
-                            .when(selected, |el| el.child(Icon::new(IconName::Check).small())),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_font(mono, value.clone(), window, cx);
-                        this.font_menu_open = None;
-                        cx.notify();
-                    })),
+                list_row(
+                    SharedString::from(format!("font-opt-{ix}")),
+                    selected,
+                    &theme,
+                )
+                .justify_between()
+                .font_family(family)
+                .child(div().min_w_0().truncate().child(label))
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(sample),
+                        )
+                        .when(selected, |el| el.child(Icon::new(IconName::Check).small())),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_font(mono, value.clone(), window, cx);
+                    this.font_menu_open = None;
+                    cx.notify();
+                })),
             )
             .into_any_element()
     }
@@ -4811,6 +5008,55 @@ impl SameAppView {
                 menu
             });
 
+        let attach_button = Button::new("composer-attach")
+            .small()
+            .ghost()
+            .icon(IconName::Plus)
+            .rounded(ButtonRounded::Size(px(999.0)))
+            .tooltip(t(
+                lang,
+                "ファイルを添付 (ドラッグ＆ドロップでも追加できます)",
+                "Attach files (or drag and drop them here)",
+            ))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.pick_attachments(window, cx);
+            }));
+
+        let can_send = !self.prompt_empty || !self.attachments.is_empty();
+        let submit_hint = match self.config.submit_key {
+            SubmitKey::Enter => "Enter",
+            SubmitKey::ModEnter => {
+                if cfg!(target_os = "macos") {
+                    "Cmd+Enter"
+                } else {
+                    "Ctrl+Enter"
+                }
+            }
+        };
+        let action_button = if running {
+            Button::new("btn-cancel-prompt")
+                .small()
+                .icon(IconName::Square)
+                .rounded(ButtonRounded::Size(px(999.0)))
+                .tooltip(format!("{} (Esc)", t(lang, "停止", "Stop")))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.cancel_current();
+                    cx.notify();
+                }))
+        } else {
+            Button::new("btn-send-prompt")
+                .small()
+                .primary()
+                .icon(IconName::ArrowUp)
+                .rounded(ButtonRounded::Size(px(999.0)))
+                .disabled(!can_send)
+                .tooltip(format!("{} ({submit_hint})", t(lang, "送信", "Send")))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.send_current_prompt(window, cx);
+                    cx.notify();
+                }))
+        };
+
         div()
             .h_flex()
             .items_center()
@@ -4821,9 +5067,12 @@ impl SameAppView {
             .child(
                 div()
                     .h_flex()
+                    .flex_1()
                     .items_center()
                     .gap_1()
                     .min_w_0()
+                    .overflow_hidden()
+                    .child(attach_button)
                     .child(provider_button)
                     .child(model_button)
                     .children(effort_button)
@@ -4847,9 +5096,79 @@ impl SameAppView {
                                 this.set_auto_approve(!this.config.auto_approve_tools);
                                 cx.notify();
                             })),
-                    )
-                    .when(running, |el| el.child(t(lang, "応答中…", "Responding…"))),
+                    ),
             )
+            .child(
+                div()
+                    .h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .when(running, |el| el.child(t(lang, "応答中…", "Responding…")))
+                    .child(action_button),
+            )
+    }
+
+    /// Chips for the files attached to the next prompt, each removable.
+    fn render_attachment_chips(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.attachments.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+        Some(
+            div()
+                .h_flex()
+                .flex_wrap()
+                .gap_1p5()
+                .children(self.attachments.iter().enumerate().map(|(i, path)| {
+                    let name = attachment_name(path);
+                    let image = same_agent::adapters::is_image_path(&name);
+                    let full = path.to_string_lossy().to_string();
+                    div()
+                        .id(SharedString::from(format!("attachment-{i}")))
+                        .h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .max_w(px(240.0))
+                        .pl_2()
+                        .pr_0p5()
+                        .py_0p5()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.muted)
+                        .text_xs()
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(full.clone()).build(window, cx)
+                        })
+                        .child(
+                            Icon::new(if image {
+                                IconName::GalleryVerticalEnd
+                            } else {
+                                IconName::File
+                            })
+                            .xsmall()
+                            .text_color(theme.muted_foreground),
+                        )
+                        .child(div().min_w_0().truncate().child(name))
+                        .child(
+                            Button::new(SharedString::from(format!("attachment-remove-{i}")))
+                                .xsmall()
+                                .ghost()
+                                .icon(IconName::Close)
+                                .rounded(ButtonRounded::Size(px(999.0)))
+                                .tooltip(t(lang, "添付を外す", "Remove"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if i < this.attachments.len() {
+                                        this.attachments.remove(i);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Suggestions shown above the prompt while a `/command` is typed:
@@ -5074,6 +5393,7 @@ impl SameAppView {
 
         let suggestions = self.render_command_suggestions(&session, &slash_cmds, cx);
         let composer_bar = self.render_composer_bar(&session, running, cx);
+        let attachment_chips = self.render_attachment_chips(cx);
 
         div()
             .v_flex()
@@ -5154,17 +5474,36 @@ impl SameAppView {
             // Message feed (virtualized)
             .child({
                 self.sync_feed();
-                list(
-                    self.feed.clone(),
-                    cx.processor(|this, ix: usize, _window, cx| this.render_feed_item(ix, cx)),
-                )
-                .flex_1()
-                .min_h_0()
-                .w_full()
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        list(
+                            self.feed.clone(),
+                            cx.processor(|this, ix: usize, _window, cx| {
+                                this.render_feed_item(ix, cx)
+                            }),
+                        )
+                        .size_full(),
+                    )
+                    // Always visible (the default only shows while
+                    // scrolling), so the position in a long chat is clear.
+                    .child(
+                        div().absolute().inset_0().child(
+                            Scrollbar::new(&self.feed)
+                                .id("chat-feed-scrollbar")
+                                .axis(ScrollbarAxis::Vertical)
+                                .mode(ScrollbarMode::Always)
+                                .viewport_from_layout(),
+                        ),
+                    )
             })
-            // Prompt composer
+            // Prompt composer: one rounded card holding attachments, the
+            // text and a toolbar (like ChatGPT / T3 Code / OpenCode).
             .child(
-                div().v_flex().px_4().pt_2().pb_3().gap_1().child(
+                div().v_flex().px_4().pt_1().pb_4().child(
                     div()
                         .v_flex()
                         .w_full()
@@ -5174,37 +5513,50 @@ impl SameAppView {
                         .when_some(suggestions, |el, s| el.child(s))
                         .child(
                             div()
-                                .h_flex()
-                                .gap_2()
-                                .items_end()
+                                .id("composer-card")
+                                .v_flex()
+                                .w_full()
+                                .gap_1()
+                                .px_3()
+                                .pt_2()
+                                .pb_2()
+                                .rounded(px(20.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.secondary)
+                                .shadow_md()
+                                .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                                    style.border_color(cx.theme().ring).bg(cx.theme().accent)
+                                })
+                                .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                                    this.add_attachments(paths.paths().iter().cloned());
+                                    this.prompt_input.update(cx, |ta, cx| ta.focus(window, cx));
+                                    cx.notify();
+                                }))
+                                .when_some(attachment_chips, |el, chips| el.child(chips))
                                 .child(
                                     div()
-                                        .flex_1()
+                                        .w_full()
                                         .min_w_0()
-                                        .child(Textarea::new(&self.prompt_input)),
+                                        // Up / Down recall earlier prompts.
+                                        .capture_action(cx.listener(
+                                            |this, _: &MoveUp, window, cx| {
+                                                if this.recall_prompt_history(true, window, cx) {
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .capture_action(cx.listener(
+                                            |this, _: &MoveDown, window, cx| {
+                                                if this.recall_prompt_history(false, window, cx) {
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        .child(Textarea::new(&self.prompt_input).appearance(false)),
                                 )
-                                .child(if running {
-                                    Button::new("btn-cancel-prompt")
-                                        .danger()
-                                        .tooltip("Esc")
-                                        .label(t(lang, "■ 停止", "■ Stop"))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_current();
-                                            cx.notify();
-                                        }))
-                                } else {
-                                    Button::new("btn-send-prompt")
-                                        .primary()
-                                        .disabled(self.prompt_empty)
-                                        .tooltip("Enter")
-                                        .label(t(lang, "送信", "Send"))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.send_current_prompt(window, cx);
-                                            cx.notify();
-                                        }))
-                                }),
-                        )
-                        .child(composer_bar),
+                                .child(composer_bar),
+                        ),
                 ),
             )
             .into_any_element()
@@ -6650,6 +7002,14 @@ fn user_markdown(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_attachment_note_keeps_only_the_typed_text() {
+        assert_eq!(strip_attachment_note("hello"), "hello");
+        assert_eq!(strip_attachment_note("hi\n\n📎 `a.png`  📎 `b.txt`"), "hi");
+        assert_eq!(strip_attachment_note("📎 `a.png`"), "");
+        assert_eq!(strip_attachment_note("a\n\nb"), "a\n\nb");
+    }
 
     #[test]
     fn user_markdown_keeps_line_breaks_outside_fences() {
