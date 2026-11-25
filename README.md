@@ -16,10 +16,11 @@ A lightweight, local-first, multi-provider AI agent desktop workspace written in
   - Antigravity (`agy acp`)
   - Custom ACP agents (configurable command, args, env, cwd)
 - **Structured Workspace**: Organize work into `Workspace -> Project -> Quest -> Session` (with quick sessions supported without forcing hierarchy).
-- **Streaming & Tool Visibility**: Real-time streaming responses, collapsible thinking/reasoning blocks, tool call cards, and interactive permission approval dialogs.
+- **Streaming & Tool Visibility**: Real-time streaming responses, collapsible thinking/reasoning blocks, tool call cards, interactive permission approval dialogs (with live auto-approve toggle), and file/image attachments.
 - **Local-First Storage**: All configuration (TOML) and conversation history (SQLite) are stored locally. Zero telemetry, no mandatory account.
 - **Built-in Workspace Tools**: File browser, file viewer/editor, and optional Git status/diff viewer for software development projects.
-- **Bilingual & Themed UI**: Dark/Light themes and Japanese/English UI support.
+- **Customizable & Bilingual UI**: Dark/Light themes, 6 accent color presets, configurable UI/monospace fonts and font size, configurable submit key, and Japanese/English UI support.
+- **In-App Updates**: Built-in updater that checks GitHub Releases and updates in place (`same --version` / `-V` to print the installed version).
 
 ## Windows + WSL
 
@@ -29,7 +30,7 @@ On Windows, agents run where the project lives. A project folder inside WSL (`\\
 
 | Key | Action |
 | --- | --- |
-| `Enter` / `Shift+Enter` | Send prompt / insert newline |
+| `Enter` / `Shift+Enter` | Send prompt / insert newline (configurable to `Ctrl+Enter` / `Cmd+Enter` in Settings) |
 | `Esc` | Stop the running agent (or cancel a rename) |
 | `Ctrl+N` | New session |
 | `Ctrl+S` | Save the file open in the file panel |
@@ -38,7 +39,7 @@ On Windows, agents run where the project lives. A project folder inside WSL (`\\
 
 ## Picking the Agent and Model
 
-The row under the prompt has an agent picker and a model picker, like the Codex and Claude Code composers. ACP agents (e.g. OpenCode) report their models after the first message of a session, and the list fills in from then on. You can also type `/model <name>` (or `/model default`) in the prompt; typing `/` lists the commands, and `/model ` lists the models.
+The row under the prompt has an agent picker, a model picker, and a reasoning effort picker (when supported by the selected model). Models are discovered dynamically from each provider (ACP `session/new`, Claude Code `initialize`, and Codex `app-server`). You can also type `/model <name>` (or `/model default`) in the prompt; typing `/` lists the commands, and `/model ` lists the models.
 
 Double-click a session (in the sidebar or its title) to rename it. Delete buttons ask for a second click to confirm.
 
