@@ -533,8 +533,8 @@ mod tests {
     #[test]
     fn parses_wsl_unc_paths() {
         assert_eq!(
-            wsl_location(r"\\wsl.localhost\Ubuntu-20.04\home\sota\git\same"),
-            Some(("Ubuntu-20.04".into(), "/home/sota/git/same".into()))
+            wsl_location(r"\\wsl.localhost\Ubuntu-20.04\home\user\git\same"),
+            Some(("Ubuntu-20.04".into(), "/home/user/git/same".into()))
         );
         assert_eq!(
             wsl_location(r"\\wsl$\Ubuntu\home\x\"),
@@ -549,7 +549,7 @@ mod tests {
             Some(("Ubuntu".into(), "/".into()))
         );
         assert_eq!(wsl_location(r"C:\work"), None);
-        assert_eq!(wsl_location("/home/sota"), None);
+        assert_eq!(wsl_location("/home/user"), None);
         assert_eq!(wsl_location(r"\\server\share\x"), None);
     }
 
@@ -559,16 +559,16 @@ mod tests {
             distro: "Ubuntu-20.04".into(),
         };
         assert_eq!(
-            t.to_target_path(Path::new(r"\\wsl.localhost\Ubuntu-20.04\home\sota\p")),
-            "/home/sota/p"
+            t.to_target_path(Path::new(r"\\wsl.localhost\Ubuntu-20.04\home\user\p")),
+            "/home/user/p"
         );
         assert_eq!(
             t.to_target_path(Path::new(r"C:\work\repo")),
             "/mnt/c/work/repo"
         );
         assert_eq!(
-            t.to_host_path(Path::new("ignored"), "/home/sota/p/main.rs"),
-            PathBuf::from(r"\\wsl.localhost\Ubuntu-20.04\home\sota\p\main.rs")
+            t.to_host_path(Path::new("ignored"), "/home/user/p/main.rs"),
+            PathBuf::from(r"\\wsl.localhost\Ubuntu-20.04\home\user\p\main.rs")
         );
         assert_eq!(
             t.to_host_path(Path::new("ignored"), "/mnt/d/data/x.txt"),

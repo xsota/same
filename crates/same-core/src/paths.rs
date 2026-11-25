@@ -35,7 +35,7 @@ mod tests {
         );
         assert_eq!(simplify_path(r"\\?\C:\work\repo"), r"C:\work\repo");
         assert_eq!(simplify_path(r"\\?\Volume{abc}\x"), r"\\?\Volume{abc}\x");
-        assert_eq!(simplify_path("/home/sota/git/same"), "/home/sota/git/same");
+        assert_eq!(simplify_path("/home/user/git/same"), "/home/user/git/same");
         assert_eq!(simplify_path(r"C:\work"), r"C:\work");
     }
 }
