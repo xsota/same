@@ -4,6 +4,8 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let brand = manifest_dir.join("../../assets/brand");
     println!("cargo:rerun-if-changed=build.rs");
+
+    emit_build_info(&manifest_dir);
     println!(
         "cargo:rerun-if-changed={}",
         brand.join("same.ico").display()
@@ -25,4 +27,38 @@ fn main() {
             .manifest_optional()
             .unwrap();
     }
+}
+
+/// Exposes `SAME_GIT_SHA` (short commit hash, "unknown" without git) to the
+/// crate; debug builds show it next to the version.
+fn emit_build_info(manifest_dir: &std::path::Path) {
+    let git_out = |args: &[&str]| -> Option<String> {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(manifest_dir)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    // Rebuild when HEAD or the active branch ref moves (works in linked
+    // worktrees and checkouts without reflogs).
+    let watch_git_path = |rel: &str| {
+        if let Some(p) = git_out(&["rev-parse", "--git-path", rel]) {
+            let full = manifest_dir.join(p);
+            if full.exists() {
+                println!("cargo:rerun-if-changed={}", full.display());
+            }
+        }
+    };
+    watch_git_path("HEAD");
+    if let Some(symref) = git_out(&["symbolic-ref", "-q", "HEAD"]) {
+        watch_git_path(&symref);
+    }
+    watch_git_path("packed-refs");
+
+    let sha = git_out(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=SAME_GIT_SHA={sha}");
 }

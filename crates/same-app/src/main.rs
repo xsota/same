@@ -23,7 +23,7 @@ fn main() {
 
     let first_arg = std::env::args().nth(1);
     if matches!(first_arg.as_deref(), Some("--version" | "-V")) {
-        println!("same {}", updater::CURRENT_VERSION);
+        println!("same {}", updater::display_version());
         return;
     }
     let initial_dir = first_arg.map(PathBuf::from);

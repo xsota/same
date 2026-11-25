@@ -14,6 +14,21 @@ static ORIGINAL_EXE: OnceLock<PathBuf> = OnceLock::new();
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GITHUB_REPO: &str = "xsota/same";
 
+/// True for `--release` builds (what CI ships).
+pub const IS_RELEASE_BUILD: bool = !cfg!(debug_assertions);
+/// Short commit hash the binary was built from ("unknown" without git).
+pub const GIT_SHA: &str = env!("SAME_GIT_SHA");
+
+/// The version shown to users: `v0.1.0` for release builds, and
+/// `v0.1.0-dev (abc1234)` for debug builds.
+pub fn display_version() -> String {
+    if IS_RELEASE_BUILD {
+        format!("v{CURRENT_VERSION}")
+    } else {
+        format!("v{CURRENT_VERSION}-dev ({GIT_SHA})")
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ReleaseInfo {

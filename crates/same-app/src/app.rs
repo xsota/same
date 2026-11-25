@@ -163,13 +163,15 @@ enum SettingsSection {
     General,
     Appearance,
     Providers,
+    About,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 3] = [
+    const ALL: [SettingsSection; 4] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Providers,
+        SettingsSection::About,
     ];
 
     fn title(self, lang: Language) -> &'static str {
@@ -177,6 +179,7 @@ impl SettingsSection {
             SettingsSection::General => t(lang, "一般", "General"),
             SettingsSection::Appearance => t(lang, "外観", "Appearance"),
             SettingsSection::Providers => t(lang, "プロバイダ接続", "Providers"),
+            SettingsSection::About => t(lang, "SAME について", "About"),
         }
     }
 
@@ -185,6 +188,7 @@ impl SettingsSection {
             SettingsSection::General => IconName::Settings2,
             SettingsSection::Appearance => IconName::Palette,
             SettingsSection::Providers => IconName::Bot,
+            SettingsSection::About => IconName::Info,
         }
     }
 }
@@ -2769,7 +2773,7 @@ impl SameAppView {
                     .px_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(format!("SAME v{CURRENT_VERSION}"))
+                    .child(format!("SAME {}", updater::display_version()))
                     .when_some(
                         match &self.update_state {
                             UpdateState::Available(info) => Some(format!("↑ v{}", info.version)),
@@ -2794,7 +2798,7 @@ impl SameAppView {
                                     .cursor_pointer()
                                     .child(badge)
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_settings(SettingsSection::General);
+                                        this.open_settings(SettingsSection::About);
                                         cx.notify();
                                     })),
                             )
@@ -4097,6 +4101,7 @@ impl SameAppView {
             SettingsSection::General => self.render_general_settings(cx),
             SettingsSection::Appearance => self.render_appearance_settings(cx),
             SettingsSection::Providers => self.render_providers_settings(cx),
+            SettingsSection::About => self.render_about_settings(cx),
         };
 
         div()
@@ -4302,13 +4307,157 @@ impl SameAppView {
                         &theme,
                     )),
             )
-            .child({
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "{}: {}",
+                        t(lang, "設定ファイル", "Config file"),
+                        self.paths.config_file.display()
+                    )),
+            )
+    }
+
+    /// Settings → About: app identity, build version and updates.
+    fn render_about_settings(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+        let version = updater::display_version();
+
+        let build_kind = if updater::IS_RELEASE_BUILD {
+            t(lang, "リリースビルド", "Release build")
+        } else {
+            t(lang, "開発ビルド", "Development build")
+        };
+        let copy_text = format!(
+            "SAME {version}\n{} {} ({})",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            build_kind
+        );
+
+        let identity = div()
+            .h_flex()
+            .items_center()
+            .gap_4()
+            .px_4()
+            .py_4()
+            .child(gpui::img(crate::brand::mascot()).size(px(64.0)))
+            .child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(accent_text())
+                            .child("SAME"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Shared Agentic Multi-provider Environment"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(version.clone()),
+                    ),
+            )
+            .child(
+                Button::new("about-copy-version")
+                    .small()
+                    .ghost()
+                    .label(t(lang, "コピー", "Copy"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                        this.note(
+                            NoteKind::Info,
+                            t(this.config.language, "コピーしました", "Copied"),
+                        );
+                        cx.notify();
+                    })),
+            );
+
+        let repo_url = format!("https://github.com/{}", updater::GITHUB_REPO);
+        let repo_button = Button::new("about-open-repo")
+            .small()
+            .outline()
+            .label("GitHub")
+            .on_click({
+                let url = repo_url.clone();
+                move |_, _, cx| cx.open_url(&url)
+            });
+        let releases_url = format!("{repo_url}/releases");
+        let releases_button = Button::new("about-open-releases")
+            .small()
+            .outline()
+            .label(t(lang, "リリースノート", "Release notes"))
+            .on_click(move |_, _, cx| cx.open_url(&releases_url));
+
+        div()
+            .v_flex()
+            .gap_4()
+            .child(settings_header(
+                SettingsSection::About.title(lang),
+                t(
+                    lang,
+                    "バージョン情報とアップデート",
+                    "Version information and updates",
+                ),
+                &theme,
+                None,
+            ))
+            .child(settings_card(&theme).child(identity))
+            .child(
+                settings_card(&theme)
+                    .child(settings_row(
+                        t(lang, "バージョン", "Version"),
+                        &format!(
+                            "{build_kind} · {} {}",
+                            std::env::consts::OS,
+                            std::env::consts::ARCH
+                        ),
+                        div().text_sm().child(version),
+                        true,
+                        &theme,
+                    ))
+                    .child(self.render_update_row(cx))
+                    .child(settings_row(
+                        t(lang, "ソースコード", "Source code"),
+                        &repo_url,
+                        div().h_flex().gap_1().child(releases_button).child(repo_button),
+                        false,
+                        &theme,
+                    ))
+                    .child(settings_row(
+                        t(lang, "ライセンス", "License"),
+                        "",
+                        div().text_sm().child("MIT OR Apache-2.0"),
+                        false,
+                        &theme,
+                    )),
+            )
+    }
+
+    /// The "check / install update" row of Settings → About.
+    fn render_update_row(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
                 let (update_desc, update_control): (String, AnyElement) = match &self.update_state {
                     UpdateState::Idle => (
-                        match lang {
-                            Language::Ja => format!("現在のバージョン: v{CURRENT_VERSION}"),
-                            Language::En => format!("Current version: v{CURRENT_VERSION}"),
-                        },
+                        t(
+                            lang,
+                            "GitHub Releases で新しいバージョンを確認します",
+                            "Check GitHub Releases for a newer version",
+                        )
+                        .to_string(),
                         Button::new("settings-check-update")
                             .small()
                             .outline()
@@ -4457,24 +4606,13 @@ impl SameAppView {
                     ),
                 };
 
-                settings_card(&theme).child(settings_row(
-                    t(lang, "バージョンとアップデート", "Version & Updates"),
+                settings_row(
+                    t(lang, "アップデート", "Updates"),
                     &update_desc,
                     update_control,
-                    true,
+                    false,
                     &theme,
-                ))
-            })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!(
-                        "{}: {}",
-                        t(lang, "設定ファイル", "Config file"),
-                        self.paths.config_file.display()
-                    )),
-            )
+                )
     }
 
     fn render_appearance_settings(&self, cx: &mut Context<Self>) -> Div {
