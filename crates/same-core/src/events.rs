@@ -38,6 +38,11 @@ pub enum SameEvent {
     ApprovalRequested {
         request: PermissionRequest,
     },
+    ApprovalWithdrawn {
+        session_id: String,
+        request_id: String,
+        remaining: usize,
+    },
     SlashCommandsUpdated {
         session_id: String,
         commands: Vec<SlashCommandInfo>,

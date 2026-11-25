@@ -1,7 +1,8 @@
 use crate::adapters::{
     claude_prompt_with_attachments, codex_prompt_with_attachments, is_image_path, run_claude_cli,
-    run_codex_cli,
 };
+use crate::codex::run_codex_cli;
+use crate::permissions::PermissionGate;
 use anyhow::{Context, Result};
 use same_acp::exec::{
     self, build_command, build_console_command, resolve_target, ConsoleScript, ExecPreference,
@@ -141,8 +142,18 @@ impl AgentManager {
         }
     }
 
+    /// Routes CLI adapter permission prompts to the approval UI (or the live
+    /// auto-approve policy).
+    fn permission_gate(&self) -> PermissionGate {
+        PermissionGate::new(
+            self.events.clone(),
+            self.permission_responders.clone(),
+            self.auto_approve.clone(),
+        )
+    }
+
     /// Updates the live tool auto-approval policy synchronously for all
-    /// running and starting ACP clients.
+    /// running and starting agents.
     pub fn set_auto_approve(&self, auto_approve: bool) {
         self.auto_approve
             .store(auto_approve, std::sync::atomic::Ordering::SeqCst);
@@ -166,7 +177,7 @@ impl AgentManager {
                 supports_streaming: true,
                 supports_thinking: true,
                 supports_tool_calls: true,
-                supports_permissions: false,
+                supports_permissions: true,
                 supports_cancel: true,
                 supports_session_resume: true,
                 supports_model_select: true,
@@ -177,7 +188,7 @@ impl AgentManager {
                 supports_streaming: true,
                 supports_thinking: true,
                 supports_tool_calls: true,
-                supports_permissions: false,
+                supports_permissions: true,
                 supports_cancel: true,
                 supports_session_resume: true,
                 supports_model_select: true,
@@ -429,8 +440,8 @@ impl AgentManager {
 
     pub fn start_prompt(&self, req: PromptRequest) {
         let manager = self.clone();
-        // Snapshot the CLI permission flag at submission time; ACP clients
-        // continue reading the live shared flag.
+        // Snapshot the flag for Codex's approval policy at submission time;
+        // individual prompts read the live flag.
         let cli_auto_approve = self.auto_approve.load(std::sync::atomic::Ordering::SeqCst);
         self.runtime.spawn(async move {
             let sid = req.session_id.clone();
@@ -490,7 +501,7 @@ impl AgentManager {
                             &req.cwd,
                             &target,
                             &claude_prompt_with_attachments(&req.prompt, &files),
-                            cli_auto_approve,
+                            manager.permission_gate(),
                             manager.events.clone(),
                             cancel_rx,
                         )
@@ -510,6 +521,7 @@ impl AgentManager {
                             &codex_prompt_with_attachments(&req.prompt, &files),
                             &images,
                             cli_auto_approve,
+                            manager.permission_gate(),
                             manager.events.clone(),
                             cancel_rx,
                         )

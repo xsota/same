@@ -39,6 +39,13 @@ pub struct PermissionResponder {
 }
 
 impl PermissionResponder {
+    /// A responder for a permission prompt raised outside ACP (e.g. by a CLI
+    /// adapter), and the receiver its decision arrives on.
+    pub fn new() -> (Self, oneshot::Receiver<PermissionDecision>) {
+        let (tx, rx) = oneshot::channel();
+        (Self { tx }, rx)
+    }
+
     pub fn respond(self, decision: PermissionDecision) {
         let _ = self.tx.send(decision);
     }

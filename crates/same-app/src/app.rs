@@ -1959,6 +1959,29 @@ impl SameAppView {
                 }
                 self.pending_permissions.push(request);
             }
+            SameEvent::ApprovalWithdrawn {
+                session_id,
+                request_id,
+                remaining,
+            } => {
+                self.pending_permissions
+                    .retain(|p| p.request_id != request_id);
+                if remaining == 0 && self.live_drafts.contains_key(&session_id) {
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        if s.status == SessionStatus::WaitingForApproval {
+                            s.status = SessionStatus::Running;
+                            let _ = self.storage.update_session_meta(
+                                &session_id,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(SessionStatus::Running),
+                            );
+                        }
+                    }
+                }
+            }
             SameEvent::SlashCommandsUpdated {
                 session_id,
                 commands,
@@ -4299,8 +4322,8 @@ impl SameAppView {
                         t(lang, "ツール実行の承認", "Tool permissions"),
                         t(
                             lang,
-                            "全 ACP セッションの新しい単発承認リクエストを自動許可します。CLI エージェントでは次回実行時のプロバイダ権限モードを切り替えます",
-                            "Automatically grants new single-use ACP permission requests across all sessions; for CLI agents, selects the provider's own permission mode on the next run",
+                            "全セッションの新しい承認リクエストを単発許可で自動承認します（Codex のサンドボックス設定は次回実行から反映）",
+                            "Automatically grants new permission requests once, across all sessions (Codex's sandbox policy follows from its next run)",
                         ),
                         auto_approve_control,
                         false,
@@ -5553,8 +5576,8 @@ impl SameAppView {
                             .when(!self.config.auto_approve_tools, |b| b.ghost())
                             .tooltip(t(
                                 lang,
-                                "全 ACP セッションの新しい単発承認リクエストを自動許可します（CLI エージェントは次回実行から反映）",
-                                "Applies globally: automatically grants new single-use ACP permission requests across all sessions, and sets the permission mode for future CLI runs",
+                                "全セッションの新しい承認リクエストを単発許可で自動承認します（Codex のサンドボックス設定は次回実行から反映）",
+                                "Applies globally: automatically grants new permission requests once, across all sessions (Codex's sandbox policy follows from its next run)",
                             ))
                             .label(if self.config.auto_approve_tools {
                                 t(lang, "自動承認: ON", "Auto-approve: ON")

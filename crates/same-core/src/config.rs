@@ -195,7 +195,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "opus".to_string(),
                 "haiku".to_string(),
             ],
-            description: "Anthropic Claude Code CLI (streaming JSON / session resume)".to_string(),
+            description: "Anthropic Claude Code CLI (streaming JSON / permission prompts / session resume)".to_string(),
         },
         ProviderConfig {
             id: "codex".to_string(),
@@ -211,7 +211,7 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "gpt-5.4".to_string(),
                 "o3".to_string(),
             ],
-            description: "OpenAI Codex CLI (codex exec --json)".to_string(),
+            description: "OpenAI Codex CLI (codex app-server)".to_string(),
         },
         ProviderConfig {
             id: "antigravity".to_string(),

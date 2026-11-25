@@ -1,52 +1,63 @@
-use anyhow::{anyhow, Context, Result};
+use crate::permissions::{self, ApprovalPrompt, PermissionGate};
+use anyhow::{anyhow, bail, Context, Result};
 use same_acp::exec::{build_command, ExecTarget};
 use same_core::{EventBus, ProviderConfig, SameEvent, ToolCallRecord, ToolCallStatus};
-use serde_json::Value;
-use std::collections::VecDeque;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Child;
-use tokio::sync::oneshot;
+use tokio::process::{Child, ChildStdin};
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinSet;
 
 /// Collects a command line so it can be launched in any [`ExecTarget`].
-struct ArgList(Vec<String>);
+pub(crate) struct ArgList(pub(crate) Vec<String>);
 
 impl ArgList {
-    fn new(base: &[String]) -> Self {
+    pub(crate) fn new(base: &[String]) -> Self {
         Self(base.to_vec())
     }
 
-    fn arg(&mut self, a: impl Into<String>) -> &mut Self {
+    pub(crate) fn arg(&mut self, a: impl Into<String>) -> &mut Self {
         self.0.push(a.into());
         self
     }
 }
 
-/// Sends `prompt` to the child's stdin and closes it, so the CLI sees the
-/// end of input. Written in the background: a large prompt must not block
-/// reading the child's output. The returned handle resolves to any I/O error
-/// so the caller can surface incomplete writes when the child exits zero.
-fn write_prompt_to_stdin(
-    child: &mut Child,
-    prompt: &str,
-) -> Result<tokio::task::JoinHandle<Result<()>>> {
-    let mut stdin = child
+/// A child's stdin shared by the tasks that answer its requests; `None` once
+/// closed.
+pub(crate) type SharedStdin = Arc<Mutex<Option<ChildStdin>>>;
+
+pub(crate) fn shared_stdin(child: &mut Child) -> Result<SharedStdin> {
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| anyhow!("Failed to capture agent stdin"))?;
-    let prompt = prompt.to_string();
-    Ok(tokio::spawn(async move {
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .context("Failed to write prompt to agent stdin")?;
-        stdin
-            .shutdown()
-            .await
-            .context("Failed to close agent stdin")?;
-        Ok(())
-    }))
+    Ok(Arc::new(Mutex::new(Some(stdin))))
+}
+
+/// Writes `val` as one JSON line.
+pub(crate) async fn write_json_line(stdin: &SharedStdin, val: &Value) -> Result<()> {
+    let mut line = serde_json::to_string(val)?;
+    line.push('\n');
+    let mut guard = stdin.lock().await;
+    let Some(pipe) = guard.as_mut() else {
+        bail!("Agent stdin is already closed");
+    };
+    pipe.write_all(line.as_bytes())
+        .await
+        .context("Failed to write to agent stdin")?;
+    pipe.flush().await.context("Failed to flush agent stdin")?;
+    Ok(())
+}
+
+/// Closes stdin so the agent sees the end of input.
+pub(crate) async fn close_stdin(stdin: &SharedStdin) {
+    if let Some(mut pipe) = stdin.lock().await.take() {
+        let _ = pipe.shutdown().await;
+    }
 }
 
 /// Whether an attachment is an image the agent can look at directly.
@@ -92,7 +103,7 @@ pub fn codex_prompt_with_attachments(prompt: &str, paths: &[String]) -> String {
 }
 
 /// Lines of stderr kept to explain a failed run.
-const STDERR_TAIL_LINES: usize = 20;
+pub(crate) const STDERR_TAIL_LINES: usize = 20;
 
 /// How one `claude -p` process ended.
 enum ClaudeRun {
@@ -148,6 +159,7 @@ fn claude_failure_message(code: Option<i32>, errors: &[String], stderr_tail: &[S
     msg
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_claude_cli(
     provider: &ProviderConfig,
     session_id: &str,
@@ -157,7 +169,7 @@ pub async fn run_claude_cli(
     cwd: &Path,
     target: &ExecTarget,
     prompt: &str,
-    auto_approve: bool,
+    gate: PermissionGate,
     events: EventBus,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -172,7 +184,7 @@ pub async fn run_claude_cli(
             cwd,
             target,
             prompt,
-            auto_approve,
+            &gate,
             &events,
             &mut cancel_rx,
         )
@@ -214,6 +226,10 @@ pub async fn run_claude_cli(
     }
 }
 
+/// Runs one turn with `stream-json` on both stdin and stdout. Permission
+/// prompts arrive as `can_use_tool` control requests (through
+/// `--permission-prompt-tool stdio`) and are answered on stdin, so stdin stays
+/// open until the turn's `result` line.
 #[allow(clippy::too_many_arguments)]
 async fn run_claude_once(
     provider: &ProviderConfig,
@@ -224,19 +240,20 @@ async fn run_claude_once(
     cwd: &Path,
     target: &ExecTarget,
     prompt: &str,
-    auto_approve: bool,
+    gate: &PermissionGate,
     events: &EventBus,
     cancel_rx: &mut oneshot::Receiver<()>,
 ) -> Result<ClaudeRun> {
     let mut cmd = ArgList::new(&provider.args);
     cmd.arg("-p")
+        .arg("--input-format")
+        .arg("stream-json")
         .arg("--output-format")
         .arg("stream-json")
-        .arg("--verbose");
+        .arg("--verbose")
+        .arg("--permission-prompt-tool")
+        .arg("stdio");
 
-    if auto_approve {
-        cmd.arg("--permission-mode").arg("acceptEdits");
-    }
     if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
         cmd.arg("--model").arg(m);
     }
@@ -247,8 +264,6 @@ async fn run_claude_once(
         cmd.arg("--resume").arg(ext);
     }
 
-    // The prompt goes through stdin: as an argument, text starting with
-    // `-` would be parsed as an option.
     let mut cmd = build_command(target, &provider.command, &cmd.0, cwd, &provider.env).await;
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -258,7 +273,14 @@ async fn run_claude_once(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn '{}'", provider.command))?;
-    let stdin_task = write_prompt_to_stdin(&mut child, prompt)?;
+    let stdin = shared_stdin(&mut child)?;
+    // Written in the background: a large prompt must not block reading the
+    // child's output.
+    let prompt_task = {
+        let stdin = stdin.clone();
+        let message = claude_user_message(prompt);
+        tokio::spawn(async move { write_json_line(&stdin, &message).await })
+    };
 
     let stdout = child
         .stdout
@@ -296,11 +318,31 @@ async fn run_claude_once(
 
     let mut lines = BufReader::new(stdout).lines();
     let mut state = ClaudeStreamState::default();
+    // Open permission prompts, by control request id.
+    let mut prompts: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+    let mut prompt_tasks: JoinSet<(Option<String>, Result<()>)> = JoinSet::new();
 
     loop {
         tokio::select! {
+            Some(res) = prompt_tasks.join_next(), if !prompt_tasks.is_empty() => {
+                if let Ok((rid, write_res)) = res {
+                    if let Some(rid) = rid {
+                        prompts.remove(&rid);
+                    }
+                    if let Err(err) = write_res {
+                        prompt_task.abort();
+                        prompt_tasks.abort_all();
+                        let _ = child.kill().await;
+                        close_stdin(&stdin).await;
+                        return Err(err);
+                    }
+                }
+            }
             _ = &mut *cancel_rx => {
+                prompt_task.abort();
+                prompt_tasks.abort_all();
                 let _ = child.kill().await;
+                close_stdin(&stdin).await;
                 return Ok(ClaudeRun::Cancelled);
             }
             line_res = lines.next_line() => {
@@ -310,14 +352,48 @@ async fn run_claude_once(
                         if trimmed.is_empty() {
                             continue;
                         }
-                        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                            handle_claude_json(&val, session_id, events, &mut state);
-                        } else {
+                        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
                             events.publish(SameEvent::AgentLog {
                                 session_id: Some(session_id.to_string()),
                                 provider_id: provider.id.clone(),
                                 line: trimmed.to_string(),
                             });
+                            continue;
+                        };
+                        match val.get("type").and_then(Value::as_str).unwrap_or("") {
+                            "control_request" => {
+                                if let Some((rid, handle)) = spawn_claude_control_request(
+                                    &val,
+                                    session_id,
+                                    gate,
+                                    &stdin,
+                                    &state.denied,
+                                    &mut prompt_tasks,
+                                ) {
+                                    prompts.insert(rid, handle);
+                                }
+                            }
+                            "control_cancel_request" => {
+                                // Claude no longer needs the answer (e.g. the
+                                // turn was interrupted).
+                                if let Some(handle) = val
+                                    .get("request_id")
+                                    .and_then(Value::as_str)
+                                    .and_then(|rid| prompts.remove(rid))
+                                {
+                                    handle.abort();
+                                }
+                            }
+                            "control_response" => {}
+                            msg_type => {
+                                handle_claude_json(&val, session_id, events, &mut state);
+                                if msg_type == "result" {
+                                    // The turn is over; closing stdin lets
+                                    // the CLI exit.
+                                    prompt_tasks.abort_all();
+                                    close_stdin(&stdin).await;
+                                }
+                            }
                         }
                     }
                     None => break,
@@ -325,6 +401,8 @@ async fn run_claude_once(
             }
         }
     }
+    prompt_tasks.abort_all();
+    close_stdin(&stdin).await;
 
     let status = child.wait().await?;
     // Give stderr a brief moment to drain after the child exits, without
@@ -345,10 +423,238 @@ async fn run_claude_once(
             did_work: state.did_work,
         });
     }
-    if let Ok(Err(err)) = stdin_task.await {
+    if let Ok(Err(err)) = prompt_task.await {
         return Err(err);
     }
     Ok(ClaudeRun::Completed)
+}
+
+/// A `stream-json` user message carrying the prompt.
+fn claude_user_message(prompt: &str) -> Value {
+    json!({
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "parent_tool_use_id": null,
+        "session_id": "",
+    })
+}
+
+/// Text Claude sees when the user denies a tool.
+const CLAUDE_DENY_MESSAGE: &str = "The user denied this action.";
+
+/// Answers a control request from Claude Code. `can_use_tool` asks the user
+/// in a background task (returned so it can be aborted); anything else gets
+/// an error response right away.
+fn spawn_claude_control_request(
+    val: &Value,
+    session_id: &str,
+    gate: &PermissionGate,
+    stdin: &SharedStdin,
+    denied: &DeniedTools,
+    tasks: &mut JoinSet<(Option<String>, Result<()>)>,
+) -> Option<(String, tokio::task::AbortHandle)> {
+    let request_id = val.get("request_id").and_then(Value::as_str)?.to_string();
+    let request = val.get("request").cloned().unwrap_or(Value::Null);
+    let stdin = stdin.clone();
+    let subtype = request
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if subtype != "can_use_tool" {
+        tasks.spawn(async move {
+            let reply = claude_control_error(
+                &request_id,
+                &format!("Unsupported control request: {subtype}"),
+            );
+            let res = tokio::spawn(async move { write_json_line(&stdin, &reply).await })
+                .await
+                .unwrap_or(Ok(()));
+            (None, res)
+        });
+        return None;
+    }
+    if request.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") {
+        let rid = request_id.clone();
+        tasks.spawn(async move {
+            let reply = json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": rid,
+                    "response": {
+                        "behavior": "deny",
+                        "message": "AskUserQuestion is not supported in SAME; ask the user directly in your reply.",
+                    },
+                },
+            });
+            let res = tokio::spawn(async move { write_json_line(&stdin, &reply).await })
+                .await
+                .unwrap_or(Ok(()));
+            (None, res)
+        });
+        return None;
+    }
+
+    let gate = gate.clone();
+    let sid = session_id.to_string();
+    let denied = denied.clone();
+    let rid = request_id.clone();
+    let handle = tasks.spawn(async move {
+        let choice = gate.ask(&sid, claude_permission_prompt(&request)).await;
+        let reply = claude_permission_response(&rid, &request, choice.as_deref());
+        if reply
+            .pointer("/response/response/behavior")
+            .and_then(Value::as_str)
+            == Some("deny")
+        {
+            if let Some(id) = request.get("tool_use_id").and_then(Value::as_str) {
+                denied.lock().unwrap().insert(id.to_string());
+            }
+        }
+        // Detach the write so a late `control_cancel_request` abort cannot
+        // truncate a JSON line mid-frame.
+        let res = tokio::spawn(async move { write_json_line(&stdin, &reply).await })
+            .await
+            .unwrap_or(Ok(()));
+        (Some(rid), res)
+    });
+    Some((request_id, handle))
+}
+
+/// The approval prompt for a `can_use_tool` request.
+fn claude_permission_prompt(request: &Value) -> ApprovalPrompt {
+    let tool = request
+        .get("display_name")
+        .or_else(|| request.get("tool_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("Tool");
+    let input = request.get("input");
+    let mut description = String::new();
+    if let Some(d) = request
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|d| !d.trim().is_empty())
+    {
+        description.push_str(d.trim());
+        description.push_str("\n\n");
+    }
+    if let Some(i) = input {
+        description.push_str(&serde_json::to_string_pretty(i).unwrap_or_default());
+    }
+    let mut options = vec![permissions::option("allow", "Allow", "allow_once")];
+    let rule_suggestions = claude_rule_suggestions(request);
+    if !rule_suggestions.is_empty() {
+        let summary = format_claude_rule_suggestions(&rule_suggestions);
+        if !summary.is_empty() {
+            if !description.is_empty() {
+                description.push_str("\n\n");
+            }
+            description.push_str("Always allow rules:\n");
+            description.push_str(&summary);
+        }
+        options.push(permissions::option(
+            "allow_always",
+            "Always allow",
+            "allow_always",
+        ));
+    }
+    options.push(permissions::option("deny", "Deny", "reject_once"));
+    ApprovalPrompt {
+        tool_call_id: request
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        title: summarize_tool_call(tool, input),
+        description,
+        options,
+    }
+}
+
+/// The `addRules` permission updates Claude suggests for "don't ask again".
+/// Other suggestions (extra directories, switching mode) are left out so
+/// "Always allow" grants only this kind of call.
+fn claude_rule_suggestions(request: &Value) -> Vec<Value> {
+    request
+        .get("permission_suggestions")
+        .and_then(Value::as_array)
+        .map(|s| {
+            s.iter()
+                .filter(|u| u.get("type").and_then(Value::as_str) == Some("addRules"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn format_claude_rule_suggestions(suggestions: &[Value]) -> String {
+    let mut lines = Vec::new();
+    for suggestion in suggestions {
+        let dest = suggestion
+            .get("destination")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if let Some(rules) = suggestion.get("rules").and_then(Value::as_array) {
+            for rule in rules {
+                let tool = rule
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Tool");
+                let content = rule
+                    .get("ruleContent")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                let spec = match content {
+                    Some(c) => format!("{tool}({c})"),
+                    None => tool.to_string(),
+                };
+                match dest {
+                    Some(d) => lines.push(format!("- {spec} ({d})")),
+                    None => lines.push(format!("- {spec}")),
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// The control response for a `can_use_tool` request. `choice` is the
+/// selected option id; `None` (stopped or dismissed) denies and interrupts.
+fn claude_permission_response(request_id: &str, request: &Value, choice: Option<&str>) -> Value {
+    let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
+    let decision = match choice {
+        Some("allow") => json!({"behavior": "allow", "updatedInput": input}),
+        Some("allow_always") => json!({
+            "behavior": "allow",
+            "updatedInput": input,
+            "updatedPermissions": claude_rule_suggestions(request),
+        }),
+        Some(_) => json!({"behavior": "deny", "message": CLAUDE_DENY_MESSAGE}),
+        None => json!({
+            "behavior": "deny",
+            "message": CLAUDE_DENY_MESSAGE,
+            "interrupt": true,
+        }),
+    };
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": decision,
+        },
+    })
+}
+
+fn claude_control_error(request_id: &str, message: &str) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "error",
+            "request_id": request_id,
+            "error": message,
+        },
+    })
 }
 
 /// What a `stream-json` run has reported so far.
@@ -359,7 +665,11 @@ struct ClaudeStreamState {
     is_error: bool,
     /// `errors` of an `is_error` result line.
     errors: Vec<String>,
+    /// Tool uses the user denied, so their error results show as denied.
+    denied: DeniedTools,
 }
+
+type DeniedTools = Arc<std::sync::Mutex<HashSet<String>>>;
 
 fn handle_claude_json(
     val: &Value,
@@ -456,6 +766,13 @@ fn handle_claude_json(
                             .get("is_error")
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
+                        let status = if is_err && state.denied.lock().unwrap().contains(&id) {
+                            ToolCallStatus::Denied
+                        } else if is_err {
+                            ToolCallStatus::Failed
+                        } else {
+                            ToolCallStatus::Completed
+                        };
                         let output = block.get("content").map(|v| {
                             if let Some(s) = v.as_str() {
                                 s.to_string()
@@ -469,11 +786,7 @@ fn handle_claude_json(
                                 id,
                                 title: String::new(),
                                 kind: None,
-                                status: if is_err {
-                                    ToolCallStatus::Failed
-                                } else {
-                                    ToolCallStatus::Completed
-                                },
+                                status,
                                 input: None,
                                 output,
                             },
@@ -516,257 +829,6 @@ fn handle_claude_json(
     }
 }
 
-pub async fn run_codex_cli(
-    provider: &ProviderConfig,
-    session_id: &str,
-    external_session_id: Option<&str>,
-    model: Option<&str>,
-    effort: Option<&str>,
-    cwd: &Path,
-    target: &ExecTarget,
-    prompt: &str,
-    images: &[String],
-    auto_approve: bool,
-    events: EventBus,
-    mut cancel_rx: oneshot::Receiver<()>,
-) -> Result<()> {
-    let mut cmd = ArgList::new(&provider.args);
-    cmd.arg("exec");
-
-    if let Some(ext) = external_session_id.filter(|s| !s.trim().is_empty()) {
-        cmd.arg("resume").arg(ext);
-    }
-
-    cmd.arg("--json").arg("--skip-git-repo-check");
-
-    if auto_approve {
-        // What `--full-auto` did before Codex removed it; a config override
-        // also works for `exec resume`, which has no `--sandbox` flag.
-        cmd.arg("-c").arg("sandbox_mode=\"workspace-write\"");
-    }
-    if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
-        cmd.arg("-m").arg(m);
-    }
-    if let Some(e) = effort.filter(|s| !s.trim().is_empty()) {
-        cmd.arg("-c").arg(format!("model_reasoning_effort=\"{e}\""));
-    }
-    // `--image=<path>`: the spaced form takes several values and would
-    // swallow the `-` below.
-    for img in images {
-        cmd.arg(format!("--image={img}"));
-    }
-
-    // `-` reads the prompt from stdin, so prompt text starting with `-` is
-    // never parsed as an option.
-    cmd.arg("-");
-    let mut cmd = build_command(target, &provider.command, &cmd.0, cwd, &provider.env).await;
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to spawn '{}'", provider.command))?;
-    let stdin_task = write_prompt_to_stdin(&mut child, prompt)?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture Codex stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture Codex stderr"))?;
-
-    {
-        let events = events.clone();
-        let sid = session_id.to_string();
-        let pid = provider.id.clone();
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                events.publish(SameEvent::AgentLog {
-                    session_id: Some(sid.clone()),
-                    provider_id: pid.clone(),
-                    line,
-                });
-            }
-        });
-    }
-
-    let mut lines = BufReader::new(stdout).lines();
-
-    loop {
-        tokio::select! {
-            _ = &mut cancel_rx => {
-                let _ = child.kill().await;
-                events.publish(SameEvent::SessionCancelled {
-                    session_id: session_id.to_string(),
-                });
-                return Ok(());
-            }
-            line_res = lines.next_line() => {
-                match line_res? {
-                    Some(line) => {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                            handle_codex_json(&val, session_id, &events);
-                        } else {
-                            events.publish(SameEvent::AgentLog {
-                                session_id: Some(session_id.to_string()),
-                                provider_id: provider.id.clone(),
-                                line: trimmed.to_string(),
-                            });
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
-    }
-
-    let status = child.wait().await?;
-    if !status.success() {
-        return Err(anyhow!(
-            "Codex CLI exited with status {}",
-            status.code().unwrap_or(-1)
-        ));
-    }
-    if let Ok(Err(err)) = stdin_task.await {
-        return Err(err);
-    }
-
-    events.publish(SameEvent::SessionCompleted {
-        session_id: session_id.to_string(),
-        stop_reason: Some("end_turn".to_string()),
-    });
-    Ok(())
-}
-
-fn handle_codex_json(val: &Value, session_id: &str, events: &EventBus) {
-    let ev_type = val.get("type").and_then(Value::as_str).unwrap_or("");
-    match ev_type {
-        "thread.started" => {
-            if let Some(tid) = val.get("thread_id").and_then(Value::as_str) {
-                events.publish(SameEvent::ExternalSessionBound {
-                    session_id: session_id.to_string(),
-                    external_session_id: tid.to_string(),
-                });
-            }
-        }
-        "item.started" | "item.updated" | "item.completed" => {
-            let Some(item) = val.get("item") else {
-                return;
-            };
-            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-            let item_id = item
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("item")
-                .to_string();
-
-            match item_type {
-                "agent_message" if ev_type == "item.completed" => {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        events.publish(SameEvent::MessageDelta {
-                            session_id: session_id.to_string(),
-                            text: text.to_string(),
-                        });
-                    }
-                }
-                "reasoning" if ev_type == "item.completed" => {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        events.publish(SameEvent::ThinkingDelta {
-                            session_id: session_id.to_string(),
-                            text: text.to_string(),
-                        });
-                    }
-                }
-                "command_execution" => {
-                    let command = item
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Command")
-                        .to_string();
-                    let output = item
-                        .get("aggregated_output")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    let status = if ev_type == "item.completed" {
-                        let code = item.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
-                        if code == 0 {
-                            ToolCallStatus::Completed
-                        } else {
-                            ToolCallStatus::Failed
-                        }
-                    } else {
-                        ToolCallStatus::InProgress
-                    };
-                    let rec = ToolCallRecord {
-                        id: item_id,
-                        title: format!("Shell: {command}"),
-                        kind: Some("command_execution".to_string()),
-                        status,
-                        input: Some(command),
-                        output,
-                    };
-                    if ev_type == "item.started" {
-                        events.publish(SameEvent::ToolCallStarted {
-                            session_id: session_id.to_string(),
-                            tool_call: rec,
-                        });
-                    } else {
-                        events.publish(SameEvent::ToolCallUpdated {
-                            session_id: session_id.to_string(),
-                            tool_call: rec,
-                        });
-                    }
-                }
-                "file_change" => {
-                    let output = serde_json::to_string_pretty(item).ok();
-                    let rec = ToolCallRecord {
-                        id: item_id,
-                        title: "File change".to_string(),
-                        kind: Some("file_change".to_string()),
-                        status: if ev_type == "item.completed" {
-                            ToolCallStatus::Completed
-                        } else {
-                            ToolCallStatus::InProgress
-                        },
-                        input: None,
-                        output,
-                    };
-                    if ev_type == "item.started" {
-                        events.publish(SameEvent::ToolCallStarted {
-                            session_id: session_id.to_string(),
-                            tool_call: rec,
-                        });
-                    } else {
-                        events.publish(SameEvent::ToolCallUpdated {
-                            session_id: session_id.to_string(),
-                            tool_call: rec,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-        "error" => {
-            if let Some(msg) = val.get("message").and_then(Value::as_str) {
-                events.publish(SameEvent::SessionFailed {
-                    session_id: session_id.to_string(),
-                    error: msg.to_string(),
-                });
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Builds a one-line tool card title such as `Read src/main.rs` or
 /// `Bash: cargo test` from a Claude `tool_use` block.
 fn summarize_tool_call(name: &str, input: Option<&Value>) -> String {
@@ -801,8 +863,8 @@ fn summarize_tool_call(name: &str, input: Option<&Value>) -> String {
 #[cfg(test)]
 mod summarize_tests {
     use super::{
-        claude_failure_message, handle_claude_json, summarize_tool_call, ClaudeRun,
-        ClaudeStreamState,
+        claude_failure_message, claude_permission_prompt, claude_permission_response,
+        handle_claude_json, summarize_tool_call, ClaudeRun, ClaudeStreamState,
     };
     use same_core::EventBus;
     use serde_json::json;
@@ -854,6 +916,82 @@ mod summarize_tests {
             did_work: true,
         };
         assert!(!worked.is_missing_conversation("x"));
+    }
+
+    #[test]
+    fn claude_permission_prompt_and_responses() {
+        let request = json!({
+            "subtype": "can_use_tool",
+            "tool_name": "Bash",
+            "display_name": "Bash",
+            "input": {"command": "touch a.txt", "description": "Create a.txt"},
+            "description": "Create a.txt",
+            "permission_suggestions": [
+                {"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "touch a.txt"}],
+                 "behavior": "allow", "destination": "localSettings"},
+                {"type": "setMode", "mode": "acceptEdits", "destination": "session"}
+            ],
+            "tool_use_id": "toolu_1"
+        });
+        let prompt = claude_permission_prompt(&request);
+        assert_eq!(prompt.title, "Bash touch a.txt");
+        assert_eq!(prompt.tool_call_id.as_deref(), Some("toolu_1"));
+        let kinds: Vec<&str> = prompt.options.iter().map(|o| o.kind.as_str()).collect();
+        assert_eq!(kinds, ["allow_once", "allow_always", "reject_once"]);
+
+        let allow = claude_permission_response("r1", &request, Some("allow"));
+        assert_eq!(allow["type"], "control_response");
+        assert_eq!(allow["response"]["request_id"], "r1");
+        assert_eq!(allow["response"]["response"]["behavior"], "allow");
+        assert_eq!(
+            allow["response"]["response"]["updatedInput"]["command"],
+            "touch a.txt"
+        );
+
+        let always = claude_permission_response("r1", &request, Some("allow_always"));
+        let updates = always["response"]["response"]["updatedPermissions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["type"], "addRules");
+
+        let deny = claude_permission_response("r1", &request, Some("deny"));
+        assert_eq!(deny["response"]["response"]["behavior"], "deny");
+        assert!(deny["response"]["response"].get("interrupt").is_none());
+        let stopped = claude_permission_response("r1", &request, None);
+        assert_eq!(stopped["response"]["response"]["interrupt"], true);
+
+        let no_rules = json!({"tool_name": "Edit", "input": {"file_path": "x"}});
+        let kinds: Vec<String> = claude_permission_prompt(&no_rules)
+            .options
+            .into_iter()
+            .map(|o| o.kind)
+            .collect();
+        assert_eq!(kinds, ["allow_once", "reject_once"]);
+    }
+
+    #[test]
+    fn denied_tool_result_shows_as_denied() {
+        let events = EventBus::default();
+        let mut rx = events.subscribe();
+        let mut state = ClaudeStreamState::default();
+        state.denied.lock().unwrap().insert("toolu_1".into());
+        let val = json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": "denied"},
+            {"type": "tool_result", "tool_use_id": "toolu_2", "is_error": true, "content": "boom"}
+        ]}});
+        handle_claude_json(&val, "s", &events, &mut state);
+        let mut statuses = vec![];
+        while let Ok(same_core::SameEvent::ToolCallUpdated { tool_call, .. }) = rx.try_recv() {
+            statuses.push(tool_call.status);
+        }
+        assert_eq!(
+            statuses,
+            [
+                same_core::ToolCallStatus::Denied,
+                same_core::ToolCallStatus::Failed
+            ]
+        );
     }
 
     #[test]
