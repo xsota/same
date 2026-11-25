@@ -16,7 +16,7 @@ A lightweight, local-first, multi-provider AI agent desktop workspace written in
   - Antigravity (`agy acp`)
   - Custom ACP agents (configurable command, args, env, cwd)
 - **Structured Workspace**: Organize work into `Workspace -> Project -> Quest -> Session` (with quick sessions supported without forcing hierarchy).
-- **Streaming & Tool Visibility**: Real-time streaming responses, collapsible thinking/reasoning blocks, tool call cards, interactive permission approval dialogs for every provider (with live auto-approve toggle), and file/image attachments.
+- **Streaming & Tool Visibility**: Real-time streaming responses, collapsible thinking/reasoning blocks, tool call cards, approval cards with diffs and keyboard answers for every provider, question and plan cards, OS notifications while in the background, and file/image attachments.
 - **Local-First Storage**: All configuration (TOML) and conversation history (SQLite) are stored locally. Zero telemetry, no mandatory account.
 - **Built-in Workspace Tools**: File browser, file viewer/editor, and optional Git status/diff viewer for software development projects.
 - **Customizable & Bilingual UI**: Dark/Light themes, 6 accent color presets, configurable UI/monospace fonts and font size, configurable submit key, and Japanese/English UI support.
@@ -36,10 +36,27 @@ On Windows, agents run where the project lives. A project folder inside WSL (`\\
 | `Ctrl+S` | Save the file open in the file panel |
 | `Ctrl+L` | Focus the prompt |
 | `Ctrl+B` | Show / hide the Files · Git · Logs panel |
+| `1`–`9` / `N` or `Esc` | On an approval card (when it has the focus ring): pick that option / deny |
+| `1`–`9` / `Enter` / `Esc` | On a question card: pick an option / answer / skip |
 
 ## Picking the Agent and Model
 
 The row under the prompt has an agent picker, a model picker, and a reasoning effort picker (when supported by the selected model). Models are discovered dynamically from each provider (ACP `session/new`, Claude Code `initialize`, and Codex `app-server`). You can also type `/model <name>` (or `/model default`) in the prompt; typing `/` lists the commands, and `/model ` lists the models.
+
+## Approval Modes
+
+Each session has an approval mode, picked under the prompt (the default for new sessions is in Settings). A change applies to a running reply right away (for Codex, sandbox and policy changes apply on the next turn).
+
+| Mode | Claude Code | Codex | ACP agents |
+| --- | --- | --- | --- |
+| Plan | `--permission-mode plan` | read-only sandbox, plan collaboration mode | the agent's `plan` mode |
+| Ask (default) | `default` | workspace-write sandbox, `on-request` approvals | the agent's default mode |
+| Accept edits | `acceptEdits` | same as Ask | `acceptEdits`-like mode, else edits are allowed by SAME |
+| Full access | `bypassPermissions` | no sandbox, `never` asks | `bypassPermissions`-like mode, else everything is allowed by SAME |
+
+In plan mode the agent's questions (Claude Code's AskUserQuestion, Codex `request_user_input`) and its proposed plan show as cards; **Implement this plan** switches back to the mode the session had before and starts the work.
+
+The Claude Code and Codex CLIs run as one process per session that lives across turns (so "Allow for this session" grants last), and stop after 10 minutes unused; the next turn resumes the conversation.
 
 Double-click a session (in the sidebar or its title) to rename it. Delete buttons ask for a second click to confirm.
 
