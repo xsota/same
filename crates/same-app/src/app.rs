@@ -1,8 +1,8 @@
 use gpui_component::Selectable;
 use crate::i18n::t;
 use crate::theme::{
-    accent, accent_foreground, accent_text, apply_gpui_theme, status_amber, status_green,
-    status_red,
+    accent, accent_foreground, accent_text, apply_gpui_theme, default_font_size,
+    default_mono_font, default_ui_font, status_amber, status_green, status_red,
 };
 use crate::workspace_fs::{load_git_info, scan_directory, FileEntry, GitInfo};
 use chrono::{DateTime, Local, Utc};
@@ -29,6 +29,7 @@ use same_agent::{
 use same_core::paths::simplify_path;
 use same_core::{
     AccentColor, AppConfig, AppPaths, EventBus, ExecMode, Language, Message, MessageRole, ModelInfo,
+    SubmitKey, MAX_FONT_SIZE, MIN_FONT_SIZE,
     PermissionRequest, Project, ProviderConfig, ProviderKind, Quest, SameEvent, Session,
     SessionStatus, SlashCommandInfo, Storage, ThemeMode, ToolCallRecord, ToolCallStatus, Workspace,
 };
@@ -39,7 +40,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-actions!(same, [NewSession, SaveFile, FocusPrompt, ToggleRightPanel]);
+actions!(
+    same,
+    [NewSession, SaveFile, FocusPrompt, ToggleRightPanel, SendPrompt]
+);
 
 /// Registers the application-wide keyboard shortcuts.
 pub fn bind_keys(cx: &mut App) {
@@ -48,6 +52,17 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-s", SaveFile, None),
         KeyBinding::new("ctrl-l", FocusPrompt, None),
         KeyBinding::new("ctrl-b", ToggleRightPanel, None),
+        // Sends the prompt when the send key is Ctrl/Cmd+Enter, in case the
+        // textarea does not report that chord itself.
+        KeyBinding::new(
+            if cfg!(target_os = "macos") {
+                "cmd-enter"
+            } else {
+                "ctrl-enter"
+            },
+            SendPrompt,
+            None,
+        ),
     ]);
 }
 
@@ -153,6 +168,8 @@ pub struct SameAppView {
     ui_tx: mpsc::UnboundedSender<UiAsyncMsg>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    /// Subscription to `prompt_input`, replaced when the input is rebuilt.
+    _prompt_sub: Subscription,
 
     active_view: MainView,
     settings_section: SettingsSection,
@@ -242,6 +259,20 @@ pub struct SameAppView {
     custom_cmd: Entity<InputState>,
     custom_args: Entity<InputState>,
     custom_desc: Entity<InputState>,
+
+    // Settings → Appearance font pickers
+    /// Installed font families, sorted.
+    font_names: Vec<String>,
+    /// The open font dropdown: `Some(false)` UI font, `Some(true)` code font.
+    font_menu_open: Option<bool>,
+    /// Virtualized rows of the font dropdown, one per `font_rows` entry.
+    /// Shared by both pickers (only one is open at a time).
+    font_list: ListState,
+    /// The dropdown's rows after filtering: `None` is the platform default,
+    /// `Some(i)` is `font_names[i]`.
+    font_rows: Vec<Option<usize>>,
+    /// Search box at the top of the font dropdown.
+    font_search: Entity<InputState>,
 }
 
 impl SameAppView {
@@ -258,7 +289,11 @@ impl SameAppView {
         // would otherwise show a Stop button that can never do anything.
         let _ = storage.reset_active_sessions();
 
-        apply_gpui_theme(config.theme, config.accent, Some(window), cx);
+        apply_gpui_theme(&config, Some(window), cx);
+        // Installed font families, for the font pickers in Settings.
+        let mut font_names = cx.text_system().all_font_names();
+        font_names.sort_by_key(|n| n.to_lowercase());
+        font_names.dedup();
 
         let rt = Arc::new(tokio::runtime::Runtime::new()?);
         let events = EventBus::new(1024);
@@ -319,11 +354,8 @@ impl SameAppView {
             projects.first().map(|p| p.id.clone())
         };
 
-        let prompt_input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(2, 12)
-                .submit_on_enter(true)
-        });
+        let prompt_input = Self::new_prompt_input(config.submit_key, window, cx);
+        let prompt_sub = cx.subscribe_in(&prompt_input, window, Self::on_prompt_event);
         let rename_input = cx.new(|cx| InputState::new(window, cx));
         let file_filter_input = cx.new(|cx| InputState::new(window, cx));
         let file_editor_input = cx.new(|cx| TextareaState::new(window, cx));
@@ -342,35 +374,9 @@ impl SameAppView {
         let custom_cmd = cx.new(|cx| InputState::new(window, cx));
         let custom_args = cx.new(|cx| InputState::new(window, cx));
         let custom_desc = cx.new(|cx| InputState::new(window, cx));
+        let font_search = cx.new(|cx| InputState::new(window, cx));
 
         let mut subscriptions = vec![
-            cx.subscribe_in(
-                &prompt_input,
-                window,
-                |this, state, ev: &InputEvent, window, cx| match ev {
-                    // Shift+Enter inserts a newline but still emits PressEnter.
-                    InputEvent::PressEnter { shift: false, .. } => {
-                        this.send_current_prompt(window, cx);
-                        cx.notify();
-                    }
-                    InputEvent::Change => {
-                        let value = state.read(cx).value();
-                        let empty = value.trim().is_empty();
-                        let is_command = value.starts_with('/') && !value.contains('\n');
-                        // Suggestions filter on every keystroke while a
-                        // command is typed, so notify for those too.
-                        if empty != this.prompt_empty
-                            || is_command
-                            || is_command != this.prompt_is_command
-                        {
-                            this.prompt_empty = empty;
-                            this.prompt_is_command = is_command;
-                            cx.notify();
-                        }
-                    }
-                    _ => {}
-                },
-            ),
             cx.subscribe_in(&rename_input, window, |this, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                     this.commit_rename(cx);
@@ -431,6 +437,29 @@ impl SameAppView {
                     }
                 },
             ),
+            // Font dropdown search: typing filters the rows, Enter picks the
+            // first match.
+            cx.subscribe_in(
+                &font_search,
+                window,
+                |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::Change => {
+                        this.filter_font_rows(cx);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        if let (Some(mono), Some(&row)) =
+                            (this.font_menu_open, this.font_rows.first())
+                        {
+                            let family = row.map(|i| this.font_names[i].clone());
+                            this.set_font(mono, family, window, cx);
+                            this.font_menu_open = None;
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
         ];
 
         // Stop agent processes on quit so none outlive the app.
@@ -457,6 +486,7 @@ impl SameAppView {
             ui_tx,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
+            _prompt_sub: prompt_sub,
             active_view: MainView::Chat,
             settings_section: SettingsSection::General,
             workspace,
@@ -522,6 +552,13 @@ impl SameAppView {
             custom_cmd,
             custom_args,
             custom_desc,
+            font_list: ListState::new(font_names.len() + 1, ListAlignment::Top, px(200.0)),
+            font_rows: std::iter::once(None)
+                .chain((0..font_names.len()).map(Some))
+                .collect(),
+            font_names,
+            font_menu_open: None,
+            font_search,
         };
 
         app.apply_placeholders(window, cx);
@@ -545,8 +582,8 @@ impl SameAppView {
             s.set_placeholder(
                 t(
                     lang,
-                    "メッセージを入力…  (Enter で送信 / Shift+Enter で改行)",
-                    "Message the agent…  (Enter to send, Shift+Enter for newline)",
+                    "メッセージを入力…  (/ でコマンド)",
+                    "Message the agent…  (/ for commands)",
                 ),
                 window,
                 cx,
@@ -607,6 +644,12 @@ impl SameAppView {
         set_input(
             &self.custom_desc,
             t(lang, "このエージェントの説明", "What this agent is for"),
+            window,
+            cx,
+        );
+        set_input(
+            &self.font_search,
+            t(lang, "フォントを検索…", "Search fonts…"),
             window,
             cx,
         );
@@ -2090,7 +2133,7 @@ impl SameAppView {
             return;
         }
         self.config.theme = mode;
-        apply_gpui_theme(mode, self.config.accent, Some(window), cx);
+        apply_gpui_theme(&self.config, Some(window), cx);
         self.save_config();
     }
 
@@ -2099,8 +2142,165 @@ impl SameAppView {
             return;
         }
         self.config.accent = accent_color;
-        apply_gpui_theme(self.config.theme, accent_color, Some(window), cx);
+        apply_gpui_theme(&self.config, Some(window), cx);
         self.save_config();
+    }
+
+    /// Sets the UI (`mono == false`) or code font; `None` restores the
+    /// platform default.
+    fn set_font(
+        &mut self,
+        mono: bool,
+        family: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let family = family
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty());
+        let slot = if mono {
+            &mut self.config.mono_font
+        } else {
+            &mut self.config.ui_font
+        };
+        if *slot == family {
+            return;
+        }
+        *slot = family;
+        apply_gpui_theme(&self.config, Some(window), cx);
+        self.save_config();
+        self.feed.remeasure();
+        window.refresh();
+    }
+
+    /// Opens (or closes, if already open) the font dropdown of one picker:
+    /// clears the search, focuses it and scrolls to the current choice.
+    fn toggle_font_menu(&mut self, mono: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.font_menu_open == Some(mono) {
+            self.font_menu_open = None;
+            return;
+        }
+        self.font_menu_open = Some(mono);
+        self.font_search.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.focus(window, cx);
+        });
+        self.filter_font_rows(cx);
+        let current = if mono {
+            &self.config.mono_font
+        } else {
+            &self.config.ui_font
+        };
+        let target = current
+            .as_deref()
+            .and_then(|c| self.font_names.iter().position(|n| n == c));
+        if let Some(ix) = self.font_rows.iter().position(|r| *r == target) {
+            self.font_list.scroll_to(gpui::ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.0),
+            });
+        }
+    }
+
+    /// Rebuilds `font_rows` from the search box: case-insensitive substring
+    /// match; the "default" row only shows while the search is empty.
+    fn filter_font_rows(&mut self, cx: &mut Context<Self>) {
+        let query = self.font_search.read(cx).value().trim().to_lowercase();
+        self.font_rows = if query.is_empty() {
+            std::iter::once(None)
+                .chain((0..self.font_names.len()).map(Some))
+                .collect()
+        } else {
+            self.font_names
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.to_lowercase().contains(&query))
+                .map(|(i, _)| Some(i))
+                .collect()
+        };
+        self.font_list.reset(self.font_rows.len());
+    }
+
+    /// Sets the base font size in px; `None` restores the default.
+    fn set_font_size(&mut self, size: Option<f32>, window: &mut Window, cx: &mut Context<Self>) {
+        let size = size.map(|s| s.round().clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        if self.config.font_size() == size {
+            return;
+        }
+        self.config.font_size = size;
+        apply_gpui_theme(&self.config, Some(window), cx);
+        self.save_config();
+        self.feed.remeasure();
+        self.font_list.remeasure();
+        window.refresh();
+    }
+
+    /// The chat prompt. With [`SubmitKey::Enter`] the textarea sends on
+    /// Enter itself; otherwise Enter inserts a newline and
+    /// [`Self::on_prompt_event`] sends on Ctrl/Cmd+Enter.
+    fn new_prompt_input(
+        submit_key: SubmitKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextareaState> {
+        cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 12)
+                .submit_on_enter(submit_key == SubmitKey::Enter)
+        })
+    }
+
+    fn on_prompt_event(
+        &mut self,
+        state: &Entity<TextareaState>,
+        ev: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match ev {
+            InputEvent::PressEnter { shift, .. } => {
+                let send = match self.config.submit_key {
+                    // Shift+Enter inserts a newline but still emits PressEnter.
+                    SubmitKey::Enter => !*shift,
+                    // Enter already inserted its newline; the prompt is
+                    // trimmed before sending.
+                    SubmitKey::ModEnter => window.modifiers().secondary(cx),
+                };
+                if send {
+                    self.send_current_prompt(window, cx);
+                    cx.notify();
+                }
+            }
+            InputEvent::Change => {
+                let value = state.read(cx).value();
+                let empty = value.trim().is_empty();
+                let is_command = value.starts_with('/') && !value.contains('\n');
+                // Suggestions filter on every keystroke while a command is
+                // typed, so notify for those too.
+                if empty != self.prompt_empty
+                    || is_command
+                    || is_command != self.prompt_is_command
+                {
+                    self.prompt_empty = empty;
+                    self.prompt_is_command = is_command;
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Switches the send key in place, preserving the draft's undo history,
+    /// selection, and caret position.
+    fn set_submit_key(&mut self, key: SubmitKey, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.submit_key == key {
+            return;
+        }
+        self.config.submit_key = key;
+        self.save_config();
+        self.prompt_input
+            .update(cx, |ta, cx| ta.set_submit_on_enter(key == SubmitKey::Enter, cx));
+        self.apply_placeholders(window, cx);
     }
 
     fn set_auto_approve(&mut self, value: bool) {
@@ -3659,6 +3859,39 @@ impl SameAppView {
                 },
             ));
 
+        let submit_key = self.config.submit_key;
+        let mod_key = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+        let submit_key_control = div().h_flex().gap_1().children(
+            [
+                (SubmitKey::Enter, "Enter".to_string()),
+                (SubmitKey::ModEnter, format!("{mod_key}+Enter")),
+            ]
+            .map(|(value, label)| {
+                Button::new(SharedString::from(format!("set-submit-key-{value:?}")))
+                    .small()
+                    .label(label)
+                    .toggled(submit_key == value)
+                    .when(submit_key == value, |b| b.primary())
+                    .when(submit_key != value, |b| b.ghost())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_submit_key(value, window, cx);
+                        cx.notify();
+                    }))
+            }),
+        );
+        let submit_key_hint = match (submit_key, lang) {
+            (SubmitKey::Enter, Language::Ja) => "Enter で送信、Shift+Enter で改行".to_string(),
+            (SubmitKey::Enter, Language::En) => {
+                "Enter sends, Shift+Enter inserts a newline".to_string()
+            }
+            (SubmitKey::ModEnter, Language::Ja) => {
+                format!("{mod_key}+Enter で送信、Enter で改行")
+            }
+            (SubmitKey::ModEnter, Language::En) => {
+                format!("{mod_key}+Enter sends, Enter inserts a newline")
+            }
+        };
+
         div()
             .v_flex()
             .gap_4()
@@ -3689,6 +3922,13 @@ impl SameAppView {
                             "Agent used for new sessions when no session is selected",
                         ),
                         default_provider_control,
+                        false,
+                        &theme,
+                    ))
+                    .child(settings_row(
+                        t(lang, "送信キー", "Send key"),
+                        &submit_key_hint,
+                        submit_key_control,
                         false,
                         &theme,
                     ))
@@ -3816,8 +4056,8 @@ impl SameAppView {
                 SettingsSection::Appearance.title(lang),
                 t(
                     lang,
-                    "テーマとアクセントカラーを変更します",
-                    "Theme and accent colour",
+                    "テーマ・アクセントカラー・フォントを変更します",
+                    "Theme, accent colour and fonts",
                 ),
                 &theme,
                 None,
@@ -3861,6 +4101,330 @@ impl SameAppView {
                             .child(preview),
                     ),
             )
+            .child(
+                settings_card(&theme)
+                    .child(settings_row(
+                        t(lang, "フォントサイズ", "Font size"),
+                        t(
+                            lang,
+                            "UI 全体の文字の大きさ (コードも同じ比率で拡大縮小)",
+                            "Base text size for the whole UI (code scales with it)",
+                        ),
+                        self.render_font_size_control(cx),
+                        true,
+                        &theme,
+                    ))
+                    .child(self.render_font_picker(false, cx))
+                    .child(self.render_font_picker(true, cx)),
+            )
+    }
+
+    fn render_font_size_control(&self, cx: &mut Context<Self>) -> Div {
+        let lang = self.config.language;
+        let overridden = self.config.font_size().is_some();
+        let size = self
+            .config
+            .font_size()
+            .unwrap_or_else(default_font_size)
+            .round();
+
+        div()
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("font-size-dec")
+                    .small()
+                    .ghost()
+                    .label("−")
+                    .disabled(size <= MIN_FONT_SIZE)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_font_size(Some(size - 1.0), window, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .w(px(56.0))
+                    .text_center()
+                    .text_sm()
+                    .child(format!("{size:.0} px")),
+            )
+            .child(
+                Button::new("font-size-inc")
+                    .small()
+                    .ghost()
+                    .label("+")
+                    .disabled(size >= MAX_FONT_SIZE)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_font_size(Some(size + 1.0), window, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("font-size-reset")
+                    .small()
+                    .ghost()
+                    .label(t(lang, "既定に戻す", "Reset"))
+                    .disabled(!overridden)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_font_size(None, window, cx);
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// Picker for the UI font (`mono == false`) or the code font: a
+    /// dropdown of installed fonts, each drawn in itself, and a preview.
+    fn render_font_picker(&self, mono: bool, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+        let (current, default_name) = if mono {
+            (&self.config.mono_font, default_mono_font())
+        } else {
+            (&self.config.ui_font, default_ui_font())
+        };
+        let overridden = current.is_some();
+        let family: SharedString = current
+            .clone()
+            .unwrap_or_else(|| default_name.to_string())
+            .into();
+        let open = self.font_menu_open == Some(mono);
+
+        let (label, hint, sample) = if mono {
+            (
+                t(lang, "コードフォント", "Code font"),
+                t(
+                    lang,
+                    "コードブロック・ツール出力・ファイルエディタ・ログ",
+                    "Code blocks, tool output, the file editor and logs",
+                ),
+                "fn main() { let x = [0, O, 1, l, I]; } // コメント",
+            )
+        } else {
+            (
+                t(lang, "UI フォント", "UI font"),
+                t(lang, "メニュー・チャット・ボタンなど", "Menus, chat, buttons and so on"),
+                "あいうえお 漢字 カタカナ — The quick brown fox 0123",
+            )
+        };
+
+        div()
+            .v_flex()
+            .gap_2()
+            .px_4()
+            .py_3()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_0p5()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(hint),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            // Dropdown trigger: the current font, in itself.
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("font-trigger-{mono}")))
+                                    .h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .w(px(280.0))
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(if open { theme.ring } else { theme.border })
+                                    .bg(theme.background)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme.list_hover))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_family(family.clone())
+                                            .child(if overridden {
+                                                family.to_string()
+                                            } else {
+                                                format!("{family} ({})", t(lang, "既定", "default"))
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(if open { "▴" } else { "▾" }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.toggle_font_menu(mono, window, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("font-reset-{mono}")))
+                                    .small()
+                                    .ghost()
+                                    .label(t(lang, "既定に戻す", "Reset"))
+                                    .disabled(!overridden)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.set_font(mono, None, window, cx);
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            // Dropdown: a search box over every installed font, virtualized
+            // so only the rows on screen are laid out (and their fonts
+            // loaded).
+            .when(open, |el| {
+                let empty = self.font_rows.is_empty();
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("font-menu-{mono}")))
+                        .v_flex()
+                        .gap_1()
+                        .p_1()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .shadow_md()
+                        // The settings page scrolls too: keep wheel events
+                        // that land on the dropdown away from it, so the
+                        // list (not the page) scrolls.
+                        .occlude()
+                        .on_scroll(|_, _, cx| cx.stop_propagation())
+                        .child(Input::new(&self.font_search).small())
+                        .child(
+                            div()
+                                .h(px(300.0))
+                                .when(empty, |el| {
+                                    el.p_2()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(t(
+                                            lang,
+                                            "一致するフォントがありません",
+                                            "No matching fonts",
+                                        ))
+                                })
+                                .when(!empty, |el| {
+                                    el.child(
+                                        list(
+                                            self.font_list.clone(),
+                                            cx.processor(|this, ix: usize, _window, cx| {
+                                                this.render_font_option(ix, cx)
+                                            }),
+                                        )
+                                        .size_full(),
+                                    )
+                                }),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .px_2()
+                    .py_1p5()
+                    .rounded(px(4.0))
+                    .bg(theme.background)
+                    .text_sm()
+                    .font_family(family)
+                    .child(sample),
+            )
+    }
+
+    /// Row `ix` of the open font dropdown (see `font_rows`): the platform
+    /// default or an installed font, drawn in its own font.
+    fn render_font_option(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(mono) = self.font_menu_open else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+        let current = if mono {
+            self.config.mono_font.as_deref()
+        } else {
+            self.config.ui_font.as_deref()
+        };
+        let (value, family, label): (Option<String>, SharedString, String) =
+            match self.font_rows.get(ix) {
+                Some(None) => {
+                    let name = if mono {
+                        default_mono_font()
+                    } else {
+                        default_ui_font()
+                    };
+                    (
+                        None,
+                        name.into(),
+                        format!("{} — {name}", t(lang, "既定", "Default")),
+                    )
+                }
+                Some(Some(i)) => match self.font_names.get(*i) {
+                    Some(name) => (Some(name.clone()), name.clone().into(), name.clone()),
+                    None => return div().into_any_element(),
+                },
+                None => return div().into_any_element(),
+            };
+        let selected = current == value.as_deref();
+        let sample = if mono { "0O1lI {}[]" } else { "あア漢 Aa" };
+
+        div()
+            .py(px(1.0))
+            .child(
+                list_row(SharedString::from(format!("font-opt-{ix}")), selected, &theme)
+                    .justify_between()
+                    .font_family(family)
+                    .child(div().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(sample),
+                            )
+                            .when(selected, |el| el.child(Icon::new(IconName::Check).small())),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_font(mono, value.clone(), window, cx);
+                        this.font_menu_open = None;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
     }
 }
 
@@ -4284,26 +4848,8 @@ impl SameAppView {
                                 cx.notify();
                             })),
                     )
-                    .when(running, |el| {
-                        el.child(
-                            div()
-                                .h_flex()
-                                .gap_1()
-                                .items_center()
-                                .child(crate::brand::mascot_loader(
-                                    "composer-loader",
-                                    14.0,
-                                    theme.foreground,
-                                ))
-                                .child(t(lang, "応答中…", "Responding…")),
-                        )
-                    }),
+                    .when(running, |el| el.child(t(lang, "応答中…", "Responding…"))),
             )
-            .child(div().flex_shrink_0().child(t(
-                lang,
-                "Enter 送信 · Shift+Enter 改行 · / コマンド",
-                "Enter send · Shift+Enter newline · / commands",
-            )))
     }
 
     /// Suggestions shown above the prompt while a `/command` is typed:
@@ -6017,6 +6563,19 @@ impl Render for SameAppView {
                 this.prompt_input.update(cx, |s, cx| s.focus(window, cx));
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &SendPrompt, window, cx| {
+                let focused = this
+                    .prompt_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window);
+                if this.config.submit_key == SubmitKey::ModEnter && focused {
+                    this.send_current_prompt(window, cx);
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| {
                 this.show_right_panel = !this.show_right_panel;
                 cx.notify();
@@ -6028,7 +6587,9 @@ impl Render for SameAppView {
                         .read(cx)
                         .focus_handle(cx)
                         .is_focused(window);
-                    if this.renaming_session_id.take().is_some() {
+                    if this.renaming_session_id.take().is_some()
+                        || this.font_menu_open.take().is_some()
+                    {
                         cx.notify();
                     } else if prompt_focused
                         && this

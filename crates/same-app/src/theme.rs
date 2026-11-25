@@ -1,7 +1,8 @@
-use gpui::{rgb, App, Hsla, Rgba, Window};
+use gpui::{px, rgb, App, Hsla, Pixels, Rgba, SharedString, Window};
 use gpui_component::theme::{Theme, ThemeMode as GpuiThemeMode};
-use same_core::{AccentColor, ThemeMode};
+use same_core::{AppConfig, ThemeMode};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 /// The current accent as 0xRRGGBB. Read by [`accent`] during render, set by
 /// [`apply_gpui_theme`].
@@ -109,12 +110,52 @@ fn accent_text_for_mode(hex: u32, mode: ThemeMode) -> u32 {
     target
 }
 
-pub fn apply_gpui_theme(
-    mode: ThemeMode,
-    accent_color: AccentColor,
-    window: Option<&mut Window>,
-    cx: &mut App,
-) {
+/// Platform default UI font.
+pub fn default_ui_font() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Yu Gothic UI"
+    } else if cfg!(target_os = "linux") {
+        "DejaVu Sans"
+    } else {
+        ".SystemUIFont"
+    }
+}
+
+/// Platform default code font.
+pub fn default_mono_font() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Consolas"
+    } else if cfg!(target_os = "linux") {
+        "DejaVu Sans Mono"
+    } else {
+        "Menlo"
+    }
+}
+
+/// gpui-component's base font size (px) before any user override; captured
+/// in [`apply_gpui_theme`] so the settings screen can show it.
+static DEFAULT_FONT_SIZE_BITS: AtomicU32 = AtomicU32::new(0x4180_0000); // 16.0
+/// (font_size, mono_font_size) as gpui-component first set them.
+static DEFAULT_SIZES: OnceLock<(Pixels, Pixels)> = OnceLock::new();
+
+pub fn default_font_size() -> f32 {
+    f32::from_bits(DEFAULT_FONT_SIZE_BITS.load(Ordering::Relaxed))
+}
+
+pub fn apply_gpui_theme(config: &AppConfig, window: Option<&mut Window>, cx: &mut App) {
+    let mode = config.theme;
+    let accent_color = config.accent;
+    let ui_font: SharedString = config
+        .ui_font
+        .clone()
+        .unwrap_or_else(|| default_ui_font().to_string())
+        .into();
+    let mono_font: SharedString = config
+        .mono_font
+        .clone()
+        .unwrap_or_else(|| default_mono_font().to_string())
+        .into();
+    let font_size = config.font_size();
     let gpui_mode = match mode {
         ThemeMode::Dark => GpuiThemeMode::Dark,
         ThemeMode::Light => GpuiThemeMode::Light,
@@ -151,15 +192,30 @@ pub fn apply_gpui_theme(
         });
         theme.list_active_border = base;
 
-        #[cfg(target_os = "linux")]
-        {
-            theme.font_family = "DejaVu Sans".into();
-            theme.mono_font_family = "DejaVu Sans Mono".into();
+        // Always assigned (not only when overridden) so "reset" takes effect
+        // even if `Theme::change` keeps the previous families.
+        theme.font_family = ui_font.clone();
+        theme.mono_font_family = mono_font.clone();
+
+        // `Root` uses `font_size` as the window's rem size, so every
+        // rem-based text size (text_sm, text_xs, …) follows it. Code text
+        // scales by the same ratio. The defaults are captured once, before
+        // any override, because `Theme::change` may keep the sizes as is.
+        let (default_size, default_mono) =
+            *DEFAULT_SIZES.get_or_init(|| (theme.font_size, theme.mono_font_size));
+        let default_px = f32::from(default_size);
+        if default_px > 0.0 {
+            DEFAULT_FONT_SIZE_BITS.store(default_px.to_bits(), Ordering::Relaxed);
         }
-        #[cfg(target_os = "windows")]
-        {
-            theme.font_family = "Yu Gothic UI".into();
-            theme.mono_font_family = "Consolas".into();
+        match font_size {
+            Some(size) if default_px > 0.0 => {
+                theme.font_size = px(size);
+                theme.mono_font_size = default_mono * (size / default_px);
+            }
+            _ => {
+                theme.font_size = default_size;
+                theme.mono_font_size = default_mono;
+            }
         }
     });
 }
@@ -167,6 +223,7 @@ pub fn apply_gpui_theme(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use same_core::AccentColor;
 
     #[test]
     fn primary_button_states_meet_wcag_aa_contrast() {

@@ -67,6 +67,17 @@ impl AccentColor {
     }
 }
 
+/// Which key sends the chat prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitKey {
+    /// Enter sends; Shift+Enter inserts a newline.
+    #[default]
+    Enter,
+    /// Ctrl+Enter (Cmd+Enter on macOS) sends; Enter inserts a newline.
+    ModEnter,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Language {
@@ -125,12 +136,25 @@ pub struct AppConfig {
     pub theme: ThemeMode,
     #[serde(default)]
     pub accent: AccentColor,
+    /// UI font family. `None` uses the platform default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_font: Option<String>,
+    /// Font family for code, logs and the file editor. `None` uses the
+    /// platform default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mono_font: Option<String>,
+    /// Base UI font size in px; every rem-based size scales with it.
+    /// `None` uses the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f32>,
     #[serde(default)]
     pub language: Language,
     #[serde(default = "default_provider_id")]
     pub default_provider_id: String,
     #[serde(default)]
     pub auto_approve_tools: bool,
+    #[serde(default)]
+    pub submit_key: SubmitKey,
     #[serde(default = "default_providers")]
     pub providers: Vec<ProviderConfig>,
     /// Per-project overrides of [`ExecMode`], keyed by project folder.
@@ -209,9 +233,13 @@ impl Default for AppConfig {
         Self {
             theme: ThemeMode::Dark,
             accent: AccentColor::default(),
+            ui_font: None,
+            mono_font: None,
+            font_size: None,
             language: Language::Ja,
             default_provider_id: default_provider_id(),
             auto_approve_tools: false,
+            submit_key: SubmitKey::default(),
             providers: default_providers(),
             project_exec: BTreeMap::new(),
         }
@@ -254,7 +282,19 @@ impl AppConfig {
     pub fn find_provider(&self, id: &str) -> Option<&ProviderConfig> {
         self.providers.iter().find(|p| p.id == id)
     }
+
+    /// The configured font size, clamped to the supported range. A
+    /// hand-edited out-of-range or non-finite value counts as unset.
+    pub fn font_size(&self) -> Option<f32> {
+        self.font_size
+            .filter(|s| s.is_finite())
+            .map(|s| s.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE))
+    }
 }
+
+/// Bounds of the UI font size setting, in px.
+pub const MIN_FONT_SIZE: f32 = 10.0;
+pub const MAX_FONT_SIZE: f32 = 24.0;
 
 #[cfg(test)]
 mod tests {
@@ -266,6 +306,7 @@ mod tests {
         let cfg: AppConfig = toml::from_str(raw).unwrap();
         assert_eq!(cfg.theme, ThemeMode::Light);
         assert_eq!(cfg.accent, AccentColor::Teal);
+        assert_eq!(cfg.submit_key, SubmitKey::Enter);
         assert!(!cfg.providers.is_empty());
     }
 
@@ -277,5 +318,34 @@ mod tests {
         let back: AppConfig = toml::from_str(&raw).unwrap();
         assert_eq!(back.accent, AccentColor::Purple);
         assert_eq!(back.providers.len(), cfg.providers.len());
+    }
+
+    #[test]
+    fn unset_fonts_are_omitted_and_set_fonts_round_trip() {
+        let cfg = AppConfig::default();
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!raw.contains("ui_font"));
+        assert!(!raw.contains("font_size"));
+
+        let mut cfg = AppConfig::default();
+        cfg.ui_font = Some("Noto Sans JP".into());
+        cfg.mono_font = Some("JetBrains Mono".into());
+        cfg.font_size = Some(15.0);
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let back: AppConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(back.ui_font.as_deref(), Some("Noto Sans JP"));
+        assert_eq!(back.mono_font.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(back.font_size(), Some(15.0));
+    }
+
+    #[test]
+    fn font_size_is_clamped() {
+        let mut cfg = AppConfig::default();
+        cfg.font_size = Some(100.0);
+        assert_eq!(cfg.font_size(), Some(MAX_FONT_SIZE));
+        cfg.font_size = Some(1.0);
+        assert_eq!(cfg.font_size(), Some(MIN_FONT_SIZE));
+        cfg.font_size = Some(f32::NAN);
+        assert_eq!(cfg.font_size(), None);
     }
 }
