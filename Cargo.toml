@@ -28,6 +28,7 @@ gpui = { package = "gpui-pre", version = "0.3.14" }
 gpui-platform = { package = "gpui-pre-platform", version = "0.3.14", features = ["wayland", "x11"] }
 gpui-component = "0.11.0"
 gpui-kit-assets = "0.11.0"
+notify-rust = "4.19"
 same-core = { path = "crates/same-core" }
 same-acp = { path = "crates/same-acp" }
 same-agent = { path = "crates/same-agent" }

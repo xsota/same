@@ -1,8 +1,11 @@
 use crate::adapters::{
-    claude_prompt_with_attachments, codex_prompt_with_attachments, is_image_path, run_claude_cli,
+    claude_prompt_with_attachments, codex_prompt_with_attachments, is_image_path,
 };
-use crate::codex::run_codex_cli;
-use crate::permissions::PermissionGate;
+use crate::claude::{run_claude_turn, ClaudeControls, ClaudePool, ClaudeTurn};
+use crate::codex::{run_codex_turn, CodexPool, CodexTurnRequest};
+use crate::diff;
+use crate::permissions::{mode_of, Answers, AutoAllow, InputResponders, ModeStore, PermissionGate};
+use crate::process::IDLE_TIMEOUT;
 use anyhow::{Context, Result};
 use same_acp::exec::{
     self, build_command, build_console_command, resolve_target, ConsoleScript, ExecPreference,
@@ -13,9 +16,11 @@ use same_acp::{
     SessionUpdate,
 };
 use same_core::{
-    EventBus, ModelInfo, PermissionOption, PermissionRequest, ProviderCapabilities, ProviderConfig,
-    ProviderKind, SameEvent, SessionStatus, SlashCommandInfo, ToolCallRecord, ToolCallStatus,
+    ApprovalMode, EventBus, ModelInfo, PermissionOption, PermissionRequest, ProviderCapabilities,
+    ProviderConfig, ProviderKind, SameEvent, SessionStatus, SlashCommandInfo, ToolCallRecord,
+    ToolCallStatus,
 };
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -37,6 +42,8 @@ pub struct PromptRequest {
     pub attachments: Vec<PathBuf>,
     /// Where the project's agents should run (see [`ExecPreference`]).
     pub exec: ExecPreference,
+    /// The session's approval mode.
+    pub mode: ApprovalMode,
 }
 
 /// A one-off setup step for a provider's CLI.
@@ -81,6 +88,10 @@ struct AcpSessionHandle {
     /// The models the agent offers and the one in use; also updated by the
     /// agent's `config_option_update` notifications.
     model_state: SharedModelState,
+    /// The agent's `modes` (`availableModes` / `currentModeId`), if any.
+    modes: Option<Value>,
+    /// The last confirmed ACP mode id on this session.
+    current_mode_id: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 type SharedModelState = Arc<Mutex<Option<AcpModelState>>>;
@@ -117,9 +128,13 @@ pub struct AgentManager {
     /// Per ACP provider: the model and effort a fresh session starts with,
     /// restored when a session goes back to "Default".
     acp_defaults: Arc<Mutex<HashMap<String, AcpDefaults>>>,
-    /// Live tool auto-approval policy shared with all running and starting ACP
-    /// clients.
-    auto_approve: Arc<std::sync::atomic::AtomicBool>,
+    input_responders: InputResponders,
+    /// Each session's approval mode, read live by prompts.
+    modes: ModeStore,
+    gate: PermissionGate,
+    claude_pool: Arc<ClaudePool>,
+    claude_controls: ClaudeControls,
+    codex_pool: Arc<CodexPool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,32 +146,137 @@ struct AcpDefaults {
 
 impl AgentManager {
     pub fn new(events: EventBus, runtime: tokio::runtime::Handle) -> Self {
-        Self {
+        let permission_responders = Arc::new(Mutex::new(HashMap::new()));
+        let input_responders = InputResponders::default();
+        let modes = ModeStore::default();
+        let gate = PermissionGate::new(
+            events.clone(),
+            permission_responders.clone(),
+            input_responders.clone(),
+            modes.clone(),
+        );
+        let manager = Self {
             events,
             runtime,
             acp_sessions: Arc::new(Mutex::new(HashMap::new())),
             cancellers: Arc::new(Mutex::new(HashMap::new())),
-            permission_responders: Arc::new(Mutex::new(HashMap::new())),
+            permission_responders,
             acp_defaults: Arc::new(Mutex::new(HashMap::new())),
-            auto_approve: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            input_responders,
+            modes,
+            gate,
+            claude_pool: Arc::new(ClaudePool::default()),
+            claude_controls: ClaudeControls::default(),
+            codex_pool: Arc::new(CodexPool::default()),
+        };
+        // Stops CLI agent processes left idle.
+        {
+            let claude = Arc::downgrade(&manager.claude_pool);
+            let codex = Arc::downgrade(&manager.codex_pool);
+            manager.runtime.spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    tick.tick().await;
+                    let (Some(claude), Some(codex)) = (claude.upgrade(), codex.upgrade()) else {
+                        break;
+                    };
+                    claude.reap_idle(IDLE_TIMEOUT).await;
+                    codex.reap_idle(IDLE_TIMEOUT).await;
+                }
+            });
         }
+        manager
     }
 
-    /// Routes CLI adapter permission prompts to the approval UI (or the live
-    /// auto-approve policy).
-    fn permission_gate(&self) -> PermissionGate {
-        PermissionGate::new(
-            self.events.clone(),
-            self.permission_responders.clone(),
-            self.auto_approve.clone(),
-        )
+    /// Changes a session's approval mode, also for a turn already running:
+    /// prompts read it live, Claude Code switches its permission mode, and an
+    /// ACP agent with matching modes switches too. Codex picks it up at its
+    /// next turn.
+    pub fn set_session_mode(&self, session_id: &str, mode: ApprovalMode) {
+        let previous = self
+            .modes
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), mode);
+        if previous == Some(mode) {
+            return;
+        }
+        let controls = self.claude_controls.clone();
+        let acp_sessions = self.acp_sessions.clone();
+        let modes_map = self.modes.clone();
+        let events = self.events.clone();
+        let sid = session_id.to_string();
+        self.runtime.spawn(async move {
+            // Re-read the latest requested mode so rapid switches cannot apply
+            // an older selection out of order.
+            let latest = mode_of(&modes_map, &sid);
+            controls.set_mode(&sid, latest).await;
+            let handle = acp_sessions.lock().await.get(&sid).map(|h| {
+                (
+                    h.client.clone(),
+                    h.acp_session_id.clone(),
+                    h.provider_id.clone(),
+                    h.modes.clone(),
+                    h.current_mode_id.clone(),
+                )
+            });
+            if let Some((client, acp_sid, provider_id, modes, current_mode_id)) = handle {
+                let latest = mode_of(&modes_map, &sid);
+                let failed = match modes {
+                    Some(modes) => match acp_mode_id(&modes, latest) {
+                        Some(id) => match set_acp_mode_bounded(&client, &acp_sid, &id).await {
+                            Ok(()) => {
+                                *current_mode_id.lock().unwrap() = Some(id);
+                                None
+                            }
+                            Err(e) => Some(format!("{e:#}")),
+                        },
+                        None if latest != ApprovalMode::FullAccess => Some(format!(
+                            "agent does not advertise a mode for '{}'",
+                            latest.as_str()
+                        )),
+                        None => None,
+                    },
+                    None if latest == ApprovalMode::Plan => {
+                        Some("agent does not advertise a Plan (read-only) mode".to_string())
+                    }
+                    None => None,
+                };
+                if let Some(reason) = failed {
+                    events.publish(SameEvent::AgentLog {
+                        session_id: Some(sid.clone()),
+                        provider_id,
+                        line: format!(
+                            "Failed to switch ACP session mode to '{}': {reason}",
+                            latest.as_str()
+                        ),
+                    });
+                    if latest != ApprovalMode::FullAccess {
+                        let _ = client.cancel(&acp_sid).await;
+                    }
+                }
+            }
+        });
     }
 
-    /// Updates the live tool auto-approval policy synchronously for all
-    /// running and starting agents.
-    pub fn set_auto_approve(&self, auto_approve: bool) {
-        self.auto_approve
-            .store(auto_approve, std::sync::atomic::Ordering::SeqCst);
+    /// Stops a session's CLI agent process (the session was deleted or moved
+    /// to another agent).
+    pub fn release_session(&self, session_id: &str) {
+        self.claude_controls.remove(session_id);
+        let claude = self.claude_pool.clone();
+        let codex = self.codex_pool.clone();
+        let sid = session_id.to_string();
+        self.runtime.spawn(async move {
+            claude.release(&sid).await;
+            codex.release(&sid).await;
+        });
+    }
+
+    /// Answers a question card; `None` dismisses it.
+    pub async fn respond_user_input(&self, request_id: &str, answers: Answers) {
+        if let Some(tx) = self.input_responders.lock().await.remove(request_id) {
+            let _ = tx.send(answers);
+        }
     }
 
     pub fn capabilities_for(kind: ProviderKind) -> ProviderCapabilities {
@@ -440,9 +560,10 @@ impl AgentManager {
 
     pub fn start_prompt(&self, req: PromptRequest) {
         let manager = self.clone();
-        // Snapshot the flag for Codex's approval policy at submission time;
-        // individual prompts read the live flag.
-        let cli_auto_approve = self.auto_approve.load(std::sync::atomic::Ordering::SeqCst);
+        self.modes
+            .lock()
+            .unwrap()
+            .insert(req.session_id.clone(), req.mode);
         self.runtime.spawn(async move {
             let sid = req.session_id.clone();
             let pid = req.provider.id.clone();
@@ -492,17 +613,22 @@ impl AgentManager {
                         manager.run_acp_prompt(req, target, files, cancel_rx).await
                     }
                     ProviderKind::ClaudeCli => {
-                        run_claude_cli(
-                            &req.provider,
-                            &req.session_id,
-                            req.external_session_id.as_deref(),
-                            req.model.as_deref(),
-                            req.effort.as_deref(),
-                            &req.cwd,
-                            &target,
-                            &claude_prompt_with_attachments(&req.prompt, &files),
-                            manager.permission_gate(),
-                            manager.events.clone(),
+                        let prompt = claude_prompt_with_attachments(&req.prompt, &files);
+                        run_claude_turn(
+                            ClaudeTurn {
+                                pool: &manager.claude_pool,
+                                controls: &manager.claude_controls,
+                                provider: &req.provider,
+                                session_id: &req.session_id,
+                                external_session_id: req.external_session_id.as_deref(),
+                                model: req.model.as_deref(),
+                                effort: req.effort.as_deref(),
+                                cwd: &req.cwd,
+                                target: &target,
+                                prompt: &prompt,
+                                gate: &manager.gate,
+                                events: &manager.events,
+                            },
                             cancel_rx,
                         )
                         .await
@@ -510,19 +636,22 @@ impl AgentManager {
                     ProviderKind::CodexCli => {
                         let images: Vec<String> =
                             files.iter().filter(|f| is_image_path(f)).cloned().collect();
-                        run_codex_cli(
-                            &req.provider,
-                            &req.session_id,
-                            req.external_session_id.as_deref(),
-                            req.model.as_deref(),
-                            req.effort.as_deref(),
-                            &req.cwd,
-                            &target,
-                            &codex_prompt_with_attachments(&req.prompt, &files),
-                            &images,
-                            cli_auto_approve,
-                            manager.permission_gate(),
-                            manager.events.clone(),
+                        let prompt = codex_prompt_with_attachments(&req.prompt, &files);
+                        run_codex_turn(
+                            CodexTurnRequest {
+                                pool: &manager.codex_pool,
+                                provider: &req.provider,
+                                session_id: &req.session_id,
+                                external_session_id: req.external_session_id.as_deref(),
+                                model: req.model.as_deref(),
+                                effort: req.effort.as_deref(),
+                                cwd: &req.cwd,
+                                target: &target,
+                                prompt: &prompt,
+                                images: &images,
+                                gate: &manager.gate,
+                                events: &manager.events,
+                            },
                             cancel_rx,
                         )
                         .await
@@ -735,14 +864,54 @@ impl AgentManager {
         target: ExecTarget,
     ) -> Result<(Arc<AcpClient>, String, SharedModelState)> {
         {
-            let guard = self.acp_sessions.lock().await;
-            if let Some(handle) = guard.get(&req.session_id) {
-                if handle.provider_id == req.provider.id && handle.target == target {
-                    return Ok((
-                        handle.client.clone(),
-                        handle.acp_session_id.clone(),
-                        handle.model_state.clone(),
-                    ));
+            let existing = {
+                let guard = self.acp_sessions.lock().await;
+                guard.get(&req.session_id).and_then(|handle| {
+                    if handle.provider_id == req.provider.id && handle.target == target {
+                        Some((
+                            handle.client.clone(),
+                            handle.acp_session_id.clone(),
+                            handle.model_state.clone(),
+                            handle.modes.clone(),
+                            handle.current_mode_id.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some((client, acp_sid, model_state, modes, current_mode_id)) = existing {
+                let mode_ok = match &modes {
+                    Some(m) => match acp_mode_id(m, req.mode) {
+                        Some(id) => match set_acp_mode_bounded(&client, &acp_sid, &id).await {
+                            Ok(()) => {
+                                *current_mode_id.lock().unwrap() = Some(id);
+                                true
+                            }
+                            Err(_) => false,
+                        },
+                        None if req.mode == ApprovalMode::Plan => false,
+                        None if req.mode == ApprovalMode::FullAccess => true,
+                        None => {
+                            let current = current_mode_id.lock().unwrap().clone();
+                            let full_id = acp_mode_id(m, ApprovalMode::FullAccess);
+                            let edit_id = acp_mode_id(m, ApprovalMode::AcceptEdits);
+                            let stuck_in_full = current.is_some() && current == full_id;
+                            let stuck_in_edits = req.mode == ApprovalMode::Ask
+                                && current.is_some()
+                                && current == edit_id;
+                            !(stuck_in_full || stuck_in_edits)
+                        }
+                    },
+                    None => req.mode != ApprovalMode::Plan,
+                };
+                if mode_ok {
+                    return Ok((client, acp_sid, model_state));
+                }
+                // Could not confirm the requested mode on the pooled session;
+                // drop it and start a fresh one.
+                if let Some(old) = self.acp_sessions.lock().await.remove(&req.session_id) {
+                    old.client.shutdown().await;
                 }
             }
         }
@@ -753,10 +922,11 @@ impl AgentManager {
                 args: req.provider.args.clone(),
                 env: req.provider.env.clone(),
                 cwd: req.cwd.clone(),
-                auto_approve: self.auto_approve.load(std::sync::atomic::Ordering::SeqCst),
+                // The approval mode is applied below, per prompt.
+                auto_approve: false,
                 target: target.clone(),
             },
-            self.auto_approve.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await?;
 
@@ -770,8 +940,11 @@ impl AgentManager {
             let acp_sessions = self.acp_sessions.clone();
             let this_client = client.clone();
             let model_state = model_state.clone();
+            let workspace_cwd = req.cwd.clone();
+            let agent_cwd = target.to_target_path(&req.cwd);
             let same_session_id = req.session_id.clone();
             let provider_id = req.provider.id.clone();
+            let modes = self.modes.clone();
 
             tokio::spawn(async move {
                 while let Some(ev) = acp_rx.recv().await {
@@ -869,9 +1042,31 @@ impl AgentManager {
                             title,
                             description,
                             options,
+                            tool_call,
                             responder,
                             ..
                         } => {
+                            let is_edit =
+                                tool_call.get("kind").and_then(Value::as_str) == Some("edit");
+                            let auto = if is_edit
+                                && acp_edit_within_workspace(
+                                    &tool_call,
+                                    &workspace_cwd,
+                                    &agent_cwd,
+                                ) {
+                                AutoAllow::Edit
+                            } else {
+                                AutoAllow::InFullAccess
+                            };
+                            if auto.allows(mode_of(&modes, &same_session_id)) {
+                                if let Some(opt) = options.iter().find(|o| o.kind == "allow_once") {
+                                    responder.respond(PermissionDecision::Selected {
+                                        option_id: opt.option_id.clone(),
+                                    });
+                                    continue;
+                                }
+                            }
+                            let diff = diff::acp_tool_diff(&tool_call);
                             responders
                                 .lock()
                                 .await
@@ -895,6 +1090,7 @@ impl AgentManager {
                                             kind: o.kind,
                                         })
                                         .collect(),
+                                    diff,
                                 },
                             });
                         }
@@ -925,19 +1121,59 @@ impl AgentManager {
                 .load_session(ext_id, &req.cwd)
                 .await
                 .ok()
-                .map(|state| (ext_id.to_string(), state)),
+                .map(|(state, modes)| (ext_id.to_string(), state, modes)),
             None => None,
         };
-        let (acp_session_id, initial_models) = match loaded {
+        let (acp_session_id, initial_models, modes) = match loaded {
             Some(found) => found,
             None => {
                 let res = client.new_session(&req.cwd).await?;
                 if let Some(state) = &res.model_state {
                     self.record_acp_defaults(&req.provider.id, state).await;
                 }
-                (res.session_id, res.model_state)
+                (res.session_id, res.model_state, res.modes)
             }
         };
+        // Start in the session's latest approval mode (re-read in case the
+        // user changed it while the ACP process was starting).
+        let mut confirmed_mode_id = modes
+            .as_ref()
+            .and_then(|m| m.get("currentModeId"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let effective_mode = mode_of(&self.modes, &req.session_id);
+        if let Some(id) = modes.as_ref().and_then(|m| acp_mode_id(m, effective_mode)) {
+            if confirmed_mode_id.as_deref() != Some(id.as_str()) {
+                match set_acp_mode_bounded(&client, &acp_session_id, &id).await {
+                    Ok(()) => confirmed_mode_id = Some(id),
+                    Err(err) => {
+                        if effective_mode != ApprovalMode::FullAccess {
+                            client.shutdown().await;
+                            return Err(err).with_context(|| {
+                                format!("Failed to set ACP agent mode to '{id}'")
+                            });
+                        }
+                    }
+                }
+            }
+        } else if effective_mode == ApprovalMode::Plan {
+            client.shutdown().await;
+            anyhow::bail!(
+                "Provider '{}' does not support Plan (read-only) mode",
+                req.provider.name
+            );
+        } else if effective_mode != ApprovalMode::FullAccess {
+            let full_id = modes
+                .as_ref()
+                .and_then(|m| acp_mode_id(m, ApprovalMode::FullAccess));
+            if confirmed_mode_id.is_some() && confirmed_mode_id == full_id {
+                client.shutdown().await;
+                anyhow::bail!(
+                    "Cannot downgrade ACP session from full access to '{}'",
+                    effective_mode.as_str()
+                );
+            }
+        }
         if let Some(state) = initial_models {
             self.events
                 .publish(models_event(&req.session_id, &req.provider.id, &state));
@@ -961,6 +1197,8 @@ impl AgentManager {
                 client: client.clone(),
                 acp_session_id: acp_session_id.clone(),
                 model_state: model_state.clone(),
+                modes,
+                current_mode_id: Arc::new(std::sync::Mutex::new(confirmed_mode_id)),
             },
         );
         if let Some(old) = displaced {
@@ -988,11 +1226,63 @@ impl AgentManager {
     }
 
     pub async fn shutdown_all(&self) {
-        let mut guard = self.acp_sessions.lock().await;
-        for (_, handle) in guard.drain() {
-            handle.client.shutdown().await;
+        {
+            let mut guard = self.acp_sessions.lock().await;
+            for (_, handle) in guard.drain() {
+                handle.client.shutdown().await;
+            }
         }
+        self.claude_pool.shutdown_all().await;
+        self.codex_pool.shutdown_all().await;
     }
+}
+
+/// Calls `session/set_mode` with a bounded wait so a stalled ACP agent cannot
+/// hang session setup or mode switching indefinitely.
+async fn set_acp_mode_bounded(client: &AcpClient, acp_sid: &str, mode_id: &str) -> Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        client.set_mode(acp_sid, mode_id),
+    )
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("session/set_mode timed out")))
+}
+
+/// The id of the ACP agent mode matching an approval mode, from the agent's
+/// `availableModes` (claude-agent-acp: default / acceptEdits / plan /
+/// bypassPermissions; codex-acp: read-only / auto / full-access).
+fn acp_mode_id(modes: &Value, mode: ApprovalMode) -> Option<String> {
+    let available: Vec<&str> = modes
+        .get("availableModes")?
+        .as_array()?
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .collect();
+    let candidates: &[&str] = match mode {
+        ApprovalMode::Plan => &["plan", "read-only", "readonly"],
+        ApprovalMode::Ask => &["default", "manual", "ask", "auto", "build"],
+        ApprovalMode::AcceptEdits => &[
+            "acceptEdits",
+            "accept-edits",
+            "auto-edit",
+            "default",
+            "manual",
+            "auto",
+            "build",
+        ],
+        ApprovalMode::FullAccess => &[
+            "bypassPermissions",
+            "full-access",
+            "yolo",
+            "dangerously-skip-permissions",
+        ],
+    };
+    candidates.iter().find_map(|c| {
+        available
+            .iter()
+            .find(|a| a.eq_ignore_ascii_case(c))
+            .map(|a| a.to_string())
+    })
 }
 
 fn parse_tool_status(s: &str) -> ToolCallStatus {
@@ -1003,6 +1293,102 @@ fn parse_tool_status(s: &str) -> ToolCallStatus {
         "pending" => ToolCallStatus::Pending,
         _ => ToolCallStatus::InProgress,
     }
+}
+
+/// Returns `true` only when the ACP edit tool call names at least one target
+/// path and every target path resolves (after following symlinks) inside the
+/// session's workspace directory.
+fn acp_edit_within_workspace(tool_call: &Value, workspace_cwd: &Path, agent_cwd: &str) -> bool {
+    let mut paths: Vec<&str> = Vec::new();
+    if let Some(locs) = tool_call.get("locations").and_then(Value::as_array) {
+        for loc in locs {
+            if let Some(p) = loc
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                paths.push(p);
+            }
+        }
+    }
+    if let Some(content) = tool_call.get("content").and_then(Value::as_array) {
+        for item in content {
+            if item.get("type").and_then(Value::as_str) == Some("diff") {
+                if let Some(p) = item
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    if let Some(raw) = tool_call.get("rawInput") {
+        for key in ["file_path", "path", "notebook_path"] {
+            if let Some(p) = raw
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                paths.push(p);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return false;
+    }
+    let Ok(canon_workspace) = std::fs::canonicalize(workspace_cwd) else {
+        return false;
+    };
+    // If the agent runs inside a different filesystem namespace (e.g. WSL
+    // where `agent_cwd` differs from `workspace_cwd`), we cannot reliably
+    // resolve symlinks from the host; require explicit approval instead.
+    if Path::new(agent_cwd) != workspace_cwd {
+        return false;
+    }
+    paths.into_iter().all(|p| {
+        let path = Path::new(p);
+        // Reject parent traversal (`..`) so symlinks cannot be bypassed via
+        // lexical normalization; require explicit approval instead.
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace_cwd.join(path)
+        };
+        canonicalize_with_missing_tail(&candidate)
+            .is_some_and(|resolved| resolved.starts_with(&canon_workspace))
+    })
+}
+
+/// Canonicalizes `path` by resolving the deepest existing ancestor via
+/// `std::fs::canonicalize` and re-attaching the remaining non-existent tail.
+/// Uses `symlink_metadata` so dangling symlinks fail closed instead of being
+/// treated as ordinary missing filenames.
+fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
+    let mut existing = path;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tail.push(existing.file_name()?);
+                existing = existing.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut resolved = std::fs::canonicalize(existing).ok()?;
+    for seg in tail.into_iter().rev() {
+        resolved.push(seg);
+    }
+    Some(resolved)
 }
 
 #[cfg(test)]
@@ -1085,6 +1471,7 @@ mod tests {
             prompt: String::new(),
             attachments: Vec::new(),
             exec: ExecPreference::Auto,
+            mode: ApprovalMode::Ask,
         };
         let apply = |req: PromptRequest| {
             let (mgr, client, sid, state) = (&mgr, &client, res.session_id.clone(), state.clone());
@@ -1128,7 +1515,6 @@ mod tests {
         let fake = std::env::var("SAME_WSL_FAKE_ACP").unwrap();
         let events = EventBus::new(4096);
         let mgr = AgentManager::new(events.clone(), tokio::runtime::Handle::current());
-        mgr.set_auto_approve(true);
 
         let run = |provider: ProviderConfig, sid: &str| {
             let mut rx = events.subscribe();
@@ -1142,6 +1528,7 @@ mod tests {
                 prompt: "Reply with just the word OK.".to_string(),
                 attachments: Vec::new(),
                 exec: ExecPreference::Auto,
+                mode: ApprovalMode::FullAccess,
             });
             async move {
                 let mut text = String::new();
@@ -1215,6 +1602,53 @@ mod tests {
         assert_eq!(
             AgentManager::login_script(&windows_agy).windows,
             r"& 'C:\Users\me\AppData\Local\agy\bin\agy.exe' 'acp' '--login'"
+        );
+    }
+
+    #[test]
+    fn acp_modes_match_by_id() {
+        let claude_acp = serde_json::json!({"currentModeId": "default", "availableModes": [
+            {"id": "default", "name": "Default"}, {"id": "acceptEdits", "name": "Accept Edits"},
+            {"id": "plan", "name": "Plan"}, {"id": "bypassPermissions", "name": "Bypass"}
+        ]});
+        assert_eq!(
+            acp_mode_id(&claude_acp, ApprovalMode::Plan).as_deref(),
+            Some("plan")
+        );
+        assert_eq!(
+            acp_mode_id(&claude_acp, ApprovalMode::Ask).as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            acp_mode_id(&claude_acp, ApprovalMode::AcceptEdits).as_deref(),
+            Some("acceptEdits")
+        );
+        assert_eq!(
+            acp_mode_id(&claude_acp, ApprovalMode::FullAccess).as_deref(),
+            Some("bypassPermissions")
+        );
+        let codex_acp = serde_json::json!({"availableModes": [
+            {"id": "read-only"}, {"id": "auto"}, {"id": "full-access"}
+        ]});
+        assert_eq!(
+            acp_mode_id(&codex_acp, ApprovalMode::Ask).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(
+            acp_mode_id(&codex_acp, ApprovalMode::AcceptEdits).as_deref(),
+            Some("auto")
+        );
+        assert_eq!(
+            acp_mode_id(&codex_acp, ApprovalMode::FullAccess).as_deref(),
+            Some("full-access")
+        );
+        assert_eq!(
+            acp_mode_id(&codex_acp, ApprovalMode::Plan).as_deref(),
+            Some("read-only")
+        );
+        assert_eq!(
+            acp_mode_id(&serde_json::json!({}), ApprovalMode::Plan),
+            None
         );
     }
 }

@@ -1,4 +1,4 @@
-use crate::models::{ProviderConfig, ProviderKind};
+use crate::models::{ApprovalMode, ProviderConfig, ProviderKind};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -151,8 +151,20 @@ pub struct AppConfig {
     pub language: Language,
     #[serde(default = "default_provider_id")]
     pub default_provider_id: String,
-    #[serde(default)]
+    /// Replaced by `default_approval_mode`; read only to migrate old configs.
+    #[serde(default, skip_serializing)]
     pub auto_approve_tools: bool,
+    /// Set by [`AppConfig::load_or_default`] when it migrated
+    /// `auto_approve_tools`, so the app can tell the user once.
+    #[serde(skip)]
+    pub migrated_auto_approve: bool,
+    /// The approval mode of sessions that have not picked one.
+    #[serde(default)]
+    pub default_approval_mode: ApprovalMode,
+    /// OS notifications when an agent waits for the user or finishes while
+    /// the window is in the background.
+    #[serde(default = "default_true")]
+    pub notifications: bool,
     #[serde(default)]
     pub submit_key: SubmitKey,
     #[serde(default = "default_providers")]
@@ -161,6 +173,10 @@ pub struct AppConfig {
     /// Projects not listed use [`ExecMode::Auto`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub project_exec: BTreeMap<String, ExecMode>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_provider_id() -> String {
@@ -195,7 +211,9 @@ pub fn default_providers() -> Vec<ProviderConfig> {
                 "opus".to_string(),
                 "haiku".to_string(),
             ],
-            description: "Anthropic Claude Code CLI (streaming JSON / permission prompts / session resume)".to_string(),
+            description:
+                "Anthropic Claude Code CLI (streaming JSON / permission prompts / session resume)"
+                    .to_string(),
         },
         ProviderConfig {
             id: "codex".to_string(),
@@ -239,6 +257,9 @@ impl Default for AppConfig {
             language: Language::Ja,
             default_provider_id: default_provider_id(),
             auto_approve_tools: false,
+            migrated_auto_approve: false,
+            default_approval_mode: ApprovalMode::default(),
+            notifications: true,
             submit_key: SubmitKey::default(),
             providers: default_providers(),
             project_exec: BTreeMap::new(),
@@ -255,9 +276,24 @@ impl AppConfig {
         }
         let raw = fs::read_to_string(&paths.config_file)
             .with_context(|| format!("Failed to read {}", paths.config_file.display()))?;
-        let cfg: Self = toml::from_str(&raw)
+        let mut cfg: Self = toml::from_str(&raw)
             .with_context(|| format!("Failed to parse {}", paths.config_file.display()))?;
+        cfg.migrate_auto_approve(&raw);
         Ok(cfg)
+    }
+
+    /// The old global auto-approve toggle becomes "accept edits", which keeps
+    /// Codex's sandbox, rather than full access.
+    fn migrate_auto_approve(&mut self, raw: &str) {
+        let has_mode = toml::from_str::<toml::Value>(raw)
+            .ok()
+            .and_then(|v| v.get("default_approval_mode").cloned())
+            .is_some();
+        if self.auto_approve_tools && !has_mode {
+            self.default_approval_mode = ApprovalMode::AcceptEdits;
+            self.migrated_auto_approve = true;
+        }
+        self.auto_approve_tools = false;
     }
 
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
@@ -299,6 +335,27 @@ pub const MAX_FONT_SIZE: f32 = 24.0;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_auto_approve_migrates_to_accept_edits() {
+        let raw = "auto_approve_tools = true\n";
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.migrate_auto_approve(raw);
+        assert_eq!(cfg.default_approval_mode, ApprovalMode::AcceptEdits);
+        assert!(cfg.migrated_auto_approve);
+        let saved = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!saved.contains("auto_approve_tools"));
+
+        let raw = "auto_approve_tools = true\ndefault_approval_mode = \"plan\"\n";
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        cfg.migrate_auto_approve(raw);
+        assert_eq!(cfg.default_approval_mode, ApprovalMode::Plan);
+        assert!(!cfg.migrated_auto_approve);
+
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.default_approval_mode, ApprovalMode::Ask);
+        assert!(cfg.notifications);
+    }
 
     #[test]
     fn legacy_config_without_accent_loads() {

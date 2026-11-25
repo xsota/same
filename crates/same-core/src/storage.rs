@@ -1,6 +1,6 @@
 use crate::models::{
-    Message, MessageRole, Project, Quest, QuestStatus, Session, SessionStatus, ToolCallRecord,
-    Workspace,
+    ApprovalMode, Message, MessageRole, Project, Quest, QuestStatus, Session, SessionStatus,
+    ToolCallRecord, Workspace,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -113,6 +113,12 @@ impl Storage {
             .exists([])?;
         if !has_effort {
             conn.execute_batch("ALTER TABLE sessions ADD COLUMN effort TEXT;")?;
+        }
+        let has_mode = conn
+            .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'approval_mode'")?
+            .exists([])?;
+        if !has_mode {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN approval_mode TEXT;")?;
         }
         Ok(())
     }
@@ -324,6 +330,7 @@ impl Storage {
             provider_id: provider_id.to_string(),
             model: model.map(str::to_string),
             effort: None,
+            approval_mode: None,
             external_session_id: None,
             status: SessionStatus::Idle,
             pinned: false,
@@ -356,7 +363,7 @@ impl Storage {
     pub fn list_sessions(&self, project_id: &str) -> Result<Vec<Session>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, quest_id, title, provider_id, model, external_session_id, status, pinned, archived, created_at, updated_at, effort
+            "SELECT id, project_id, quest_id, title, provider_id, model, external_session_id, status, pinned, archived, created_at, updated_at, effort, approval_mode
              FROM sessions WHERE project_id = ?1 AND archived = 0
              ORDER BY pinned DESC, updated_at DESC",
         )?;
@@ -375,6 +382,9 @@ impl Storage {
                 created_at: parse_dt(r.get::<_, String>(10)?),
                 updated_at: parse_dt(r.get::<_, String>(11)?),
                 effort: r.get(12)?,
+                approval_mode: r
+                    .get::<_, Option<String>>(13)?
+                    .and_then(|m| ApprovalMode::parse(&m)),
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -384,7 +394,7 @@ impl Storage {
     pub fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, project_id, quest_id, title, provider_id, model, external_session_id, status, pinned, archived, created_at, updated_at, effort
+            "SELECT id, project_id, quest_id, title, provider_id, model, external_session_id, status, pinned, archived, created_at, updated_at, effort, approval_mode
              FROM sessions WHERE id = ?1",
             params![session_id],
             |r| {
@@ -402,11 +412,31 @@ impl Storage {
                     created_at: parse_dt(r.get::<_, String>(10)?),
                     updated_at: parse_dt(r.get::<_, String>(11)?),
                     effort: r.get(12)?,
+                    approval_mode: r
+                        .get::<_, Option<String>>(13)?
+                        .and_then(|m| ApprovalMode::parse(&m)),
                 })
             },
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn set_session_approval_mode(
+        &self,
+        session_id: &str,
+        mode: Option<ApprovalMode>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET approval_mode = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                mode.map(|m| m.as_str()),
+                Utc::now().to_rfc3339(),
+                session_id
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn set_session_effort(&self, session_id: &str, effort: Option<&str>) -> Result<()> {
@@ -566,6 +596,23 @@ mod tests {
         assert_eq!(storage.list_sessions(&project.id)?[0].effort, None);
         // Re-running the migration on an up-to-date database is a no-op.
         storage.migrate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_approval_mode_round_trips() -> Result<()> {
+        let storage = Storage::open_in_memory()?;
+        let ws = storage.ensure_default_workspace()?;
+        let project = storage.ensure_project_for_path(&ws.id, &PathBuf::from("/tmp/same-m"))?;
+        let s = storage.create_session(&project.id, None, "t", "claude", None)?;
+        assert_eq!(s.approval_mode, None);
+        storage.set_session_approval_mode(&s.id, Some(ApprovalMode::Plan))?;
+        assert_eq!(
+            storage.get_session(&s.id)?.unwrap().approval_mode,
+            Some(ApprovalMode::Plan)
+        );
+        storage.set_session_approval_mode(&s.id, None)?;
+        assert_eq!(storage.list_sessions(&project.id)?[0].approval_mode, None);
         Ok(())
     }
 

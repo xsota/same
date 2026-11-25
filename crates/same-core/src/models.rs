@@ -114,6 +114,43 @@ impl SessionStatus {
     }
 }
 
+/// How much an agent may do without asking, chosen per session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Read and plan only; the agent proposes a plan to approve.
+    Plan,
+    /// Ask before edits and commands (each agent's own default).
+    #[default]
+    Ask,
+    /// Edits in the workspace go through; other actions still ask.
+    AcceptEdits,
+    /// Nothing asks, and sandboxes are off.
+    FullAccess,
+}
+
+impl ApprovalMode {
+    pub const ALL: [ApprovalMode; 4] = [
+        ApprovalMode::Plan,
+        ApprovalMode::Ask,
+        ApprovalMode::AcceptEdits,
+        ApprovalMode::FullAccess,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Ask => "ask",
+            Self::AcceptEdits => "accept_edits",
+            Self::FullAccess => "full_access",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_str() == s)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -124,6 +161,9 @@ pub struct Session {
     pub model: Option<String>,
     /// Reasoning effort (e.g. "high"); `None` leaves it to the agent.
     pub effort: Option<String>,
+    /// `None` uses the configured default.
+    #[serde(default)]
+    pub approval_mode: Option<ApprovalMode>,
     pub external_session_id: Option<String>,
     pub status: SessionStatus,
     pub pinned: bool,
@@ -261,6 +301,38 @@ pub struct PermissionRequest {
     pub title: String,
     pub description: String,
     pub options: Vec<PermissionOption>,
+    /// A unified diff of the change, when the tool edits files.
+    #[serde(default)]
+    pub diff: Option<String>,
+}
+
+/// An agent asking the user questions (Claude Code's AskUserQuestion, Codex
+/// `request_user_input`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInputRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub questions: Vec<UserQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<UserQuestionOption>,
+    pub multi_select: bool,
+    /// A free-text answer is accepted besides the options.
+    pub allow_other: bool,
+    /// The free-text answer should be masked.
+    #[serde(default)]
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserQuestionOption {
+    pub label: String,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

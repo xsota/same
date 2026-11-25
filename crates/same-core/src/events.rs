@@ -1,6 +1,6 @@
 use crate::models::{
     ModelInfo, PermissionRequest, ProviderCapabilities, SessionStatus, SlashCommandInfo,
-    ToolCallRecord,
+    ToolCallRecord, UserInputRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -42,6 +42,20 @@ pub enum SameEvent {
         session_id: String,
         request_id: String,
         remaining: usize,
+    },
+    /// The agent asks the user questions and waits for the answers.
+    UserInputRequested {
+        request: UserInputRequest,
+    },
+    /// The questions no longer need answers (the turn ended or was stopped).
+    UserInputWithdrawn {
+        session_id: String,
+        request_id: String,
+    },
+    /// The agent proposed a plan (plan mode) and stopped to wait for the user.
+    PlanProposed {
+        session_id: String,
+        plan: String,
     },
     SlashCommandsUpdated {
         session_id: String,

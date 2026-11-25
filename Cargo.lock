@@ -5674,6 +5674,7 @@ dependencies = [
  "same-core",
  "serde",
  "serde_json",
+ "similar",
  "tokio",
 ]
 
@@ -5690,6 +5691,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "image",
+ "notify-rust",
  "reqwest",
  "same-agent",
  "same-core",

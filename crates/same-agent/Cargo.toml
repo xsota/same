@@ -11,3 +11,4 @@ serde_json.workspace = true
 tokio.workspace = true
 same-core.workspace = true
 same-acp.workspace = true
+similar = "2.7"

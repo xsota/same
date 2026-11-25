@@ -1,3 +1,5 @@
+mod approvals;
+
 use crate::i18n::t;
 use crate::theme::{
     accent, accent_foreground, accent_text, apply_gpui_theme, default_font_size, default_mono_font,
@@ -32,16 +34,18 @@ use same_agent::{
 };
 use same_core::paths::simplify_path;
 use same_core::{
-    AccentColor, AppConfig, AppPaths, EventBus, ExecMode, Language, Message, MessageRole,
-    ModelInfo, PermissionRequest, Project, ProviderConfig, ProviderKind, Quest, SameEvent, Session,
-    SessionStatus, SlashCommandInfo, Storage, SubmitKey, ThemeMode, ToolCallRecord, ToolCallStatus,
-    Workspace, MAX_FONT_SIZE, MIN_FONT_SIZE,
+    AccentColor, AppConfig, AppPaths, ApprovalMode, EventBus, ExecMode, Language, Message,
+    MessageRole, ModelInfo, PermissionRequest, Project, ProviderConfig, ProviderKind, Quest,
+    SameEvent, Session, SessionStatus, SlashCommandInfo, Storage, SubmitKey, ThemeMode,
+    ToolCallRecord, ToolCallStatus, Workspace, MAX_FONT_SIZE, MIN_FONT_SIZE,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+use approvals::{split_plan, PendingInput, PLAN_MARKER};
 
 /// Removes the `📎 \`name\`` line that [`SameAppView::send_current_prompt`]
 /// appends to a stored prompt with attachments.
@@ -105,6 +109,8 @@ struct LiveDraft {
     content: String,
     thinking: String,
     tool_calls: Vec<ToolCallRecord>,
+    /// The plan the agent proposed (plan mode).
+    plan: Option<String>,
 }
 
 enum UiAsyncMsg {
@@ -233,6 +239,18 @@ pub struct SameAppView {
 
     live_drafts: HashMap<String, LiveDraft>,
     pending_permissions: Vec<PermissionRequest>,
+    /// Question cards waiting for answers.
+    pending_inputs: Vec<PendingInput>,
+    /// Focus of the first open permission / question card of the selected
+    /// session, so it can be answered from the keyboard.
+    approval_focus: FocusHandle,
+    /// Move the focus to that card at the next render.
+    focus_approval: bool,
+    /// The window is in the foreground (no OS notifications then).
+    window_active: bool,
+    /// Per session: the approval mode before it switched to plan, restored
+    /// when the plan is implemented.
+    pre_plan_mode: HashMap<String, ApprovalMode>,
     slash_commands: HashMap<String, Vec<SlashCommandInfo>>,
     /// Models an agent reported (ACP), by provider id, so a fresh session
     /// can offer them before its first prompt.
@@ -353,7 +371,6 @@ impl SameAppView {
         let rt = Arc::new(tokio::runtime::Runtime::new()?);
         let events = EventBus::new(1024);
         let agent_manager = AgentManager::new(events.clone(), rt.handle().clone());
-        agent_manager.set_auto_approve(config.auto_approve_tools);
 
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
 
@@ -517,6 +534,11 @@ impl SameAppView {
             ),
         ];
 
+        // OS notifications only while the window is in the background.
+        subscriptions.push(cx.observe_window_activation(window, |this, window, _| {
+            this.window_active = window.is_window_active();
+        }));
+
         // Stop agent processes on quit so none outlive the app.
         subscriptions.push(cx.on_app_quit(|this: &mut Self, _| {
             let mgr = this.agent_manager.clone();
@@ -554,6 +576,11 @@ impl SameAppView {
             messages: vec![],
             live_drafts: HashMap::new(),
             pending_permissions: vec![],
+            pending_inputs: vec![],
+            approval_focus: cx.focus_handle(),
+            focus_approval: false,
+            window_active: true,
+            pre_plan_mode: HashMap::new(),
             slash_commands: HashMap::new(),
             agent_models,
             models_discovered: HashSet::new(),
@@ -619,6 +646,18 @@ impl SameAppView {
             font_search,
         };
 
+        if app.config.migrated_auto_approve {
+            // Saved without the old key from now on.
+            app.save_config();
+            app.note(
+                NoteKind::Info,
+                t(
+                    app.config.language,
+                    "「自動承認」は承認モード「編集は自動」に置き換わりました（入力欄の下で変更できます）",
+                    "Auto-approve became the \"Accept edits\" approval mode (change it under the prompt)",
+                ),
+            );
+        }
         app.apply_placeholders(window, cx);
         app.reload_project_state(window, cx);
         app.refresh_provider_checks();
@@ -827,6 +866,11 @@ impl SameAppView {
             model.as_deref(),
         ) {
             Ok(mut sess) => {
+                let default_mode = self.config.default_approval_mode;
+                let _ = self
+                    .storage
+                    .set_session_approval_mode(&sess.id, Some(default_mode));
+                sess.approval_mode = Some(default_mode);
                 if effort.is_some() {
                     let _ = self.storage.set_session_effort(&sess.id, effort.as_deref());
                     sess.effort = effort;
@@ -855,13 +899,18 @@ impl SameAppView {
         self.sessions = self.storage.list_sessions(&project_id).unwrap_or_default();
 
         if self.sessions.is_empty() {
-            if let Ok(sess) = self.storage.create_session(
+            if let Ok(mut sess) = self.storage.create_session(
                 &project_id,
                 None,
                 DEFAULT_SESSION_TITLE,
                 &self.config.default_provider_id,
                 None,
             ) {
+                let default_mode = self.config.default_approval_mode;
+                let _ = self
+                    .storage
+                    .set_session_approval_mode(&sess.id, Some(default_mode));
+                sess.approval_mode = Some(default_mode);
                 self.sessions.push(sess);
             }
         }
@@ -1138,7 +1187,9 @@ impl SameAppView {
             self.rt.spawn(async move { mgr.cancel_session(&s).await });
             self.live_drafts.remove(&sid);
         }
+        self.agent_manager.release_session(&sid);
         self.pending_permissions.retain(|p| p.session_id != sid);
+        self.pending_inputs.retain(|p| p.request.session_id != sid);
         let _ = self.storage.delete_session(&sid);
         self.sessions.retain(|x| x.id != sid);
         if self.selected_session_id.as_deref() == Some(sid.as_str()) {
@@ -1956,8 +2007,52 @@ impl SameAppView {
                             t(self.config.language, "承認待ち", "Approval needed")
                         ),
                     );
+                } else {
+                    self.focus_approval = true;
                 }
+                self.notify_waiting(
+                    &request.session_id,
+                    t(self.config.language, "承認待ち", "Approval needed"),
+                );
                 self.pending_permissions.push(request);
+            }
+            SameEvent::UserInputRequested { request } => {
+                if !self.live_drafts.contains_key(&request.session_id) {
+                    let mgr = self.agent_manager.clone();
+                    let rid = request.request_id.clone();
+                    self.rt
+                        .spawn(async move { mgr.respond_user_input(&rid, None).await });
+                    return;
+                }
+                let lang = self.config.language;
+                if self.selected_session_id.as_deref() == Some(request.session_id.as_str()) {
+                    self.focus_approval = true;
+                } else {
+                    let title = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == request.session_id)
+                        .map(|s| self.session_title(s))
+                        .unwrap_or_default();
+                    self.note(
+                        NoteKind::Warning,
+                        format!("{}: {title}", t(lang, "質問があります", "Question for you")),
+                    );
+                }
+                self.notify_waiting(
+                    &request.session_id,
+                    t(lang, "質問があります", "Question for you"),
+                );
+                self.pending_inputs.push(PendingInput::new(request));
+            }
+            SameEvent::UserInputWithdrawn { request_id, .. } => {
+                self.pending_inputs
+                    .retain(|p| p.request.request_id != request_id);
+            }
+            SameEvent::PlanProposed { session_id, plan } => {
+                if let Some(draft) = self.live_drafts.get_mut(&session_id) {
+                    draft.plan = Some(plan);
+                }
             }
             SameEvent::ApprovalWithdrawn {
                 session_id,
@@ -2060,6 +2155,10 @@ impl SameAppView {
                 }
             }
         }
+        if let Some(plan) = draft.plan.as_deref().filter(|p| !p.trim().is_empty()) {
+            content.push_str(PLAN_MARKER);
+            content.push_str(plan);
+        }
         if let Some(err) = &error {
             if !content.is_empty() {
                 content.push_str("\n\n");
@@ -2102,12 +2201,25 @@ impl SameAppView {
         }
         self.pending_permissions
             .retain(|p| p.session_id != session_id);
+        self.pending_inputs
+            .retain(|p| p.request.session_id != session_id);
 
         let title = sess
             .as_ref()
             .map(|s| self.session_title(s))
             .unwrap_or_default();
         let visible = self.selected_session_id.as_deref() == Some(session_id);
+        match (&error, status) {
+            (Some(err), _) => self.os_notify(
+                format!("SAME — {}", t(lang, "エラー", "Error")),
+                format!("{title}: {}", err.lines().next().unwrap_or("")),
+            ),
+            (None, SessionStatus::Completed) => self.os_notify(
+                format!("SAME — {}", t(lang, "完了", "Finished")),
+                title.clone(),
+            ),
+            _ => {}
+        }
         if let (Some(err), false) = (error, visible) {
             let first_line: String = err.lines().next().unwrap_or("").chars().take(160).collect();
             self.note(
@@ -2279,6 +2391,7 @@ impl SameAppView {
             }
         }
 
+        let mode = self.session_mode(&session);
         self.live_drafts
             .insert(session.id.clone(), LiveDraft::default());
         self.scroll_feed_to_end();
@@ -2292,6 +2405,7 @@ impl SameAppView {
             prompt: full_prompt,
             attachments,
             exec: self.exec_pref(),
+            mode,
         });
     }
 
@@ -2433,10 +2547,20 @@ impl SameAppView {
             .map(|p| p.request_id.clone())
             .collect();
         self.pending_permissions.retain(|p| p.session_id != sid);
+        let inputs: Vec<String> = self
+            .pending_inputs
+            .iter()
+            .filter(|p| p.request.session_id == sid)
+            .map(|p| p.request.request_id.clone())
+            .collect();
+        self.pending_inputs.retain(|p| p.request.session_id != sid);
         let mgr = self.agent_manager.clone();
         self.rt.spawn(async move {
             for rid in perms {
                 mgr.respond_permission(&rid, None).await;
+            }
+            for rid in inputs {
+                mgr.respond_user_input(&rid, None).await;
             }
             mgr.cancel_session(&sid).await;
         });
@@ -2643,15 +2767,6 @@ impl SameAppView {
             ta.set_submit_on_enter(key == SubmitKey::Enter, cx)
         });
         self.apply_placeholders(window, cx);
-    }
-
-    fn set_auto_approve(&mut self, value: bool) {
-        if self.config.auto_approve_tools == value {
-            return;
-        }
-        self.config.auto_approve_tools = value;
-        self.agent_manager.set_auto_approve(value);
-        self.save_config();
     }
 }
 
@@ -4215,31 +4330,53 @@ impl SameAppView {
                 menu
             });
 
-        let auto_approve = self.config.auto_approve_tools;
-        let auto_approve_control = div().h_flex().gap_1().children(
-            [
-                (false, t(lang, "確認する", "Ask")),
-                (true, t(lang, "自動承認", "Auto-approve")),
-            ]
-            .map(|(value, label)| {
-                Button::new(SharedString::from(format!("set-auto-approve-{value}")))
+        let default_mode = self.config.default_approval_mode;
+        let default_mode_control =
+            div()
+                .h_flex()
+                .gap_1()
+                .flex_wrap()
+                .children(ApprovalMode::ALL.map(|mode| {
+                    Button::new(SharedString::from(format!(
+                        "set-default-mode-{}",
+                        mode.as_str()
+                    )))
                     .small()
-                    .label(label)
-                    .toggled(auto_approve == value)
-                    .when(auto_approve == value, |b| {
-                        if value {
+                    .label(approvals::mode_label(lang, mode))
+                    .tooltip(approvals::mode_hint(lang, mode))
+                    .toggled(default_mode == mode)
+                    .when(default_mode == mode, |b| {
+                        if mode == ApprovalMode::FullAccess {
                             b.warning()
                         } else {
                             b.primary()
                         }
                     })
-                    .when(auto_approve != value, |b| b.ghost())
+                    .when(default_mode != mode, |b| b.ghost())
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_auto_approve(value);
+                        this.config.default_approval_mode = mode;
+                        this.save_config();
                         cx.notify();
                     }))
-            }),
-        );
+                }));
+        let notifications = self.config.notifications;
+        let notifications_control = div().h_flex().gap_1().children([true, false].map(|on| {
+            Button::new(SharedString::from(format!("set-notifications-{on}")))
+                .small()
+                .label(if on {
+                    t(lang, "オン", "On")
+                } else {
+                    t(lang, "オフ", "Off")
+                })
+                .toggled(notifications == on)
+                .when(notifications == on, |b| b.primary())
+                .when(notifications != on, |b| b.ghost())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.config.notifications = on;
+                    this.save_config();
+                    cx.notify();
+                }))
+        }));
 
         let submit_key = self.config.submit_key;
         let mod_key = if cfg!(target_os = "macos") {
@@ -4319,13 +4456,24 @@ impl SameAppView {
                         &theme,
                     ))
                     .child(settings_row(
-                        t(lang, "ツール実行の承認", "Tool permissions"),
+                        t(lang, "承認モードの既定", "Default approval mode"),
                         t(
                             lang,
-                            "全セッションの新しい承認リクエストを単発許可で自動承認します（Codex のサンドボックス設定は次回実行から反映）",
-                            "Automatically grants new permission requests once, across all sessions (Codex's sandbox policy follows from its next run)",
+                            "新しいセッションの承認モード。各セッションでは入力欄の下で切り替えられます",
+                            "For sessions that have not picked one; switch per session under the prompt",
                         ),
-                        auto_approve_control,
+                        default_mode_control,
+                        false,
+                        &theme,
+                    ))
+                    .child(settings_row(
+                        t(lang, "通知", "Notifications"),
+                        t(
+                            lang,
+                            "ウィンドウが背面にある間、承認待ち・質問・完了を OS の通知で知らせます",
+                            "While the window is in the background, OS notifications for approvals, questions and finished replies",
+                        ),
+                        notifications_control,
                         false,
                         &theme,
                     )),
@@ -5236,6 +5384,7 @@ impl SameAppView {
         let _ = self.storage.set_session_effort(sid, None);
         self.agent_current_model.remove(sid);
         self.slash_commands.remove(sid);
+        self.agent_manager.release_session(sid);
     }
 
     /// The row under the prompt: agent and model pickers (like the Codex /
@@ -5568,27 +5717,7 @@ impl SameAppView {
                     .child(provider_button)
                     .child(model_button)
                     .children(effort_button)
-                    .child(
-                        Button::new("toggle-auto-approve")
-                            .xsmall()
-                            .toggled(self.config.auto_approve_tools)
-                            .when(self.config.auto_approve_tools, |b| b.warning())
-                            .when(!self.config.auto_approve_tools, |b| b.ghost())
-                            .tooltip(t(
-                                lang,
-                                "全セッションの新しい承認リクエストを単発許可で自動承認します（Codex のサンドボックス設定は次回実行から反映）",
-                                "Applies globally: automatically grants new permission requests once, across all sessions (Codex's sandbox policy follows from its next run)",
-                            ))
-                            .label(if self.config.auto_approve_tools {
-                                t(lang, "自動承認: ON", "Auto-approve: ON")
-                            } else {
-                                t(lang, "自動承認: OFF", "Auto-approve: OFF")
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_auto_approve(!this.config.auto_approve_tools);
-                                cx.notify();
-                            })),
-                    ),
+                    .child(self.render_mode_menu(session, cx)),
             )
             .child(
                 div()
@@ -6092,6 +6221,14 @@ impl SameAppView {
             .filter(|r| r.session_id == session.id)
             .cloned()
             .collect();
+        let input_ixs: Vec<usize> = self
+            .pending_inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.request.session_id == session.id)
+            .map(|(i, _)| i)
+            .collect();
+        let waiting = !pending_perms.is_empty() || !input_ixs.is_empty();
 
         let tail = div()
             .v_flex()
@@ -6156,13 +6293,23 @@ impl SameAppView {
                     model: session.model.clone(),
                     created_at: Utc::now(),
                 };
-                el.child(self.render_message(&m, Some(!pending_perms.is_empty()), cx))
+                let plan = draft.plan.clone();
+                el.child(self.render_message(&m, Some(waiting), cx))
+                    .when_some(plan, |el, plan| {
+                        el.child(self.render_plan_card(&m.id, &plan, false, cx))
+                    })
             })
+            // Only the first card takes keyboard answers.
             .children(
                 pending_perms
                     .into_iter()
-                    .map(|req| self.render_permission(req, cx)),
+                    .enumerate()
+                    .map(|(i, req)| self.render_permission(req, i == 0, cx)),
             )
+            .children(input_ixs.iter().enumerate().map(|(n, &i)| {
+                let first = n == 0 && self.pending_permissions.iter().all(|p| p.session_id != session.id);
+                self.render_user_input(&self.pending_inputs[i], first, cx)
+            }))
             .when(
                 !running
                     && session.status == SessionStatus::Interrupted
@@ -6179,110 +6326,6 @@ impl SameAppView {
                 },
             );
         self.feed_column(ix, tail)
-    }
-
-    fn render_permission(&self, req: PermissionRequest, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let lang = self.config.language;
-        let has_reject = req.options.iter().any(|o| o.kind.starts_with("reject"));
-        // Without a description, show what the tool is about to do.
-        let detail = if req.description.trim().is_empty() {
-            req.tool_call_id.as_ref().and_then(|tid| {
-                self.live_drafts
-                    .get(&req.session_id)
-                    .and_then(|d| d.tool_calls.iter().find(|tc| &tc.id == tid))
-                    .and_then(|tc| tc.input.clone())
-            })
-        } else {
-            Some(req.description.clone())
-        };
-        let req_id_cancel = req.request_id.clone();
-        div()
-            .v_flex()
-            .p_3()
-            .gap_2()
-            .rounded(px(8.0))
-            .bg(theme.sidebar)
-            .border_1()
-            .border_color(gpui::Hsla::from(status_amber()))
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(status_amber())
-                    .child(format!(
-                        "⚠ {}",
-                        t(lang, "ツール実行の許可が必要です", "Permission needed")
-                    )),
-            )
-            .child(div().text_sm().child(req.title.clone()))
-            .when_some(detail, |el, detail| {
-                el.child(
-                    div()
-                        .id(SharedString::from(format!("perm-desc-{}", req.request_id)))
-                        .max_h(px(220.0))
-                        .overflow_y_scroll()
-                        .text_xs()
-                        .p_2()
-                        .rounded(px(4.0))
-                        .bg(theme.background)
-                        .font_family(theme.mono_font_family.clone())
-                        .child(detail),
-                )
-            })
-            .child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .children(req.options.into_iter().map(|opt| {
-                        let req_id = req.request_id.clone();
-                        let opt_id = opt.id.clone();
-                        let kind = opt.kind.clone();
-                        Button::new(SharedString::from(format!("perm-{}-{}", req_id, opt_id)))
-                            .small()
-                            .map(|b| match kind.as_str() {
-                                "allow_once" => b.primary(),
-                                k if k.starts_with("reject") => b.danger(),
-                                _ => b.outline(),
-                            })
-                            .label(opt.name)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.pending_permissions.retain(|p| p.request_id != req_id);
-                                let mgr = this.agent_manager.clone();
-                                let rid = req_id.clone();
-                                let oid = opt_id.clone();
-                                this.rt.spawn(async move {
-                                    mgr.respond_permission(&rid, Some(oid)).await;
-                                });
-                                cx.notify();
-                            }))
-                    }))
-                    .when(!has_reject, |el| {
-                        el.child(
-                            Button::new(SharedString::from(format!(
-                                "perm-cancel-{}",
-                                req_id_cancel
-                            )))
-                            .small()
-                            .danger()
-                            .label(t(lang, "拒否", "Deny"))
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.pending_permissions
-                                        .retain(|p| p.request_id != req_id_cancel);
-                                    let mgr = this.agent_manager.clone();
-                                    let rid = req_id_cancel.clone();
-                                    this.rt.spawn(async move {
-                                        mgr.respond_permission(&rid, None).await;
-                                    });
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                    }),
-            )
-            .into_any_element()
     }
 
     /// Renders one message. `live` is `Some(waiting_for_permission)` for the
@@ -6370,8 +6413,14 @@ impl SameAppView {
             .map(|p| self.provider_name(p))
             .unwrap_or_else(|| "Assistant".to_string());
         let (body, error) = split_error(&msg.content);
+        let (body, plan) = split_plan(body);
         let body = body.to_string();
+        let plan = plan.map(str::to_string);
         let error = error.map(str::to_string);
+        // Only the session's latest reply offers to implement its plan.
+        let plan_actionable = !is_live
+            && self.messages.last().is_some_and(|m| m.id == msg.id)
+            && !self.is_session_running(&msg.session_id);
 
         div()
             .v_flex()
@@ -6508,6 +6557,9 @@ impl SameAppView {
                         .selectable(true),
                     ),
                 )
+            })
+            .when_some(plan, |el, plan| {
+                el.child(self.render_plan_card(&msg.id, &plan, plan_actionable, cx))
             })
             .when_some(error, |el, err| {
                 el.child(
@@ -7376,6 +7428,19 @@ impl Render for SameAppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if std::mem::take(&mut self.reload_open_file_pending) {
             self.reload_open_file_from_disk(window, cx);
+        }
+        self.ensure_input_fields(window, cx);
+        // Take keyboard answers on a new card, unless the user is typing.
+        if std::mem::take(&mut self.focus_approval) && self.active_view == MainView::Chat {
+            let typing = !self.prompt_input.read(cx).value().is_empty()
+                && self
+                    .prompt_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window);
+            if !typing {
+                window.focus(&self.approval_focus, cx);
+            }
         }
         for (kind, msg) in std::mem::take(&mut self.pending_notes) {
             let note = match kind {

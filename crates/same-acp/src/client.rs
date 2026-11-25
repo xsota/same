@@ -63,6 +63,8 @@ pub enum AcpEvent {
         title: String,
         description: String,
         options: Vec<AcpPermissionOption>,
+        /// The request's raw `toolCall` (its `kind`, and any diff content).
+        tool_call: Value,
         responder: PermissionResponder,
     },
     StderrLine(String),
@@ -356,12 +358,13 @@ impl AcpClient {
         Ok(res)
     }
 
-    /// Resumes a session; returns its model choice if the agent reports one.
+    /// Resumes a session; returns its model choice and modes if the agent
+    /// reports them.
     pub async fn load_session(
         &self,
         session_id: &str,
         cwd: &Path,
-    ) -> Result<Option<AcpModelState>> {
+    ) -> Result<(Option<AcpModelState>, Option<Value>)> {
         let val = self
             .request(
                 "session/load",
@@ -372,7 +375,17 @@ impl AcpClient {
                 }),
             )
             .await?;
-        Ok(parse_model_state(&val))
+        Ok((parse_model_state(&val), val.get("modes").cloned()))
+    }
+
+    /// Switches the session's mode (`session/set_mode`).
+    pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<()> {
+        self.request(
+            "session/set_mode",
+            json!({"sessionId": session_id, "modeId": mode_id}),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Switches the session's model. Uses `session/set_config_option` when the
@@ -598,6 +611,7 @@ async fn handle_permission_request(
         title,
         description,
         options,
+        tool_call: tool_call.cloned().unwrap_or(Value::Null),
         responder: PermissionResponder { tx },
     });
 

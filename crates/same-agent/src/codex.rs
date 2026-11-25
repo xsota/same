@@ -1,29 +1,24 @@
-//! Runs a Codex turn through `codex app-server` (JSON-RPC over stdio), which
-//! sends command and file-change approval requests the user can answer.
+//! Codex through `codex app-server` (JSON-RPC over stdio), one process per
+//! SAME session kept between turns. Each turn carries the session's approval
+//! mode (approval policy, sandbox, plan collaboration mode); command and
+//! file-change approvals and `request_user_input` questions go to the user.
 
-use crate::adapters::{
-    close_stdin, shared_stdin, write_json_line, ArgList, SharedStdin, STDERR_TAIL_LINES,
+use crate::adapters::{write_json_line, ArgList, SharedStdin};
+use crate::diff;
+use crate::permissions::{self, ApprovalPrompt, AutoAllow, PermissionGate};
+use crate::process::{LineProcess, Pool, Pooled};
+use anyhow::{anyhow, bail, Result};
+use same_acp::exec::ExecTarget;
+use same_core::{
+    ApprovalMode, EventBus, ProviderConfig, SameEvent, ToolCallRecord, ToolCallStatus,
+    UserQuestion, UserQuestionOption,
 };
-use crate::permissions::{self, ApprovalPrompt, PermissionGate};
-use anyhow::{anyhow, Context, Result};
-use same_acp::exec::{build_command, ExecTarget};
-use same_core::{EventBus, ProviderConfig, SameEvent, ToolCallRecord, ToolCallStatus};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
-
-const ID_INITIALIZE: u64 = 1;
-const ID_THREAD: u64 = 2;
-const ID_TURN: u64 = 3;
-/// `thread/start` after the stored thread could not be resumed.
-const ID_THREAD_FRESH: u64 = 4;
-const ID_INTERRUPT: u64 = 5;
 
 /// How the turn ended, from `turn/completed`.
 #[derive(Debug, PartialEq)]
@@ -46,137 +41,415 @@ struct CodexTurn {
     error: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_codex_cli(
-    provider: &ProviderConfig,
-    session_id: &str,
-    external_session_id: Option<&str>,
-    model: Option<&str>,
-    effort: Option<&str>,
-    cwd: &Path,
-    target: &ExecTarget,
-    prompt: &str,
-    images: &[String],
-    auto_approve: bool,
-    gate: PermissionGate,
-    events: EventBus,
+/// The app-server of one SAME session.
+pub(crate) struct CodexProcess {
+    proc: LineProcess,
+    fingerprint: String,
+    next_id: u64,
+    /// The thread this process has open, and its model (needed to name the
+    /// model in a collaboration mode).
+    thread_id: Option<String>,
+    thread_model: Option<String>,
+}
+
+impl Pooled for CodexProcess {
+    fn process(&mut self) -> &mut LineProcess {
+        &mut self.proc
+    }
+    fn into_process(self) -> LineProcess {
+        self.proc
+    }
+    fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+pub(crate) type CodexPool = Pool<CodexProcess>;
+
+impl CodexProcess {
+    fn request(&mut self, method: &str, params: Value) -> (u64, Value) {
+        self.next_id += 1;
+        let id = self.next_id;
+        (
+            id,
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        )
+    }
+
+    /// Sends a request and waits for its response outside a turn. Server
+    /// requests arriving meanwhile are refused; notifications are dropped.
+    async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        let (id, msg) = self.request(method, params);
+        write_json_line(&self.proc.stdin, &msg).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let line = tokio::time::timeout_at(deadline, self.proc.lines.recv())
+                .await
+                .map_err(|_| anyhow!("Codex app-server did not answer {method}"))?;
+            let Some(line) = line else {
+                let code = self.proc.wait_exit().await;
+                let tail = self.proc.stderr_tail();
+                let last = tail.iter().rev().find(|l| !l.trim().is_empty());
+                bail!(
+                    "Codex app-server exited with status {}{}",
+                    code.unwrap_or(-1),
+                    last.map(|l| format!(": {}", l.trim())).unwrap_or_default()
+                );
+            };
+            let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            let method_in = val.get("method").and_then(Value::as_str);
+            let has_id = val.get("id").is_some_and(|i| !i.is_null());
+            match (method_in, has_id) {
+                (Some(m), true) => {
+                    let reply = unsupported_request(&val, m);
+                    write_json_line(&self.proc.stdin, &reply).await?;
+                }
+                (None, true) if val.get("id").and_then(Value::as_u64) == Some(id) => {
+                    if let Some(err) = val.get("error") {
+                        bail!(
+                            "{}",
+                            err.get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex request failed")
+                        );
+                    }
+                    return Ok(val.get("result").cloned().unwrap_or(Value::Null));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The settings one turn runs with, from the session's approval mode.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ModeSettings {
+    pub approval_policy: &'static str,
+    pub sandbox_policy: Value,
+    pub plan: bool,
+}
+
+pub(crate) fn codex_mode_settings(mode: ApprovalMode) -> ModeSettings {
+    match mode {
+        ApprovalMode::Plan => ModeSettings {
+            approval_policy: "on-request",
+            sandbox_policy: json!({"type": "readOnly"}),
+            plan: true,
+        },
+        // Codex has no edits-only mode: inside the workspace it already
+        // writes without asking, and a write outside it is not an "edit" to
+        // wave through.
+        ApprovalMode::Ask | ApprovalMode::AcceptEdits => ModeSettings {
+            approval_policy: "on-request",
+            sandbox_policy: json!({"type": "workspaceWrite"}),
+            plan: false,
+        },
+        ApprovalMode::FullAccess => ModeSettings {
+            approval_policy: "never",
+            sandbox_policy: json!({"type": "dangerFullAccess"}),
+            plan: false,
+        },
+    }
+}
+
+fn codex_fingerprint(provider: &ProviderConfig, cwd: &Path, target: &ExecTarget) -> String {
+    format!(
+        "{}\u{0}{:?}\u{0}{:?}\u{0}{}\u{0}{:?}",
+        provider.command,
+        provider.args,
+        provider.env,
+        cwd.display(),
+        target,
+    )
+}
+
+/// How long a stopped turn may take to wind down before the process is
+/// killed instead.
+const INTERRUPT_GRACE: Duration = Duration::from_secs(10);
+
+pub(crate) struct CodexTurnRequest<'a> {
+    pub pool: &'a CodexPool,
+    pub provider: &'a ProviderConfig,
+    pub session_id: &'a str,
+    pub external_session_id: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub cwd: &'a Path,
+    pub target: &'a ExecTarget,
+    pub prompt: &'a str,
+    pub images: &'a [String],
+    pub gate: &'a PermissionGate,
+    pub events: &'a EventBus,
+}
+
+/// Runs one turn on the session's app-server, starting one (and resuming
+/// its thread) when there is none to reuse.
+pub(crate) async fn run_codex_turn(
+    t: CodexTurnRequest<'_>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let mut args = ArgList::new(&provider.args);
-    args.arg("app-server");
-    let mut cmd = build_command(target, &provider.command, &args.0, cwd, &provider.env).await;
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to spawn '{}'", provider.command))?;
-    let stdin = shared_stdin(&mut child)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture Codex stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("Failed to capture Codex stderr"))?;
-
-    let stderr_tail = Arc::new(std::sync::Mutex::new(VecDeque::new()));
-    {
-        let events = events.clone();
-        let sid = session_id.to_string();
-        let pid = provider.id.clone();
-        let tail = stderr_tail.clone();
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                {
-                    let mut tail = tail.lock().unwrap();
-                    if tail.len() == STDERR_TAIL_LINES {
-                        tail.pop_front();
-                    }
-                    tail.push_back(line.clone());
-                }
-                events.publish(SameEvent::AgentLog {
-                    session_id: Some(sid.clone()),
-                    provider_id: pid.clone(),
-                    line,
-                });
-            }
-        });
-    }
-
-    let agent_cwd = target.to_target_path(cwd);
-    // Always use `untrusted` so the server emits approval requests and
-    // `PermissionGate` can apply the live `auto_approve` toggle mid-turn.
-    let approval_policy = "untrusted";
-    let resume = external_session_id.filter(|s| !s.trim().is_empty());
-    let thread_request = match resume {
-        Some(thread_id) => {
-            let mut params = json!({
-                "threadId": thread_id,
-                "cwd": agent_cwd,
-                "approvalPolicy": approval_policy,
-            });
-            if auto_approve {
-                params["sandbox"] = json!("workspace-write");
-            }
-            rpc_request(ID_THREAD, "thread/resume", params)
-        }
-        None => thread_start(ID_THREAD, &agent_cwd, approval_policy, auto_approve),
-    };
-    for msg in [
-        rpc_request(
-            ID_INITIALIZE,
-            "initialize",
-            json!({"clientInfo": {"name": "same", "version": env!("CARGO_PKG_VERSION")}}),
-        ),
-        json!({"jsonrpc": "2.0", "method": "initialized"}),
-        thread_request,
-    ] {
-        write_json_line(&stdin, &msg).await?;
-    }
-
-    let mut lines = BufReader::new(stdout).lines();
-    let mut turn = CodexTurn::default();
-    let mut request_tasks: JoinSet<Result<()>> = JoinSet::new();
-    let mut pending_requests: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
-
-    let end: Option<TurnEnd> = loop {
-        tokio::select! {
-            Some(res) = request_tasks.join_next(), if !request_tasks.is_empty() => {
-                if let Ok(Err(err)) = res {
-                    break Some(TurnEnd::Failed(format!("Codex stdin write failed: {err}")));
-                }
-            }
+    let fingerprint = codex_fingerprint(t.provider, t.cwd, t.target);
+    let mut lease = t.pool.lease(t.session_id).await;
+    if lease.reusable(&fingerprint).await.is_none() {
+        let mut args = ArgList::new(&t.provider.args);
+        args.arg("app-server");
+        let proc = LineProcess::spawn(t.provider, &args.0, t.cwd, t.target, t.events, t.session_id)
+            .await?;
+        let mut process = CodexProcess {
+            proc,
+            fingerprint,
+            next_id: 0,
+            thread_id: None,
+            thread_model: None,
+        };
+        let init = tokio::select! {
             _ = &mut cancel_rx => {
-                request_tasks.abort_all();
-                let graceful = async {
-                    if let (Some(thread_id), Some(turn_id)) = (&turn.thread_id, &turn.turn_id) {
-                        let _ = write_json_line(
-                            &stdin,
-                            &rpc_request(
-                                ID_INTERRUPT,
-                                "turn/interrupt",
-                                json!({"threadId": thread_id, "turnId": turn_id}),
-                            ),
-                        )
-                        .await;
-                    }
-                    close_stdin(&stdin).await;
-                    let _ = child.wait().await;
-                };
-                if tokio::time::timeout(Duration::from_secs(2), graceful).await.is_err() {
-                    let _ = child.kill().await;
-                }
-                events.publish(SameEvent::SessionCancelled {
-                    session_id: session_id.to_string(),
+                process.proc.shutdown().await;
+                t.events.publish(SameEvent::SessionCancelled {
+                    session_id: t.session_id.to_string(),
                 });
                 return Ok(());
             }
-            line_res = lines.next_line() => {
-                let Some(line) = line_res? else { break None };
+            res = process.call(
+                "initialize",
+                json!({
+                    "clientInfo": {"name": "same", "version": env!("CARGO_PKG_VERSION")},
+                    // Needed for `collaborationMode` (plan mode).
+                    "capabilities": {"experimentalApi": true},
+                }),
+            ) => res,
+        };
+        if let Err(err) = init {
+            process.proc.shutdown().await;
+            return Err(err);
+        }
+        write_json_line(
+            &process.proc.stdin,
+            &json!({"jsonrpc": "2.0", "method": "initialized"}),
+        )
+        .await?;
+        lease.put(process);
+    }
+    let process = lease.get().expect("process just ensured");
+
+    let open = tokio::select! {
+        _ = &mut cancel_rx => {
+            lease.discard().await;
+            t.events.publish(SameEvent::SessionCancelled {
+                session_id: t.session_id.to_string(),
+            });
+            return Ok(());
+        }
+        res = open_thread(process, &t) => res,
+    };
+    if let Err(err) = open {
+        lease.discard().await;
+        return Err(err);
+    }
+    if cancel_rx.try_recv().is_ok() {
+        lease.discard().await;
+        t.events.publish(SameEvent::SessionCancelled {
+            session_id: t.session_id.to_string(),
+        });
+        return Ok(());
+    }
+
+    let res = run_turn_on(process, &t, &mut cancel_rx).await;
+    match res {
+        Ok((end, process_ok)) => {
+            if !process_ok {
+                lease.discard().await;
+            }
+            match end {
+                TurnEnd::Completed => {
+                    t.events.publish(SameEvent::SessionCompleted {
+                        session_id: t.session_id.to_string(),
+                        stop_reason: Some("end_turn".to_string()),
+                    });
+                    Ok(())
+                }
+                // Stopped by the user, or "Deny and stop".
+                TurnEnd::Interrupted => {
+                    t.events.publish(SameEvent::SessionCancelled {
+                        session_id: t.session_id.to_string(),
+                    });
+                    Ok(())
+                }
+                TurnEnd::Failed(err) => Err(anyhow!(err)),
+            }
+        }
+        Err(err) => {
+            lease.discard().await;
+            Err(err)
+        }
+    }
+}
+
+/// Makes sure the process has the session's thread open: resumes the stored
+/// one, or starts a new one when there is none or it is gone.
+async fn open_thread(process: &mut CodexProcess, t: &CodexTurnRequest<'_>) -> Result<()> {
+    let wanted = t.external_session_id.filter(|s| !s.trim().is_empty());
+    if process.thread_id.is_some() && (wanted.is_none() || wanted == process.thread_id.as_deref()) {
+        return Ok(());
+    }
+    let cwd = t.target.to_target_path(t.cwd);
+    let base = json!({
+        "cwd": cwd,
+        "approvalPolicy": "on-request",
+        "sandbox": "workspace-write",
+    });
+    let result = match wanted {
+        Some(thread_id) => {
+            let mut params = base.clone();
+            params["threadId"] = json!(thread_id);
+            match process.call("thread/resume", params).await {
+                Ok(r) => r,
+                Err(err) if err.to_string().contains("no rollout found") => {
+                    t.events.publish(SameEvent::AgentLog {
+                        session_id: Some(t.session_id.to_string()),
+                        provider_id: t.provider.id.clone(),
+                        line: format!("Codex thread {thread_id} not found; starting a new thread"),
+                    });
+                    process.call("thread/start", base).await?
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        None => process.call("thread/start", base).await?,
+    };
+    let thread_id = result
+        .pointer("/thread/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Codex did not return a thread id"))?
+        .to_string();
+    process.thread_model = result
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    t.events.publish(SameEvent::ExternalSessionBound {
+        session_id: t.session_id.to_string(),
+        external_session_id: thread_id.clone(),
+    });
+    process.thread_id = Some(thread_id);
+    Ok(())
+}
+
+fn turn_start_params(
+    thread_id: &str,
+    t: &CodexTurnRequest<'_>,
+    thread_model: Option<&str>,
+    mode: ApprovalMode,
+) -> Value {
+    let mut input = vec![json!({"type": "text", "text": t.prompt})];
+    input.extend(
+        t.images
+            .iter()
+            .map(|path| json!({"type": "localImage", "path": path})),
+    );
+    let settings = codex_mode_settings(mode);
+    let model = t.model.filter(|s| !s.trim().is_empty());
+    let effort = t.effort.filter(|s| !s.trim().is_empty());
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": input,
+        "approvalPolicy": settings.approval_policy,
+        "sandboxPolicy": settings.sandbox_policy,
+    });
+    if let Some(m) = model {
+        params["model"] = json!(m);
+    }
+    if let Some(e) = effort {
+        params["effort"] = json!(e);
+    }
+    // Sent every turn (plan or default) so leaving plan mode clears it. It
+    // takes precedence over model and effort, so it repeats them.
+    if let Some(m) = model.or(thread_model) {
+        let mut mode_settings = json!({"model": m});
+        if let Some(e) = effort {
+            mode_settings["reasoning_effort"] = json!(e);
+        }
+        params["collaborationMode"] = json!({
+            "mode": if settings.plan { "plan" } else { "default" },
+            "settings": mode_settings,
+        });
+    }
+    params
+}
+
+/// Runs the turn; returns how it ended and whether the process can take
+/// another turn.
+async fn run_turn_on(
+    process: &mut CodexProcess,
+    t: &CodexTurnRequest<'_>,
+    cancel_rx: &mut oneshot::Receiver<()>,
+) -> Result<(TurnEnd, bool)> {
+    let session_id = t.session_id;
+    let events = t.events;
+    process.proc.drain();
+    let stdin = process.proc.stdin.clone();
+    let thread_id = process.thread_id.clone().expect("thread opened");
+    let mode = t.gate.mode(session_id);
+    let params = turn_start_params(&thread_id, t, process.thread_model.as_deref(), mode);
+    let (turn_req_id, msg) = process.request("turn/start", params);
+    write_json_line(&stdin, &msg).await?;
+
+    let mut turn = CodexTurn {
+        thread_id: Some(thread_id.clone()),
+        ..CodexTurn::default()
+    };
+    let mut request_tasks: JoinSet<Result<()>> = JoinSet::new();
+    let mut pending_requests: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
+    let mut stopping: Option<tokio::time::Instant> = None;
+    let mut interrupt_sent = false;
+
+    loop {
+        // Interrupt once the turn id is known (it may not be yet when the
+        // user stops right after sending).
+        if stopping.is_some() && !interrupt_sent {
+            if let Some(turn_id) = turn.turn_id.clone() {
+                let (_, msg) = process.request(
+                    "turn/interrupt",
+                    json!({"threadId": thread_id, "turnId": turn_id}),
+                );
+                write_json_line(&stdin, &msg).await?;
+                interrupt_sent = true;
+            }
+        }
+        let deadline = stopping;
+        tokio::select! {
+            Some(res) = request_tasks.join_next(), if !request_tasks.is_empty() => {
+                if let Ok(Err(err)) = res {
+                    return Err(anyhow!("Codex stdin write failed: {err}"));
+                }
+            }
+            _ = &mut *cancel_rx, if stopping.is_none() => {
+                request_tasks.abort_all();
+                pending_requests.clear();
+                stopping = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
+            }
+            _ = sleep_until_opt(deadline) => {
+                return Ok((TurnEnd::Interrupted, false));
+            }
+            line = process.proc.lines.recv() => {
+                let Some(line) = line else {
+                    if stopping.is_some() {
+                        return Ok((TurnEnd::Interrupted, false));
+                    }
+                    let code = process.proc.wait_exit().await;
+                    let tail = process.proc.stderr_tail();
+                    let mut msg = format!(
+                        "Codex app-server exited with status {} before the turn finished",
+                        code.unwrap_or(-1)
+                    );
+                    if let Some(err) = turn.error.take() {
+                        msg.push_str(&format!(": {err}"));
+                    } else if let Some(last) = tail.iter().rev().find(|l| !l.trim().is_empty()) {
+                        msg.push_str(&format!(": {}", last.trim()));
+                    }
+                    return Ok((TurnEnd::Failed(msg), false));
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -184,7 +457,7 @@ pub async fn run_codex_cli(
                 let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
                     events.publish(SameEvent::AgentLog {
                         session_id: Some(session_id.to_string()),
-                        provider_id: provider.id.clone(),
+                        provider_id: t.provider.id.clone(),
                         line: trimmed.to_string(),
                     });
                     continue;
@@ -195,12 +468,15 @@ pub async fn run_codex_cli(
                 let has_id = val.get("id").is_some_and(|id| !id.is_null());
                 match (method, has_id) {
                     (Some(method), true) => {
-                        if let Some((key, handle)) = spawn_server_request(
+                        if stopping.is_some() {
+                            let reply = dismissed_reply(&val, method);
+                            write_json_line(&stdin, &reply).await?;
+                        } else if let Some((key, handle)) = spawn_server_request(
                             method,
                             &val,
                             &turn,
                             session_id,
-                            &gate,
+                            t.gate,
                             &stdin,
                             &mut request_tasks,
                         ) {
@@ -220,163 +496,67 @@ pub async fn run_codex_cli(
                     }
                     (Some(method), false) => {
                         if let Some(end) =
-                            handle_notification(method, &val, session_id, &events, &mut turn)
+                            handle_notification(method, &val, session_id, events, &mut turn)
                         {
-                            break Some(end);
+                            request_tasks.abort_all();
+                            let end = if stopping.is_some() { TurnEnd::Interrupted } else { end };
+                            return Ok((end, true));
                         }
                     }
                     (None, true) => {
-                        let id = val.get("id").and_then(Value::as_u64).unwrap_or(0);
-                        let error = val
-                            .get("error")
-                            .map(|e| {
-                                e.get("message")
+                        if val.get("id").and_then(Value::as_u64) == Some(turn_req_id) {
+                            if let Some(err) = val.get("error") {
+                                let msg = err
+                                    .get("message")
                                     .and_then(Value::as_str)
-                                    .unwrap_or("Codex request failed")
-                                    .to_string()
-                            });
-                        match (id, error) {
-                            (ID_THREAD, Some(err))
-                                if resume.is_some() && err.contains("no rollout found") =>
+                                    .unwrap_or("Codex could not start the turn");
+                                return Ok((TurnEnd::Failed(msg.to_string()), true));
+                            }
+                            if let Some(id) =
+                                val.pointer("/result/turn/id").and_then(Value::as_str)
                             {
-                                events.publish(SameEvent::AgentLog {
-                                    session_id: Some(session_id.to_string()),
-                                    provider_id: provider.id.clone(),
-                                    line: format!(
-                                        "Codex thread {} not found; starting a new thread",
-                                        resume.unwrap_or_default()
-                                    ),
-                                });
-                                write_json_line(
-                                    &stdin,
-                                    &thread_start(
-                                        ID_THREAD_FRESH,
-                                        &agent_cwd,
-                                        approval_policy,
-                                        auto_approve,
-                                    ),
-                                )
-                                .await?;
+                                turn.turn_id = Some(id.to_string());
                             }
-                            (ID_INTERRUPT, _) => {}
-                            (_, Some(err)) => break Some(TurnEnd::Failed(err)),
-                            (ID_THREAD | ID_THREAD_FRESH, None) => {
-                                let Some(thread_id) = val
-                                    .pointer("/result/thread/id")
-                                    .and_then(Value::as_str)
-                                else {
-                                    break Some(TurnEnd::Failed(
-                                        "Codex did not return a thread id".to_string(),
-                                    ));
-                                };
-                                turn.thread_id = Some(thread_id.to_string());
-                                events.publish(SameEvent::ExternalSessionBound {
-                                    session_id: session_id.to_string(),
-                                    external_session_id: thread_id.to_string(),
-                                });
-                                let stdin = stdin.clone();
-                                let turn_req =
-                                    turn_start(thread_id, prompt, images, model, effort);
-                                request_tasks.spawn(async move {
-                                    write_json_line(&stdin, &turn_req).await
-                                });
-                            }
-                            (ID_TURN, None) => {
-                                if let Some(id) =
-                                    val.pointer("/result/turn/id").and_then(Value::as_str)
-                                {
-                                    turn.turn_id = Some(id.to_string());
-                                }
-                            }
-                            _ => {}
                         }
                     }
                     (None, false) => {}
                 }
             }
         }
-    };
-
-    request_tasks.abort_all();
-    close_stdin(&stdin).await;
-    let status = match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
-        Ok(status) => status.ok(),
-        Err(_) => {
-            let _ = child.kill().await;
-            None
-        }
-    };
-
-    match end {
-        Some(TurnEnd::Completed) => {
-            events.publish(SameEvent::SessionCompleted {
-                session_id: session_id.to_string(),
-                stop_reason: Some("end_turn".to_string()),
-            });
-            Ok(())
-        }
-        // e.g. the user chose "Deny and stop".
-        Some(TurnEnd::Interrupted) => {
-            events.publish(SameEvent::SessionCancelled {
-                session_id: session_id.to_string(),
-            });
-            Ok(())
-        }
-        Some(TurnEnd::Failed(err)) => Err(anyhow!(err)),
-        None => {
-            let tail: Vec<String> = stderr_tail.lock().unwrap().iter().cloned().collect();
-            let mut msg = format!(
-                "Codex app-server exited with status {} before the turn finished",
-                status.and_then(|s| s.code()).unwrap_or(-1)
-            );
-            if let Some(err) = turn.error {
-                msg.push_str(": ");
-                msg.push_str(&err);
-            } else if let Some(last) = tail.iter().rev().find(|l| !l.trim().is_empty()) {
-                msg.push_str(": ");
-                msg.push_str(last.trim());
-            }
-            Err(anyhow!(msg))
-        }
     }
 }
 
-fn rpc_request(id: u64, method: &str, params: Value) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
 }
 
-fn thread_start(id: u64, cwd: &str, approval_policy: &str, auto_approve: bool) -> Value {
-    let mut params = json!({
-        "cwd": cwd,
-        "approvalPolicy": approval_policy,
-    });
-    if auto_approve {
-        params["sandbox"] = json!("workspace-write");
+/// The answer to a server request that arrives while the turn is stopping.
+fn dismissed_reply(val: &Value, method: &str) -> Value {
+    let id = val.get("id").cloned().unwrap_or(Value::Null);
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            json!({"jsonrpc": "2.0", "id": id, "result": {"decision": "cancel"}})
+        }
+        "item/tool/requestUserInput" => {
+            json!({"jsonrpc": "2.0", "id": id, "result": {"answers": {}}})
+        }
+        _ => unsupported_request(val, method),
     }
-    rpc_request(id, "thread/start", params)
 }
 
-fn turn_start(
-    thread_id: &str,
-    prompt: &str,
-    images: &[String],
-    model: Option<&str>,
-    effort: Option<&str>,
-) -> Value {
-    let mut input = vec![json!({"type": "text", "text": prompt})];
-    input.extend(
-        images
-            .iter()
-            .map(|path| json!({"type": "localImage", "path": path})),
-    );
-    let mut params = json!({"threadId": thread_id, "input": input});
-    if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
-        params["model"] = json!(m);
+fn unsupported_request(val: &Value, method: &str) -> Value {
+    let id = val.get("id").cloned().unwrap_or(Value::Null);
+    if method == "mcpServer/elicitation/request" {
+        return json!({"jsonrpc": "2.0", "id": id, "result": {"action": "decline"}});
     }
-    if let Some(e) = effort.filter(|s| !s.trim().is_empty()) {
-        params["effort"] = json!(e);
-    }
-    rpc_request(ID_TURN, "turn/start", params)
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": -32601, "message": format!("SAME does not support {method}")},
+    })
 }
 
 /// Handles a notification; returns how the turn ended once it has.
@@ -447,6 +627,19 @@ fn handle_notification(
                         if !text.is_empty() {
                             publish_text(events, session_id, turn, text, true);
                         }
+                    }
+                }
+                "plan" if completed => {
+                    let plan = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    if !plan.is_empty() {
+                        events.publish(SameEvent::PlanProposed {
+                            session_id: session_id.to_string(),
+                            plan: plan.to_string(),
+                        });
                     }
                 }
                 "reasoning" if completed && !turn.streamed.contains(id) => {
@@ -606,6 +799,32 @@ fn changes_diff(item: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// The changes of a `fileChange` item as one unified diff. Codex gives an
+/// added file's content and a deleted file's old content rather than a diff.
+fn unified_changes(item: &Value) -> Option<String> {
+    let changes = item.get("changes")?.as_array()?;
+    let out: String = changes
+        .iter()
+        .map(|c| {
+            let path = c.get("path").and_then(Value::as_str).unwrap_or("file");
+            let body = c.get("diff").and_then(Value::as_str).unwrap_or("");
+            match c.pointer("/kind/type").and_then(Value::as_str) {
+                Some("add") => diff::unified(path, "", body),
+                Some("delete") => diff::unified(path, body, ""),
+                _ if body.starts_with("---") => body.to_string(),
+                _ => {
+                    let mut d = format!("--- a/{path}\n+++ b/{path}\n{body}");
+                    if !d.ends_with('\n') {
+                        d.push('\n');
+                    }
+                    d
+                }
+            }
+        })
+        .collect();
+    (!out.trim().is_empty()).then_some(out)
+}
+
 fn item_status(item: &Value, completed: bool) -> ToolCallStatus {
     match item.get("status").and_then(Value::as_str) {
         Some("declined") => ToolCallStatus::Denied,
@@ -749,13 +968,6 @@ fn codex_approval(
             {
                 desc.push_str(&format!("Grant write access to directory: {root}"));
             }
-            let diff = item.map(changes_diff).unwrap_or_default();
-            if !diff.is_empty() {
-                if !desc.is_empty() {
-                    desc.push_str("\n\n");
-                }
-                desc.push_str(&diff);
-            }
             (title, desc)
         }
         _ => return None,
@@ -779,16 +991,23 @@ fn codex_approval(
         ));
         decisions.push(decision);
     };
-    let has_accept = available.iter().any(|d| d.as_str() == Some("accept"));
+    let mut offered_session = false;
     for d in &available {
         match d.as_str() {
-            Some("accept") => push(d.clone(), "Allow".into(), "allow_once"),
-            // The app-server only lives for one turn, so only expose
-            // `acceptForSession` when `accept` is not offered (e.g. session-
-            // scoped network approvals). Keep it `allow_always` so single-use
-            // auto-approve does not grant a turn-wide permission.
-            Some("acceptForSession") if !has_accept => {
-                push(d.clone(), "Allow for this turn".into(), "allow_always")
+            Some("accept") => {
+                push(d.clone(), "Allow".into(), "allow_once");
+                // The app-server outlives the turn, so a session grant is
+                // worth offering; Codex honours it even when unlisted.
+                push(
+                    json!("acceptForSession"),
+                    "Allow for this session".into(),
+                    "allow_always",
+                );
+                offered_session = true;
+            }
+            Some("acceptForSession") if !offered_session => {
+                push(d.clone(), "Allow for this session".into(), "allow_always");
+                offered_session = true;
             }
             Some(_) => {}
             None => {
@@ -830,12 +1049,20 @@ fn codex_approval(
         push(json!("cancel"), "Deny and stop".into(), "reject_always");
     }
 
+    let diff = match method {
+        "item/fileChange/requestApproval" => item.and_then(unified_changes),
+        _ => None,
+    };
     Some(CodexApproval {
         prompt: ApprovalPrompt {
             tool_call_id: item_id.map(str::to_string),
             title,
             description,
             options,
+            diff,
+            // Codex's approval policy follows the mode each turn; this covers
+            // a switch to full access mid-turn.
+            auto: AutoAllow::InFullAccess,
         },
         decisions,
     })
@@ -908,6 +1135,8 @@ fn spawn_server_request(
                     permissions::option("allow", "Allow for this turn", "allow_always"),
                     permissions::option("deny", "Deny", "reject_once"),
                 ],
+                diff: None,
+                auto: AutoAllow::Never,
             };
             let gate = gate.clone();
             let sid = session_id.to_string();
@@ -925,23 +1154,98 @@ fn spawn_server_request(
             });
             Some((key, handle))
         }
-        // MCP servers asking for input are declined; the tool call fails
-        // instead of the turn waiting.
-        None if method == "mcpServer/elicitation/request" => {
-            let reply = json!({"jsonrpc": "2.0", "id": id, "result": {"action": "decline"}});
-            tasks.spawn(async move { write_json_line(&stdin, &reply).await });
-            None
-        }
-        None => {
-            let reply = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32601, "message": format!("SAME does not support {method}")},
+        None if method == "item/tool/requestUserInput" => {
+            let key = id.to_string();
+            let questions = codex_questions(&params);
+            let gate = gate.clone();
+            let sid = session_id.to_string();
+            let handle = tasks.spawn(async move {
+                let answers = gate.ask_user(&sid, questions.clone()).await;
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"answers": codex_answers(&questions, answers)},
+                });
+                tokio::spawn(async move { write_json_line(&stdin, &reply).await })
+                    .await
+                    .unwrap_or(Ok(()))
             });
+            Some((key, handle))
+        }
+        // Anything else is refused (MCP elicitations declined) so the turn
+        // does not wait forever.
+        None => {
+            let reply = unsupported_request(val, method);
             tasks.spawn(async move { write_json_line(&stdin, &reply).await });
             None
         }
     }
+}
+
+/// The questions of a `request_user_input` request.
+fn codex_questions(params: &Value) -> Vec<UserQuestion> {
+    params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|qs| {
+            qs.iter()
+                .filter_map(|q| {
+                    let id = q.get("id").and_then(Value::as_str)?.to_string();
+                    let options: Vec<UserQuestionOption> = q
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .map(|opts| {
+                            opts.iter()
+                                .filter_map(|o| {
+                                    Some(UserQuestionOption {
+                                        label: o.get("label").and_then(Value::as_str)?.to_string(),
+                                        description: o
+                                            .get("description")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(UserQuestion {
+                        header: q
+                            .get("header")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        question: q
+                            .get("question")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        multi_select: false,
+                        // Without options, the answer can only be typed.
+                        allow_other: options.is_empty()
+                            || q.get("isOther").and_then(Value::as_bool) == Some(true),
+                        secret: q.get("isSecret").and_then(Value::as_bool) == Some(true),
+                        options,
+                        id,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `{question id: {answers: [...]}}`; empty when the card was dismissed.
+fn codex_answers(questions: &[UserQuestion], answers: Option<Vec<Vec<String>>>) -> Value {
+    let map: serde_json::Map<String, Value> = answers
+        .map(|answers| {
+            questions
+                .iter()
+                .zip(answers)
+                .map(|(q, a)| (q.id.clone(), json!({"answers": a})))
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Object(map)
 }
 
 #[cfg(test)]
@@ -972,20 +1276,29 @@ mod tests {
         let kinds: Vec<&str> = a.prompt.options.iter().map(|o| o.kind.as_str()).collect();
         assert_eq!(
             kinds,
-            ["allow_once", "allow_always", "reject_once", "reject_always"]
+            [
+                "allow_once",
+                "allow_always",
+                "allow_always",
+                "reject_once",
+                "reject_always"
+            ]
         );
-        assert_eq!(a.prompt.options[1].name, "Always allow `touch a.txt`");
+        assert_eq!(a.prompt.options[1].name, "Allow for this session");
+        assert_eq!(a.prompt.options[2].name, "Always allow `touch a.txt`");
+        assert_eq!(a.prompt.auto, AutoAllow::InFullAccess);
 
         let id = json!(7);
         let pick =
             |c: Option<&str>| approval_response(&id, &a.decisions, c)["result"]["decision"].clone();
         assert_eq!(pick(Some("0")), json!("accept"));
+        assert_eq!(pick(Some("1")), json!("acceptForSession"));
         assert_eq!(
-            pick(Some("1"))["acceptWithExecpolicyAmendment"]["execpolicy_amendment"],
+            pick(Some("2"))["acceptWithExecpolicyAmendment"]["execpolicy_amendment"],
             json!(["touch", "a.txt"])
         );
-        assert_eq!(pick(Some("2")), json!("decline"));
-        assert_eq!(pick(Some("3")), json!("cancel"));
+        assert_eq!(pick(Some("3")), json!("decline"));
+        assert_eq!(pick(Some("4")), json!("cancel"));
         assert_eq!(pick(None), json!("cancel"));
     }
 
@@ -1005,9 +1318,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.prompt.title, "Edit /w/a.txt");
-        assert!(a.prompt.description.contains("hi"));
+        let diff = a.prompt.diff.unwrap();
+        assert!(diff.contains("+++ b//w/a.txt") && diff.contains("+hi"));
         let kinds: Vec<&str> = a.prompt.options.iter().map(|o| o.kind.as_str()).collect();
-        assert_eq!(kinds, ["allow_once", "reject_once", "reject_always"]);
+        assert_eq!(
+            kinds,
+            ["allow_once", "allow_always", "reject_once", "reject_always"]
+        );
+    }
+
+    #[test]
+    fn update_diffs_get_headers() {
+        let item = json!({"changes": [
+            {"path": "a.rs", "kind": {"type": "update", "move_path": null}, "diff": "@@ -1 +1 @@\n-x\n+y\n"},
+            {"path": "b.rs", "kind": {"type": "delete"}, "diff": "gone\n"}
+        ]});
+        let d = unified_changes(&item).unwrap();
+        assert!(d.contains("--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@"));
+        assert!(d.contains("-gone"));
+    }
+
+    #[test]
+    fn mode_settings_per_turn() {
+        let plan = codex_mode_settings(ApprovalMode::Plan);
+        assert!(plan.plan);
+        assert_eq!(plan.sandbox_policy["type"], "readOnly");
+        assert_eq!(
+            codex_mode_settings(ApprovalMode::Ask),
+            codex_mode_settings(ApprovalMode::AcceptEdits)
+        );
+        assert_eq!(
+            codex_mode_settings(ApprovalMode::Ask).approval_policy,
+            "on-request"
+        );
+        let full = codex_mode_settings(ApprovalMode::FullAccess);
+        assert_eq!(full.approval_policy, "never");
+        assert_eq!(full.sandbox_policy["type"], "dangerFullAccess");
+    }
+
+    #[test]
+    fn questions_map_both_ways() {
+        let params = json!({"questions": [
+            {"id": "len", "header": "README", "question": "Short or long?", "isOther": true,
+             "isSecret": false, "options": [{"label": "Short", "description": "d"}, {"label": "Long", "description": "e"}]},
+            {"id": "key", "header": "Key", "question": "API key?", "isSecret": true, "options": null}
+        ]});
+        let qs = codex_questions(&params);
+        assert_eq!(qs.len(), 2);
+        assert!(qs[0].allow_other && !qs[0].secret && qs[0].options.len() == 2);
+        assert!(qs[1].allow_other && qs[1].secret);
+        let a = codex_answers(&qs, Some(vec![vec!["Short".into()], vec!["k-1".into()]]));
+        assert_eq!(
+            a,
+            json!({"len": {"answers": ["Short"]}, "key": {"answers": ["k-1"]}})
+        );
+        assert_eq!(codex_answers(&qs, None), json!({}));
     }
 
     #[test]
