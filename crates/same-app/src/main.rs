@@ -4,6 +4,7 @@ mod app;
 mod brand;
 mod i18n;
 mod theme;
+mod updater;
 mod workspace_fs;
 
 use app::SameAppView;
@@ -20,7 +21,12 @@ fn main() {
         )
         .init();
 
-    let initial_dir = std::env::args().nth(1).map(PathBuf::from);
+    let first_arg = std::env::args().nth(1);
+    if matches!(first_arg.as_deref(), Some("--version" | "-V")) {
+        println!("same {}", updater::CURRENT_VERSION);
+        return;
+    }
+    let initial_dir = first_arg.map(PathBuf::from);
 
     gpui_platform::application()
         .with_assets(Assets)

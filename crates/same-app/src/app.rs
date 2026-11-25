@@ -3,6 +3,7 @@ use crate::theme::{
     accent, accent_foreground, accent_text, apply_gpui_theme, default_font_size, default_mono_font,
     default_ui_font, status_amber, status_green, status_red,
 };
+use crate::updater::{self, ReleaseInfo, UpdateCheckOutcome, CURRENT_VERSION};
 use crate::workspace_fs::{load_git_info, scan_directory, FileEntry, GitInfo};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
@@ -126,6 +127,24 @@ enum UiAsyncMsg {
         /// Started by the user (show the outcome), not in the background.
         manual: bool,
     },
+    UpdateChecked {
+        result: Result<UpdateCheckOutcome, String>,
+        manual: bool,
+    },
+    UpdateInstalled {
+        version: String,
+        result: Result<(), String>,
+    },
+}
+
+enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(ReleaseInfo),
+    Downloading(ReleaseInfo),
+    Installed(String),
+    Error(String),
 }
 
 /// File (in the data dir) that keeps the last model list of each provider,
@@ -237,6 +256,7 @@ pub struct SameAppView {
     /// Two-step delete: the key of the item whose delete button was clicked
     /// once and now asks for confirmation (e.g. "sess:<id>").
     confirm_delete: Option<String>,
+    update_state: UpdateState,
 
     // Chat
     prompt_input: Entity<TextareaState>,
@@ -546,6 +566,7 @@ impl SameAppView {
             logs: vec![],
             pending_notes: vec![],
             confirm_delete: None,
+            update_state: UpdateState::Idle,
             prompt_input,
             prompt_empty: true,
             attachments: Vec::new(),
@@ -597,6 +618,7 @@ impl SameAppView {
         app.apply_placeholders(window, cx);
         app.reload_project_state(window, cx);
         app.refresh_provider_checks();
+        app.check_for_updates(false);
         app.prompt_input.update(cx, |s, cx| s.focus(window, cx));
         Ok(app)
     }
@@ -1599,8 +1621,113 @@ impl SameAppView {
         });
     }
 
+    fn check_for_updates(&mut self, manual: bool) {
+        if matches!(
+            self.update_state,
+            UpdateState::Checking | UpdateState::Downloading(_)
+        ) {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        let tx = self.ui_tx.clone();
+        self.rt.spawn(async move {
+            let result = updater::check_for_updates()
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiAsyncMsg::UpdateChecked { result, manual });
+        });
+    }
+
+    fn install_update(&mut self, release: ReleaseInfo) {
+        if matches!(self.update_state, UpdateState::Downloading(_)) {
+            return;
+        }
+        let version = release.version.clone();
+        self.update_state = UpdateState::Downloading(release.clone());
+        let tx = self.ui_tx.clone();
+        self.rt.spawn(async move {
+            let result = updater::download_and_install(&release)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiAsyncMsg::UpdateInstalled { version, result });
+        });
+    }
+
     fn handle_async_msg(&mut self, msg: UiAsyncMsg) {
         match msg {
+            UiAsyncMsg::UpdateChecked { result, manual } => {
+                let lang = self.config.language;
+                match result {
+                    Ok(UpdateCheckOutcome::Available(info)) => {
+                        let ver = info.version.clone();
+                        self.update_state = UpdateState::Available(info);
+                        self.pending_notes.push((
+                            NoteKind::Info,
+                            match lang {
+                                Language::Ja => format!("新しいバージョン v{ver} が利用可能です"),
+                                Language::En => format!("New version v{ver} is available"),
+                            },
+                        ));
+                    }
+                    Ok(UpdateCheckOutcome::UpToDate { .. }) => {
+                        self.update_state = UpdateState::UpToDate;
+                        if manual {
+                            self.pending_notes.push((
+                                NoteKind::Success,
+                                t(
+                                    lang,
+                                    "最新バージョンを使用しています",
+                                    "You are on the latest version",
+                                )
+                                .to_string(),
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        if manual {
+                            self.update_state = UpdateState::Error(err.clone());
+                            self.pending_notes.push((
+                                NoteKind::Error,
+                                match lang {
+                                    Language::Ja => format!("アップデート確認に失敗しました: {err}"),
+                                    Language::En => format!("Update check failed: {err}"),
+                                },
+                            ));
+                        } else {
+                            self.update_state = UpdateState::Idle;
+                        }
+                    }
+                }
+            }
+            UiAsyncMsg::UpdateInstalled { version, result } => {
+                let lang = self.config.language;
+                match result {
+                    Ok(()) => {
+                        self.update_state = UpdateState::Installed(version.clone());
+                        self.pending_notes.push((
+                            NoteKind::Success,
+                            match lang {
+                                Language::Ja => {
+                                    format!("v{version} へのアップデートが完了しました。再起動して適用してください")
+                                }
+                                Language::En => {
+                                    format!("Updated to v{version}. Restart SAME to apply")
+                                }
+                            },
+                        ));
+                    }
+                    Err(err) => {
+                        self.update_state = UpdateState::Error(err.clone());
+                        self.pending_notes.push((
+                            NoteKind::Error,
+                            match lang {
+                                Language::Ja => format!("アップデートに失敗しました: {err}"),
+                                Language::En => format!("Update failed: {err}"),
+                            },
+                        ));
+                    }
+                }
+            }
             UiAsyncMsg::ProviderCheck(generation, res) => {
                 if generation == self.check_generation {
                     // Once per provider and environment per run, ask a
@@ -2633,6 +2760,47 @@ impl SameAppView {
             .child(self.render_quests_section(cx))
             .child(div().h(px(1.0)).bg(theme.border))
             .child(self.render_sessions_section(cx))
+            .child(div().h(px(1.0)).bg(theme.border))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .justify_between()
+                    .px_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("SAME v{CURRENT_VERSION}"))
+                    .when_some(
+                        match &self.update_state {
+                            UpdateState::Available(info) => Some(format!("↑ v{}", info.version)),
+                            UpdateState::Installed(ver) => Some(
+                                match lang {
+                                    Language::Ja => format!("再起動 (v{ver})"),
+                                    Language::En => format!("Restart (v{ver})"),
+                                },
+                            ),
+                            _ => None,
+                        },
+                        |el, badge| {
+                            el.child(
+                                div()
+                                    .id("sidebar-update-badge")
+                                    .px_1p5()
+                                    .py(px(1.0))
+                                    .rounded(px(4.0))
+                                    .bg(accent())
+                                    .text_color(accent_foreground())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .cursor_pointer()
+                                    .child(badge)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_settings(SettingsSection::General);
+                                        cx.notify();
+                                    })),
+                            )
+                        },
+                    ),
+            )
     }
 
     fn delete_button(
@@ -4134,6 +4302,169 @@ impl SameAppView {
                         &theme,
                     )),
             )
+            .child({
+                let (update_desc, update_control): (String, AnyElement) = match &self.update_state {
+                    UpdateState::Idle => (
+                        match lang {
+                            Language::Ja => format!("現在のバージョン: v{CURRENT_VERSION}"),
+                            Language::En => format!("Current version: v{CURRENT_VERSION}"),
+                        },
+                        Button::new("settings-check-update")
+                            .small()
+                            .outline()
+                            .label(t(lang, "アップデートを確認", "Check for updates"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_for_updates(true);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    ),
+                    UpdateState::Checking => (
+                        t(lang, "最新バージョンを確認しています...", "Checking for updates...")
+                            .to_string(),
+                        Button::new("settings-check-update")
+                            .small()
+                            .outline()
+                            .disabled(true)
+                            .label(t(lang, "確認中...", "Checking..."))
+                            .into_any_element(),
+                    ),
+                    UpdateState::UpToDate => (
+                        match lang {
+                            Language::Ja => {
+                                format!("v{CURRENT_VERSION} は最新です")
+                            }
+                            Language::En => {
+                                format!("v{CURRENT_VERSION} is up to date")
+                            }
+                        },
+                        Button::new("settings-check-update")
+                            .small()
+                            .outline()
+                            .label(t(lang, "再確認", "Check again"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_for_updates(true);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    ),
+                    UpdateState::Available(info) => {
+                        let info_clone = info.clone();
+                        let has_asset = info.download_url.is_some();
+                        let desc = match lang {
+                            Language::Ja => format!(
+                                "現在: v{CURRENT_VERSION} → 最新: v{}",
+                                info.version
+                            ),
+                            Language::En => format!(
+                                "Current: v{CURRENT_VERSION} → Latest: v{}",
+                                info.version
+                            ),
+                        };
+                        let ctrl = div()
+                            .h_flex()
+                            .gap_1()
+                            .when(has_asset, |d| {
+                                let ver_label = match lang {
+                                    Language::Ja => format!("v{} にアップデート", info.version),
+                                    Language::En => format!("Update to v{}", info.version),
+                                };
+                                d.child(
+                                    Button::new("settings-install-update")
+                                        .small()
+                                        .primary()
+                                        .label(ver_label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.install_update(info_clone.clone());
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("settings-recheck-update")
+                                    .small()
+                                    .ghost()
+                                    .label(t(lang, "再確認", "Recheck"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.check_for_updates(true);
+                                        cx.notify();
+                                    })),
+                            )
+                            .into_any_element();
+                        (desc, ctrl)
+                    }
+                    UpdateState::Downloading(info) => (
+                        match lang {
+                            Language::Ja => format!("v{} をダウンロードして適用しています...", info.version),
+                            Language::En => format!("Downloading and installing v{}...", info.version),
+                        },
+                        Button::new("settings-downloading-update")
+                            .small()
+                            .outline()
+                            .disabled(true)
+                            .label(t(lang, "アップデート中...", "Updating..."))
+                            .into_any_element(),
+                    ),
+                    UpdateState::Installed(ver) => (
+                        match lang {
+                            Language::Ja => format!("v{ver} の準備ができました。再起動して適用します"),
+                            Language::En => format!("v{ver} is ready. Restart to apply"),
+                        },
+                        Button::new("settings-restart-update")
+                            .small()
+                            .primary()
+                            .label(t(lang, "再起動して適用", "Restart to apply"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.file_dirty {
+                                    this.pending_notes.push((
+                                        NoteKind::Warning,
+                                        t(
+                                            this.config.language,
+                                            "未保存のファイルがあります。保存してから再起動してください",
+                                            "You have unsaved file changes. Save them before restarting",
+                                        )
+                                        .to_string(),
+                                    ));
+                                    cx.notify();
+                                    return;
+                                }
+                                if let Err(err) = updater::restart_self() {
+                                    this.pending_notes.push((
+                                        NoteKind::Error,
+                                        format!("Restart failed: {err:#}"),
+                                    ));
+                                    cx.notify();
+                                } else {
+                                    cx.quit();
+                                }
+                            }))
+                            .into_any_element(),
+                    ),
+                    UpdateState::Error(err) => (
+                        match lang {
+                            Language::Ja => format!("エラー: {err}"),
+                            Language::En => format!("Error: {err}"),
+                        },
+                        Button::new("settings-retry-update")
+                            .small()
+                            .outline()
+                            .label(t(lang, "再試行", "Retry"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_for_updates(true);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    ),
+                };
+
+                settings_card(&theme).child(settings_row(
+                    t(lang, "バージョンとアップデート", "Version & Updates"),
+                    &update_desc,
+                    update_control,
+                    true,
+                    &theme,
+                ))
+            })
             .child(
                 div()
                     .text_xs()
