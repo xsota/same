@@ -7,7 +7,7 @@ mod workspace_fs;
 
 use app::SameAppView;
 use gpui::{px, size, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
-use gpui_component::Root;
+use gpui_component::{Root, TitleBar};
 use gpui_kit_assets::Assets;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -28,13 +28,17 @@ fn main() {
             app::bind_keys(cx);
 
             let bounds = Bounds::centered(None, size(px(1360.0), px(860.0)), cx);
+            // Hide the OS title bar and draw our own (see `render_title_bar`),
+            // like Codex / Claude desktop. The title is still set for the
+            // taskbar and Alt+Tab.
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(880.0), px(560.0))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("SAME — Shared Agentic Multi-provider Environment".into()),
-                    ..Default::default()
+                    ..TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                ..TitleBar::window_options()
             };
 
             cx.open_window(options, |window, cx| {

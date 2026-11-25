@@ -391,6 +391,27 @@ impl AcpClient {
         Ok(parse_model_state(&val))
     }
 
+    /// Sets a session config option (e.g. the reasoning effort). Returns the
+    /// updated model state when the agent sends one back.
+    pub async fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Option<AcpModelState>> {
+        let val = self
+            .request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id,
+                    "configId": config_id,
+                    "value": value
+                }),
+            )
+            .await?;
+        Ok(parse_model_state(&val))
+    }
+
     pub async fn prompt(&self, session_id: &str, text: &str) -> Result<PromptResult> {
         let val = self
             .request(

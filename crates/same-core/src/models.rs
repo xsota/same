@@ -122,6 +122,8 @@ pub struct Session {
     pub title: String,
     pub provider_id: String,
     pub model: Option<String>,
+    /// Reasoning effort (e.g. "high"); `None` leaves it to the agent.
+    pub effort: Option<String>,
     pub external_session_id: Option<String>,
     pub status: SessionStatus,
     pub pinned: bool,
@@ -268,10 +270,17 @@ pub struct SlashCommandInfo {
 }
 
 /// A model an agent reported it can use (e.g. from an ACP session).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// Reasoning effort levels this model accepts (e.g. "low", "high");
+    /// empty when the agent reports none.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    /// The effort the agent uses for this model when none is chosen.
+    #[serde(default)]
+    pub default_effort: Option<String>,
 }

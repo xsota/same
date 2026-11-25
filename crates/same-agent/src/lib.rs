@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod discovery;
 pub mod manager;
 
 pub use manager::{AgentManager, PromptRequest, ProviderCheckResult, ProviderSetup, SetupOutcome};

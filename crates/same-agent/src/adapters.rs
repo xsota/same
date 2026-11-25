@@ -26,6 +26,7 @@ pub async fn run_claude_cli(
     session_id: &str,
     external_session_id: Option<&str>,
     model: Option<&str>,
+    effort: Option<&str>,
     cwd: &Path,
     target: &ExecTarget,
     prompt: &str,
@@ -44,6 +45,9 @@ pub async fn run_claude_cli(
     }
     if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
         cmd.arg("--model").arg(m);
+    }
+    if let Some(e) = effort.filter(|s| !s.trim().is_empty()) {
+        cmd.arg("--effort").arg(e);
     }
     if let Some(ext) = external_session_id.filter(|s| !s.trim().is_empty()) {
         cmd.arg("--resume").arg(ext);
@@ -275,6 +279,7 @@ pub async fn run_codex_cli(
     session_id: &str,
     external_session_id: Option<&str>,
     model: Option<&str>,
+    effort: Option<&str>,
     cwd: &Path,
     target: &ExecTarget,
     prompt: &str,
@@ -296,6 +301,9 @@ pub async fn run_codex_cli(
     }
     if let Some(m) = model.filter(|s| !s.trim().is_empty()) {
         cmd.arg("-m").arg(m);
+    }
+    if let Some(e) = effort.filter(|s| !s.trim().is_empty()) {
+        cmd.arg("-c").arg(format!("model_reasoning_effort=\"{e}\""));
     }
 
     cmd.arg(prompt);

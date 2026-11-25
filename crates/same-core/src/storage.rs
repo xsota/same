@@ -107,6 +107,13 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
             ",
         )?;
+        // Columns added after the first release.
+        let has_effort = conn
+            .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'effort'")?
+            .exists([])?;
+        if !has_effort {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN effort TEXT;")?;
+        }
         Ok(())
     }
 
@@ -316,6 +323,7 @@ impl Storage {
             title: title.to_string(),
             provider_id: provider_id.to_string(),
             model: model.map(str::to_string),
+            effort: None,
             external_session_id: None,
             status: SessionStatus::Idle,
             pinned: false,
@@ -348,7 +356,7 @@ impl Storage {
     pub fn list_sessions(&self, project_id: &str) -> Result<Vec<Session>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, quest_id, title, provider_id, model, external_session_id, status, pinned, archived, created_at, updated_at
+            "SELECT id, project_id, quest_id, title, provider_id, model, external_session_id, status, pinned, archived, created_at, updated_at, effort
              FROM sessions WHERE project_id = ?1 AND archived = 0
              ORDER BY pinned DESC, updated_at DESC",
         )?;
@@ -366,6 +374,7 @@ impl Storage {
                 archived: r.get::<_, i64>(9)? != 0,
                 created_at: parse_dt(r.get::<_, String>(10)?),
                 updated_at: parse_dt(r.get::<_, String>(11)?),
+                effort: r.get(12)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -375,7 +384,7 @@ impl Storage {
     pub fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, project_id, quest_id, title, provider_id, model, external_session_id, status, pinned, archived, created_at, updated_at
+            "SELECT id, project_id, quest_id, title, provider_id, model, external_session_id, status, pinned, archived, created_at, updated_at, effort
              FROM sessions WHERE id = ?1",
             params![session_id],
             |r| {
@@ -392,11 +401,21 @@ impl Storage {
                     archived: r.get::<_, i64>(9)? != 0,
                     created_at: parse_dt(r.get::<_, String>(10)?),
                     updated_at: parse_dt(r.get::<_, String>(11)?),
+                    effort: r.get(12)?,
                 })
             },
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn set_session_effort(&self, session_id: &str, effort: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET effort = ?1, updated_at = ?2 WHERE id = ?3",
+            params![effort, Utc::now().to_rfc3339(), session_id],
+        )?;
+        Ok(())
     }
 
     pub fn update_session_meta(
@@ -530,6 +549,25 @@ fn parse_dt(s: String) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn session_effort_round_trips() -> Result<()> {
+        let storage = Storage::open_in_memory()?;
+        let ws = storage.ensure_default_workspace()?;
+        let project = storage.ensure_project_for_path(&ws.id, &PathBuf::from("/tmp/same-e"))?;
+        let s = storage.create_session(&project.id, None, "t", "codex", None)?;
+        assert_eq!(s.effort, None);
+        storage.set_session_effort(&s.id, Some("high"))?;
+        assert_eq!(
+            storage.get_session(&s.id)?.unwrap().effort.as_deref(),
+            Some("high")
+        );
+        storage.set_session_effort(&s.id, None)?;
+        assert_eq!(storage.list_sessions(&project.id)?[0].effort, None);
+        // Re-running the migration on an up-to-date database is a no-op.
+        storage.migrate()?;
+        Ok(())
+    }
 
     #[test]
     fn test_storage_hierarchy_crud() -> Result<()> {

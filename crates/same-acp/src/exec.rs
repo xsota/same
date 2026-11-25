@@ -200,44 +200,102 @@ async fn default_distro() -> Option<String> {
     (out.status.success() && !name.is_empty()).then_some(name)
 }
 
-fn path_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+/// What the user's login + interactive shell in a distribution sets up.
+#[derive(Debug, Clone, Default)]
+struct LoginEnv {
+    path: String,
+    /// Variables the shell's rc files add or change (e.g. API keys exported
+    /// in `~/.zshenv`), compared with a bare `wsl --exec`.
+    vars: Vec<(String, String)>,
+}
+
+fn path_cache() -> &'static Mutex<HashMap<String, Option<LoginEnv>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<LoginEnv>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-const PATH_MARKER: &str = "__SAME_PATH__=";
+const ENV_MARKER: &str = "__SAME_ENV__";
 
-/// The PATH of the user's login + interactive shell in `distro`, so tools
-/// installed via `~/.zshrc` (volta, nvm, ~/.local/bin ...) are found the same
-/// way they are in the user's terminal. Cached per distribution.
-async fn login_path(distro: &str) -> Option<String> {
+/// Variables never copied from the login shell: per-process shell state,
+/// and ones `wsl.exe` or `env` set themselves.
+fn forwardable(name: &str) -> bool {
+    const SKIP: &[&str] = &[
+        "PATH", "PWD", "OLDPWD", "SHLVL", "_", "WSLENV", "TERM", "COLUMNS", "LINES",
+    ];
+    !SKIP.contains(&name)
+        && !name.starts_with("WSL_")
+        && !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Parses `env -0` output into pairs.
+fn parse_env0(bytes: &[u8]) -> Vec<(String, String)> {
+    String::from_utf8_lossy(bytes)
+        .split('\0')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.trim_start_matches('\n').to_string(), v.to_string()))
+        .collect()
+}
+
+/// The PATH and environment of the user's login + interactive shell in
+/// `distro`, so tools installed via `~/.zshrc` (volta, nvm, ~/.local/bin ...)
+/// are found, and variables such as API keys are set, the same way they are
+/// in the user's terminal. Cached per distribution.
+async fn login_env(distro: &str) -> Option<LoginEnv> {
     if let Some(cached) = path_cache().lock().unwrap().get(distro) {
         return cached.clone();
     }
-    // The shell may print banners; only the marked line is read.
+    // The shell may print banners; only what follows the marker is read.
     let script = r#"s=$(getent passwd "$(id -un)" | cut -d: -f7); exec "${s:-/bin/sh}" -lic "$1" </dev/null"#;
-    let probe = format!(r#"printf '\n{PATH_MARKER}%s\n' "$PATH""#);
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        wsl_command()
-            .args(["-d", distro, "--exec", "sh", "-c", script, "_", &probe])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output(),
-    )
-    .await;
-    let path = match out {
-        Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find_map(|l| l.trim().strip_prefix(PATH_MARKER).map(str::to_string))
-            .filter(|p| !p.is_empty()),
+    let probe = format!(r#"printf '\n{ENV_MARKER}\n'; env -0"#);
+    let shell = wsl_command()
+        .args(["-d", distro, "--exec", "sh", "-c", script, "_", &probe])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let bare = wsl_command()
+        .args(["-d", distro, "--exec", "env", "-0"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let timeout = std::time::Duration::from_secs(20);
+    let (shell, bare) = tokio::join!(
+        tokio::time::timeout(timeout, shell),
+        tokio::time::timeout(timeout, bare)
+    );
+    let env = match shell {
+        Ok(Ok(out)) => {
+            let marker = format!("\n{ENV_MARKER}\n");
+            let pos = out
+                .stdout
+                .windows(marker.len())
+                .position(|w| w == marker.as_bytes());
+            pos.map(|p| parse_env0(&out.stdout[p + marker.len()..]))
+        }
         _ => None,
     };
+    let login = env.and_then(|vars| {
+        let path = vars
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .filter(|p| !p.is_empty())?;
+        let bare: HashMap<String, String> = match bare {
+            Ok(Ok(out)) => parse_env0(&out.stdout).into_iter().collect(),
+            _ => HashMap::new(),
+        };
+        let vars = vars
+            .into_iter()
+            .filter(|(k, v)| forwardable(k) && bare.get(k) != Some(v))
+            .collect();
+        Some(LoginEnv { path, vars })
+    });
     path_cache()
         .lock()
         .unwrap()
-        .insert(distro.to_string(), path.clone());
-    path
+        .insert(distro.to_string(), login.clone());
+    login
 }
 
 /// Builds a command that runs `program args` in `target` with working
@@ -281,10 +339,25 @@ pub async fn build_wsl_command(
     if let Some(cwd) = linux_cwd {
         cmd.arg("--cd").arg(cwd);
     }
-    match login_path(distro).await {
-        Some(path) => {
+    match login_env(distro).await {
+        Some(login) => {
+            // The shell's variables reach Linux through WSLENV, not the
+            // command line, so secrets such as API keys stay out of it.
+            if !login.vars.is_empty() {
+                let mut names: Vec<String> = std::env::var("WSLENV")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .into_iter()
+                    .collect();
+                for (k, v) in &login.vars {
+                    cmd.env(k, v);
+                    names.push(k.clone());
+                }
+                cmd.env("WSLENV", names.join(":"));
+            }
             // `env` sets variables and resolves `program` on the given PATH
             // without a shell, so arguments pass through untouched.
+            let path = login.path;
             cmd.arg("--exec").arg("env").arg(format!("PATH={path}"));
             for (k, v) in env {
                 cmd.arg(format!("{k}={v}"));
@@ -374,7 +447,7 @@ pub async fn build_console_command(
             let mut cmd = Command::new("wsl.exe");
             cmd.arg("-d").arg(distro).arg("--cd").arg(&linux_cwd);
             let full = format!("{}{pause_unix}", script.unix);
-            match login_path(distro).await {
+            match login_env(distro).await.map(|l| l.path) {
                 Some(path) => {
                     cmd.args(["--exec", "env"])
                         .arg(format!("PATH={path}"))
@@ -419,7 +492,7 @@ fn new_console(cmd: &mut Command) {
     let _ = cmd;
 }
 
-/// Forgets cached login-shell PATHs, e.g. after installing a CLI whose
+/// Forgets cached login-shell environments, e.g. after installing a CLI whose
 /// installer added a directory to the shell profile.
 pub fn clear_path_cache() {
     path_cache().lock().unwrap().clear();
@@ -428,6 +501,23 @@ pub fn clear_path_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_env_parsing() {
+        let vars = parse_env0(b"\nHOME=/home/a\0OPENAI_API_KEY=sk=1\0MULTI=a\nb\0");
+        assert_eq!(
+            vars,
+            [
+                ("HOME".to_string(), "/home/a".to_string()),
+                ("OPENAI_API_KEY".to_string(), "sk=1".to_string()),
+                ("MULTI".to_string(), "a\nb".to_string()),
+            ]
+        );
+        assert!(forwardable("GOOGLE_API_KEY"));
+        assert!(!forwardable("PATH"));
+        assert!(!forwardable("WSL_DISTRO_NAME"));
+        assert!(!forwardable("BASH_FUNC_x%%"));
+    }
 
     #[test]
     fn quotes_console_scripts() {

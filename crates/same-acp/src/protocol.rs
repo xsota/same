@@ -96,6 +96,13 @@ pub struct AcpModelState {
     /// then changed with `session/set_config_option` on this id instead of
     /// `session/set_model`.
     pub config_id: Option<String>,
+    /// Reasoning effort levels the agent offers (a `thought_level` config
+    /// option), without its own "default" entry.
+    pub efforts: Vec<AcpModel>,
+    /// The effort in use, as the agent reports it (may be "default").
+    pub current_effort: Option<String>,
+    /// Config option id that changes the effort.
+    pub effort_config_id: Option<String>,
 }
 
 /// Reads the model choice from a `session/new` / `session/load` result, a
@@ -105,6 +112,36 @@ pub struct AcpModelState {
 /// `model` (preferred), or the older `models` object
 /// (`currentModelId` + `availableModels`).
 pub fn parse_model_state(val: &Value) -> Option<AcpModelState> {
+    let mut state = parse_model_part(val);
+    if let Some(opt) = val
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|opts| {
+            opts.iter()
+                .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
+        })
+    {
+        let mut efforts = Vec::new();
+        collect_config_values(opt.get("options"), &mut efforts);
+        // SAME's picker has its own "Default" row.
+        efforts.retain(|e| e.id != "default");
+        if !efforts.is_empty() {
+            let st = state.get_or_insert_with(AcpModelState::default);
+            st.efforts = efforts;
+            // Kept as the agent reports it ("default" included) so it can
+            // be restored later.
+            st.current_effort = opt
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            st.effort_config_id = opt.get("id").and_then(Value::as_str).map(str::to_string);
+        }
+    }
+    state
+}
+
+/// The model half of [`parse_model_state`].
+fn parse_model_part(val: &Value) -> Option<AcpModelState> {
     if let Some(opts) = val.get("configOptions").and_then(Value::as_array) {
         let model_opt = opts
             .iter()
@@ -125,6 +162,7 @@ pub fn parse_model_state(val: &Value) -> Option<AcpModelState> {
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     config_id,
+                    ..Default::default()
                 });
             }
         }
@@ -165,6 +203,7 @@ pub fn parse_model_state(val: &Value) -> Option<AcpModelState> {
             .and_then(Value::as_str)
             .map(str::to_string),
         config_id: None,
+        ..Default::default()
     })
 }
 
@@ -369,6 +408,26 @@ mod model_state_tests {
         assert_eq!(s.current.as_deref(), Some("m2"));
         let ids: Vec<&str> = s.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["m1", "m2"]);
+    }
+
+    #[test]
+    fn parses_effort_option() {
+        let s = parse_model_state(&json!({
+            "configOptions": [
+                { "id": "model", "category": "model", "currentValue": "m1",
+                  "options": [{ "value": "m1", "name": "M1" }] },
+                { "id": "effort", "category": "thought_level", "currentValue": "default",
+                  "options": [{ "value": "low", "name": "Low" },
+                              { "value": "high", "name": "High" },
+                              { "value": "default", "name": "Default" }] }
+            ]
+        }))
+        .unwrap();
+        let ids: Vec<&str> = s.efforts.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["low", "high"]);
+        assert_eq!(s.effort_config_id.as_deref(), Some("effort"));
+        assert_eq!(s.current_effort.as_deref(), Some("default"));
+        assert_eq!(s.models.len(), 1);
     }
 
     #[test]

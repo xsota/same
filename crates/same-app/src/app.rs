@@ -3,10 +3,11 @@ use crate::theme::{apply_gpui_theme, shark_teal, status_amber, status_green, sta
 use crate::workspace_fs::{load_git_info, scan_directory, FileEntry, GitInfo};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    actions, div, prelude::FluentBuilder as _, px, AnyElement, App, AppContext, ClickEvent,
-    ClipboardItem, Context, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight, Hsla,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, PathPromptOptions, Render,
-    ScrollHandle, SharedString, Stateful, StatefulInteractiveElement, Styled, Subscription, Window,
+    actions, div, list, prelude::FluentBuilder as _, px, AnyElement, App, AppContext, ClickEvent,
+    ClipboardItem, Context, Div, ElementId, Entity, FocusHandle, Focusable, FollowMode, FontWeight,
+    Hsla, InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState, ParentElement,
+    PathPromptOptions, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -15,7 +16,8 @@ use gpui_component::notification::Notification;
 use gpui_component::spinner::Spinner;
 use gpui_component::text::TextView;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, Theme, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
+    TitleBar, WindowExt as _,
 };
 use same_agent::{
     exec as agent_exec, AgentManager, ExecPreference, PromptRequest, ProviderCheckResult,
@@ -73,7 +75,18 @@ enum UiAsyncMsg {
         provider_id: String,
         result: Result<SetupOutcome, String>,
     },
+    ModelsDiscovered {
+        provider_id: String,
+        target: String,
+        result: Result<same_agent::discovery::Discovered, String>,
+        /// Started by the user (show the outcome), not in the background.
+        manual: bool,
+    },
 }
+
+/// File (in the data dir) that keeps the last model list of each provider,
+/// so the picker is complete right after launch.
+const MODELS_CACHE_FILE: &str = "models_cache.json";
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum MainView {
@@ -122,6 +135,12 @@ pub struct SameAppView {
     /// Models an agent reported (ACP), by provider id, so a fresh session
     /// can offer them before its first prompt.
     agent_models: HashMap<String, Vec<ModelInfo>>,
+    /// (provider id, exec target) pairs whose models were asked for this run.
+    models_discovered: HashSet<(String, String)>,
+    /// Providers with a model discovery in flight.
+    models_discovering: HashSet<String>,
+    /// Per provider: the model its agent uses when none is picked.
+    agent_default_model: HashMap<String, String>,
     /// The model an agent says a session is using, by session id.
     agent_current_model: HashMap<String, String>,
     provider_checks: HashMap<String, ProviderCheckResult>,
@@ -145,7 +164,12 @@ pub struct SameAppView {
     prompt_empty: bool,
     /// The prompt is a `/command` being typed: show suggestions.
     prompt_is_command: bool,
-    chat_scroll: ScrollHandle,
+    /// Virtualized chat feed: one item per stored message, plus a trailing
+    /// item for the live reply / permission prompts / empty state. Only the
+    /// items on screen are laid out, so long sessions stay cheap to render.
+    feed: ListState,
+    /// (session id, item count) the feed was last synced with.
+    feed_synced: std::cell::RefCell<(Option<String>, usize)>,
     renaming_session_id: Option<String>,
     rename_input: Entity<InputState>,
 
@@ -191,6 +215,7 @@ impl SameAppView {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Self> {
         let paths = AppPaths::resolve()?;
+        let agent_models = load_models_cache(&paths.data_dir);
         let config = AppConfig::load_or_default(&paths)?;
         let storage = Arc::new(Storage::open(&paths.db_file)?);
         // No agent process survives a restart: sessions persisted as running
@@ -407,7 +432,10 @@ impl SameAppView {
             live_drafts: HashMap::new(),
             pending_permissions: vec![],
             slash_commands: HashMap::new(),
-            agent_models: HashMap::new(),
+            agent_models,
+            models_discovered: HashSet::new(),
+            models_discovering: HashSet::new(),
+            agent_default_model: HashMap::new(),
             agent_current_model: HashMap::new(),
             provider_checks: HashMap::new(),
             check_generation: 0,
@@ -422,7 +450,12 @@ impl SameAppView {
             prompt_input,
             prompt_empty: true,
             prompt_is_command: false,
-            chat_scroll: ScrollHandle::new(),
+            feed: {
+                let feed = ListState::new(0, ListAlignment::Top, px(1000.0));
+                feed.set_follow_mode(FollowMode::Tail);
+                feed
+            },
+            feed_synced: Default::default(),
             renaming_session_id: None,
             rename_input,
             show_right_panel: true,
@@ -574,14 +607,34 @@ impl SameAppView {
         self.live_drafts.contains_key(session_id)
     }
 
-    /// Keeps the feed pinned to the latest message, unless the user has
-    /// scrolled up to read earlier output.
-    fn follow_feed_if_at_bottom(&self) {
-        let max = self.chat_scroll.max_offset().y;
-        let scrolled = -self.chat_scroll.offset().y;
-        if max - scrolled < px(80.0) {
-            self.chat_scroll.scroll_to_bottom();
+    /// Jumps the feed to the latest message and keeps following new output
+    /// (until the user scrolls up; scrolling back down resumes following).
+    fn scroll_feed_to_end(&self) {
+        self.feed.set_follow_mode(FollowMode::Tail);
+    }
+
+    /// Brings the feed's item count in line with the current session. Called
+    /// on every render; cheap when nothing changed.
+    fn sync_feed(&self) {
+        let count = self.messages.len() + 1;
+        let mut synced = self.feed_synced.borrow_mut();
+        let session_changed = synced.0 != self.selected_session_id;
+        let old = synced.1;
+        if session_changed || count < old || old == 0 {
+            self.feed.reset(count);
+            self.scroll_feed_to_end();
+        } else if count > old {
+            // New messages: replace the old trailing item and append.
+            self.feed.splice(old - 1..old, count - old + 1);
         }
+        // The trailing item (live reply, permissions) changes while streaming.
+        self.feed.remeasure_items(count - 1..count);
+        *synced = (self.selected_session_id.clone(), count);
+    }
+
+    /// Forces a full feed rebuild on the next render (messages replaced).
+    fn invalidate_feed(&self) {
+        *self.feed_synced.borrow_mut() = (None, 0);
     }
 
     fn select_session(&mut self, session_id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -592,7 +645,7 @@ impl SameAppView {
         self.active_view = MainView::Chat;
         self.confirm_delete = None;
         self.reload_messages(window, cx);
-        self.chat_scroll.scroll_to_bottom();
+        self.scroll_feed_to_end();
         self.prompt_input.update(cx, |s, cx| s.focus(window, cx));
     }
 
@@ -619,11 +672,12 @@ impl SameAppView {
                 return;
             }
         }
-        // A new session keeps the agent and model picked in the current one.
-        let (provider_id, model) = self
+        // A new session keeps the agent, model and effort picked in the
+        // current one.
+        let (provider_id, model, effort) = self
             .current_session()
-            .map(|s| (s.provider_id.clone(), s.model.clone()))
-            .unwrap_or_else(|| (self.config.default_provider_id.clone(), None));
+            .map(|s| (s.provider_id.clone(), s.model.clone(), s.effort.clone()))
+            .unwrap_or_else(|| (self.config.default_provider_id.clone(), None, None));
         match self.storage.create_session(
             &pid,
             self.selected_quest_filter.as_deref(),
@@ -631,7 +685,11 @@ impl SameAppView {
             &provider_id,
             model.as_deref(),
         ) {
-            Ok(sess) => {
+            Ok(mut sess) => {
+                if effort.is_some() {
+                    let _ = self.storage.set_session_effort(&sess.id, effort.as_deref());
+                    sess.effort = effort;
+                }
                 let id = sess.id.clone();
                 self.sessions.insert(0, sess);
                 self.select_session(id, window, cx);
@@ -677,12 +735,13 @@ impl SameAppView {
         self.expanded_dirs.clear();
         self.reload_messages(window, cx);
         self.reload_workspace_files(cx);
-        self.chat_scroll.scroll_to_bottom();
+        self.scroll_feed_to_end();
     }
 
     fn reload_messages(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
         if let Some(sid) = self.selected_session_id.as_deref() {
             self.messages = self.storage.list_messages(sid).unwrap_or_default();
+            self.invalidate_feed();
         } else {
             self.messages.clear();
         }
@@ -717,7 +776,7 @@ impl SameAppView {
             .map(|m| ModelInfo {
                 id: m.clone(),
                 name: m.clone(),
-                description: String::new(),
+                ..Default::default()
             })
             .collect()
     }
@@ -726,11 +785,14 @@ impl SameAppView {
     fn model_label(&self, session: &Session) -> String {
         let lang = self.config.language;
         let provider = self.config.find_provider(&session.provider_id);
+        // With "Default" picked, show what Default means (ACP agents are
+        // switched back to it on the next prompt).
         let id = session
             .model
             .clone()
-            .or_else(|| self.agent_current_model.get(&session.id).cloned())
-            .or_else(|| provider.and_then(|p| p.default_model.clone()));
+            .or_else(|| provider.and_then(|p| p.default_model.clone()))
+            .or_else(|| self.agent_default_model.get(&session.provider_id).cloned())
+            .or_else(|| self.agent_current_model.get(&session.id).cloned());
         let Some(id) = id else {
             return t(lang, "既定モデル", "Default model").to_string();
         };
@@ -820,6 +882,57 @@ impl SameAppView {
         let _ =
             self.storage
                 .update_session_meta(&sid, None, None, Some(model.as_deref()), None, None);
+        // Keep the effort only if the new model accepts it.
+        let keep = self
+            .current_session()
+            .map(|sess| match sess.effort.as_deref() {
+                Some(e) => self.effort_choices(sess).0.iter().any(|x| x == e),
+                None => true,
+            })
+            .unwrap_or(true);
+        if !keep {
+            self.set_session_effort(None);
+        }
+    }
+
+    fn set_session_effort(&mut self, effort: Option<String>) {
+        let Some(sid) = self.selected_session_id.clone() else {
+            return;
+        };
+        let Some(s) = self.sessions.iter_mut().find(|s| s.id == sid) else {
+            return;
+        };
+        if s.effort == effort {
+            return;
+        }
+        s.effort = effort.clone();
+        let _ = self.storage.set_session_effort(&sid, effort.as_deref());
+    }
+
+    /// The effort levels offered for the session's model, and the one the
+    /// agent uses when none is picked. Without a known model, every level any
+    /// of the provider's models accepts.
+    fn effort_choices(&self, session: &Session) -> (Vec<String>, Option<String>) {
+        let Some(provider) = self.config.find_provider(&session.provider_id) else {
+            return (Vec::new(), None);
+        };
+        let choices = self.model_choices(provider);
+        let model_id = session
+            .model
+            .clone()
+            .or_else(|| provider.default_model.clone())
+            .or_else(|| self.agent_default_model.get(&session.provider_id).cloned())
+            .or_else(|| self.agent_current_model.get(&session.id).cloned());
+        if let Some(m) = model_id.and_then(|id| choices.iter().find(|m| m.id == id)) {
+            return (m.efforts.clone(), m.default_effort.clone());
+        }
+        let mut all: Vec<String> = Vec::new();
+        for e in choices.iter().flat_map(|m| m.efforts.iter()) {
+            if !all.contains(e) {
+                all.push(e.clone());
+            }
+        }
+        (all, None)
     }
 
     fn start_rename(&mut self, session_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1199,6 +1312,38 @@ impl SameAppView {
         }
     }
 
+    /// Asks `provider`'s agent for its models in the background.
+    fn start_model_discovery(&mut self, provider: ProviderConfig, manual: bool) {
+        if !self.models_discovering.insert(provider.id.clone()) {
+            return;
+        }
+        let manager = self.agent_manager.clone();
+        let tx = self.ui_tx.clone();
+        let pref = self.exec_pref();
+        let cwd = self.exec_cwd();
+        self.rt.spawn(async move {
+            let (target, res) = manager.discover_models(&provider, pref, &cwd).await;
+            let _ = tx.send(UiAsyncMsg::ModelsDiscovered {
+                provider_id: provider.id,
+                target,
+                result: res.map_err(|e| format!("{e:#}")),
+                manual,
+            });
+        });
+    }
+
+    fn save_models_cache(&self) {
+        let path = self.paths.data_dir.join(MODELS_CACHE_FILE);
+        match serde_json::to_string_pretty(&self.agent_models) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(&path, text) {
+                    tracing::warn!("Failed to save {}: {e}", path.display());
+                }
+            }
+            Err(e) => tracing::warn!("Failed to encode model cache: {e}"),
+        }
+    }
+
     fn refresh_provider_checks(&mut self) {
         self.check_generation += 1;
         self.provider_checks.clear();
@@ -1339,7 +1484,81 @@ impl SameAppView {
         match msg {
             UiAsyncMsg::ProviderCheck(generation, res) => {
                 if generation == self.check_generation {
+                    // Once per provider and environment per run, ask a
+                    // working agent for its real model list.
+                    let key = (res.provider_id.clone(), res.target.clone());
+                    if res.available && !self.models_discovered.contains(&key) {
+                        if let Some(p) = self.config.find_provider(&res.provider_id).cloned() {
+                            self.start_model_discovery(p, false);
+                        }
+                    }
                     self.provider_checks.insert(res.provider_id.clone(), res);
+                }
+            }
+            UiAsyncMsg::ModelsDiscovered {
+                provider_id,
+                target,
+                result,
+                manual,
+            } => {
+                self.models_discovering.remove(&provider_id);
+                self.models_discovered
+                    .insert((provider_id.clone(), target.clone()));
+                let name = self.provider_name(&provider_id);
+                if let Ok(found) = &result {
+                    match &found.default_model {
+                        Some(d) => {
+                            self.agent_default_model
+                                .insert(provider_id.clone(), d.clone());
+                        }
+                        None => {
+                            self.agent_default_model.remove(&provider_id);
+                        }
+                    }
+                }
+                match result.map(|found| found.models) {
+                    Ok(models) if !models.is_empty() => {
+                        tracing::info!("{provider_id}: {} models ({target})", models.len());
+                        if manual {
+                            self.note(
+                                NoteKind::Success,
+                                match self.config.language {
+                                    Language::Ja => {
+                                        format!("{name}: モデル {} 件を取得しました", models.len())
+                                    }
+                                    Language::En => {
+                                        format!("{name}: found {} models", models.len())
+                                    }
+                                },
+                            );
+                        }
+                        self.agent_models.insert(provider_id, models);
+                        self.save_models_cache();
+                    }
+                    other => {
+                        let err = match other {
+                            Err(e) => e,
+                            Ok(_) => "no models reported".to_string(),
+                        };
+                        tracing::warn!("{provider_id}: model discovery failed ({target}): {err}");
+                        let stamp = Local::now().format("%H:%M:%S");
+                        self.logs.push(format!(
+                            "{stamp} [{provider_id}] Model list unavailable ({target}): {err}"
+                        ));
+                        if manual {
+                            self.note(
+                                NoteKind::Warning,
+                                match self.config.language {
+                                    Language::Ja => {
+                                        format!("{name}: モデル一覧を取得できませんでした: {err}")
+                                    }
+                                    Language::En => {
+                                        format!("{name}: could not get the model list: {err}")
+                                    }
+                                },
+                            );
+                        }
+                    }
                 }
             }
             UiAsyncMsg::ConnectResult {
@@ -1382,26 +1601,6 @@ impl SameAppView {
     }
 
     fn handle_same_event(&mut self, ev: SameEvent) {
-        // Streaming output for the visible session keeps the feed pinned.
-        let touches_visible = match &ev {
-            SameEvent::MessageDelta { session_id, .. }
-            | SameEvent::ThinkingDelta { session_id, .. }
-            | SameEvent::ToolCallStarted { session_id, .. }
-            | SameEvent::ToolCallUpdated { session_id, .. }
-            | SameEvent::SessionCompleted { session_id, .. }
-            | SameEvent::SessionFailed { session_id, .. }
-            | SameEvent::SessionCancelled { session_id } => {
-                self.selected_session_id.as_deref() == Some(session_id.as_str())
-            }
-            SameEvent::ApprovalRequested { request } => {
-                self.selected_session_id.as_deref() == Some(request.session_id.as_str())
-            }
-            _ => false,
-        };
-        if touches_visible {
-            self.follow_feed_if_at_bottom();
-        }
-
         match ev {
             SameEvent::SessionStarted { session_id, .. } => {
                 self.live_drafts.entry(session_id).or_default();
@@ -1522,8 +1721,9 @@ impl SameAppView {
                 models,
                 current,
             } => {
-                if !models.is_empty() {
+                if !models.is_empty() && self.agent_models.get(&provider_id) != Some(&models) {
                     self.agent_models.insert(provider_id, models);
+                    self.save_models_cache();
                 }
                 match current {
                     Some(m) => {
@@ -1785,12 +1985,13 @@ impl SameAppView {
 
         self.live_drafts
             .insert(session.id.clone(), LiveDraft::default());
-        self.chat_scroll.scroll_to_bottom();
+        self.scroll_feed_to_end();
         self.agent_manager.start_prompt(PromptRequest {
             session_id: session.id,
             external_session_id: session.external_session_id,
             provider,
             model,
+            effort: session.effort.clone().filter(|e| !e.trim().is_empty()),
             cwd: PathBuf::from(&project.workdir),
             prompt: full_prompt,
             auto_approve: self.config.auto_approve_tools,
@@ -1837,6 +2038,13 @@ fn expand_home(raw: &str) -> PathBuf {
         }
     }
     PathBuf::from(raw)
+}
+
+fn load_models_cache(data_dir: &Path) -> HashMap<String, Vec<ModelInfo>> {
+    std::fs::read_to_string(data_dir.join(MODELS_CACHE_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 fn rel_time(dt: DateTime<Utc>, lang: Language) -> String {
@@ -1918,63 +2126,6 @@ impl SameAppView {
             .border_color(theme.border)
             .p_3()
             .gap_2()
-            // Brand header
-            .child(
-                div()
-                    .h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(shark_teal())
-                            .child("▲ SAME"),
-                    )
-                    .child(
-                        div()
-                            .h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new("toggle-lang")
-                                    .xsmall()
-                                    .ghost()
-                                    .tooltip(t(lang, "Switch to English", "日本語に切り替え"))
-                                    .label(match lang {
-                                        Language::Ja => "JA",
-                                        Language::En => "EN",
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.config.language = match this.config.language {
-                                            Language::Ja => Language::En,
-                                            Language::En => Language::Ja,
-                                        };
-                                        this.save_config();
-                                        this.apply_placeholders(window, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("toggle-theme")
-                                    .xsmall()
-                                    .ghost()
-                                    .tooltip(t(lang, "テーマ切替", "Toggle theme"))
-                                    .label(match self.config.theme {
-                                        ThemeMode::Dark => "☀",
-                                        ThemeMode::Light => "☾",
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.config.theme = match this.config.theme {
-                                            ThemeMode::Dark => ThemeMode::Light,
-                                            ThemeMode::Light => ThemeMode::Dark,
-                                        };
-                                        apply_gpui_theme(this.config.theme, Some(window), cx);
-                                        this.save_config();
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
             // Primary navigation: Chat vs Providers Connection Screen
             .child(
                 div()
@@ -3308,22 +3459,7 @@ impl SameAppView {
                                             menu
                                         }),
                                 )
-                            })
-                            .child(
-                                Button::new("toggle-right-panel")
-                                    .xsmall()
-                                    .ghost()
-                                    .tooltip("Ctrl+B")
-                                    .label(if self.show_right_panel {
-                                        t(lang, "パネルを隠す", "Hide panel")
-                                    } else {
-                                        t(lang, "ファイル / Git", "Files / Git")
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_right_panel = !this.show_right_panel;
-                                        cx.notify();
-                                    })),
-                            ),
+                            }),
                     ),
             )
     }
@@ -3346,7 +3482,9 @@ impl SameAppView {
             s.provider_id = pid.to_string();
             s.external_session_id = None;
             s.model = None;
+            s.effort = None;
         }
+        let _ = self.storage.set_session_effort(sid, None);
         self.agent_current_model.remove(sid);
         self.slash_commands.remove(sid);
     }
@@ -3369,7 +3507,20 @@ impl SameAppView {
             .unwrap_or_default();
         let default_model = provider.as_ref().and_then(|p| p.default_model.clone());
         let current_model = session.model.clone();
-        let agent_model = self.agent_current_model.get(&session.id).cloned();
+        // What "Default" resolves to, by display name when known.
+        let agent_model = self
+            .agent_default_model
+            .get(&session.provider_id)
+            .or_else(|| self.agent_current_model.get(&session.id))
+            .map(|id| {
+                choices
+                    .iter()
+                    .find(|m| &m.id == id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| id.clone())
+            });
+        let discover_provider = provider.clone();
+        let discovering = self.models_discovering.contains(&session.provider_id);
         let sid = session.id.clone();
 
         // Agent picker
@@ -3444,6 +3595,65 @@ impl SameAppView {
                 )
             });
 
+        // Effort picker (only when the agent reports effort levels)
+        let (efforts, default_effort) = self.effort_choices(session);
+        let current_effort = session.effort.clone();
+        let effort_button = (!efforts.is_empty() || current_effort.is_some()).then(|| {
+            let effort_view = view.clone();
+            let label = match (&current_effort, &default_effort) {
+                (Some(e), _) => e.clone(),
+                (None, Some(d)) => format!("{} ({d})", t(lang, "既定", "default")),
+                (None, None) => t(lang, "既定", "default").to_string(),
+            };
+            Button::new("composer-effort-menu")
+                .xsmall()
+                .ghost()
+                .tooltip(t(
+                    lang,
+                    "思考の深さ (effort) を選択",
+                    "Pick the reasoning effort",
+                ))
+                .label(format!("{}: {label} ▾", t(lang, "思考", "Effort")))
+                .dropdown_menu(move |menu, _, _| {
+                    let mut menu = menu;
+                    let v = effort_view.clone();
+                    let default_label = match &default_effort {
+                        Some(d) => format!("{} ({d})", t(lang, "既定", "Default")),
+                        None => t(lang, "既定 (エージェント任せ)", "Default (agent decides)")
+                            .to_string(),
+                    };
+                    menu = menu.item(
+                        PopupMenuItem::new(default_label)
+                            .checked(current_effort.is_none())
+                            .on_click(move |_, _, cx| {
+                                let _ = v.update(cx, |this, cx| {
+                                    this.set_session_effort(None);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                    if !efforts.is_empty() {
+                        menu = menu.item(PopupMenuItem::separator());
+                    }
+                    for e in efforts.iter() {
+                        let v = effort_view.clone();
+                        let id = e.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(e.clone())
+                                .checked(current_effort.as_deref() == Some(e.as_str()))
+                                .on_click(move |_, _, cx| {
+                                    let id2 = id.clone();
+                                    let _ = v.update(cx, |this, cx| {
+                                        this.set_session_effort(Some(id2));
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                })
+        });
+
         // Model picker
         let model_view = view.clone();
         let model_button = Button::new("composer-model-menu")
@@ -3456,7 +3666,7 @@ impl SameAppView {
             ))
             .label(format!("{} ▾", self.model_label(session)))
             .dropdown_menu(move |menu, _, _| {
-                let mut menu = menu;
+                let mut menu = menu.scrollable(true).max_h(px(420.0));
                 let default_label = match default_model.as_ref().or(agent_model.as_ref()) {
                     Some(m) => format!("{} ({m})", t(lang, "既定", "Default")),
                     None => {
@@ -3474,18 +3684,14 @@ impl SameAppView {
                             });
                         }),
                 );
-                if !choices.is_empty() {
-                    menu = menu.item(PopupMenuItem::separator());
-                }
-                // Long lists (OpenCode reports dozens) go to the filterable
-                // `/model ` suggestions instead.
-                const MENU_MAX: usize = 30;
-                if choices.len() > MENU_MAX {
+                // Long lists (OpenCode reports 100+) also get a shortcut to
+                // the filterable `/model ` suggestions.
+                if choices.len() > 20 {
                     let v = model_view.clone();
                     menu = menu.item(
                         PopupMenuItem::new(match lang {
-                            Language::Ja => format!("すべて表示・検索… ({})", choices.len()),
-                            Language::En => format!("Show all / search… ({})", choices.len()),
+                            Language::Ja => format!("検索… ({} 件)", choices.len()),
+                            Language::En => format!("Search… ({})", choices.len()),
                         })
                         .on_click(move |_, window, cx| {
                             let _ = v.update(cx, |this, cx| {
@@ -3499,9 +3705,31 @@ impl SameAppView {
                             });
                         }),
                     );
+                }
+                {
+                    let v = model_view.clone();
+                    let provider = discover_provider.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(if discovering {
+                            t(lang, "モデル一覧を取得中…", "Fetching models…")
+                        } else {
+                            t(lang, "モデル一覧を更新", "Refresh model list")
+                        })
+                        .disabled(discovering || provider.is_none())
+                        .on_click(move |_, _, cx| {
+                            if let Some(p) = provider.clone() {
+                                let _ = v.update(cx, |this, cx| {
+                                    this.start_model_discovery(p, true);
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                    );
+                }
+                if !choices.is_empty() {
                     menu = menu.item(PopupMenuItem::separator());
                 }
-                for m in choices.iter().take(MENU_MAX) {
+                for m in choices.iter() {
                     let v = model_view.clone();
                     let id = m.id.clone();
                     let label = if m.name == m.id {
@@ -3539,6 +3767,7 @@ impl SameAppView {
                     .min_w_0()
                     .child(provider_button)
                     .child(model_button)
+                    .children(effort_button)
                     .child(
                         Button::new("toggle-auto-approve")
                             .xsmall()
@@ -3792,19 +4021,11 @@ impl SameAppView {
             .cloned()
             .unwrap_or_default();
 
-        let pending_perms: Vec<PermissionRequest> = self
-            .pending_permissions
-            .iter()
-            .filter(|r| r.session_id == session.id)
-            .cloned()
-            .collect();
-
         let provider_missing = self
             .provider_checks
             .get(&session.provider_id)
             .is_some_and(|c| !c.available);
 
-        let live = self.live_drafts.get(&session.id);
         let suggestions = self.render_command_suggestions(&session, &slash_cmds, cx);
         let composer_bar = self.render_composer_bar(&session, running, cx);
 
@@ -3830,25 +4051,21 @@ impl SameAppView {
                         .px_4()
                         .py_1()
                         .bg(theme.warning.opacity(0.12))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(status_amber())
-                                .truncate()
-                                .child(format!(
-                                    "⚠ {} — {detail}",
-                                    match lang {
-                                        Language::Ja => format!(
-                                            "{} を起動できません",
-                                            self.provider_name(&session.provider_id)
-                                        ),
-                                        Language::En => format!(
-                                            "{} is not available",
-                                            self.provider_name(&session.provider_id)
-                                        ),
-                                    }
-                                )),
-                        )
+                        .child(div().text_xs().text_color(status_amber()).truncate().child(
+                            format!(
+                                "⚠ {} — {detail}",
+                                match lang {
+                                    Language::Ja => format!(
+                                        "{} を起動できません",
+                                        self.provider_name(&session.provider_id)
+                                    ),
+                                    Language::En => format!(
+                                        "{} is not available",
+                                        self.provider_name(&session.provider_id)
+                                    ),
+                                }
+                            ),
+                        ))
                         .child(
                             Button::new("fix-provider")
                                 .xsmall()
@@ -3889,151 +4106,189 @@ impl SameAppView {
                         ),
                 )
             })
-            // Message feed
-            .child(
-                div()
-                    .id("chat-messages-scroll")
-                    .track_scroll(&self.chat_scroll)
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .v_flex()
-                            .w_full()
-                            .max_w(px(920.0))
-                            .mx_auto()
-                            .px_5()
-                            .py_4()
-                            .gap_4()
-                            .when(self.messages.is_empty() && live.is_none(), |el| {
-                                let proj_label = self
-                                    .current_project()
-                                    .map(|p| p.workdir.clone())
-                                    .unwrap_or_default();
-                                el.child(
-                                    div()
-                                        .v_flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .py_12()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .text_2xl()
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(shark_teal())
-                                                .child("▲ SAME"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(theme.muted_foreground)
-                                                .child(proj_label),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child(match lang {
-                                                    Language::Ja => format!(
-                                                        "{} に話しかけてみましょう。ファイル欄の @ でファイルを参照できます",
-                                                        self.provider_name(&session.provider_id)
-                                                    ),
-                                                    Language::En => format!(
-                                                        "Ask {} anything. Use @ in the file panel to reference files",
-                                                        self.provider_name(&session.provider_id)
-                                                    ),
-                                                }),
-                                        ),
-                                )
-                            })
-                            .children(self.messages.iter().map(|m| self.render_message(m, None, cx)))
-                            .when_some(live, |el, draft| {
-                                let m = Message {
-                                    id: format!("live-{}", session.id),
-                                    session_id: session.id.clone(),
-                                    role: MessageRole::Assistant,
-                                    content: draft.content.clone(),
-                                    thinking: if draft.thinking.is_empty() {
-                                        None
-                                    } else {
-                                        Some(draft.thinking.clone())
-                                    },
-                                    tool_calls: draft.tool_calls.clone(),
-                                    provider_id: Some(session.provider_id.clone()),
-                                    model: session.model.clone(),
-                                    created_at: Utc::now(),
-                                };
-                                el.child(self.render_message(&m, Some(!pending_perms.is_empty()), cx))
-                            })
-                            .children(pending_perms.into_iter().map(|req| self.render_permission(req, cx)))
-                            .when(
-                                !running
-                                    && session.status == SessionStatus::Interrupted
-                                    && self.messages.last().is_some_and(|m| m.role == MessageRole::User),
-                                |el| {
-                                    el.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(t(
-                                                lang,
-                                                "前回の応答はアプリ終了で中断されました。もう一度送信してください",
-                                                "The last reply was interrupted when the app closed. Send again to retry",
-                                            )),
-                                    )
-                                },
-                            ),
-                    ),
-            )
+            // Message feed (virtualized)
+            .child({
+                self.sync_feed();
+                list(
+                    self.feed.clone(),
+                    cx.processor(|this, ix: usize, _window, cx| this.render_feed_item(ix, cx)),
+                )
+                .flex_1()
+                .min_h_0()
+                .w_full()
+            })
             // Prompt composer
+            .child(
+                div().v_flex().px_4().pt_2().pb_3().gap_1().child(
+                    div()
+                        .v_flex()
+                        .w_full()
+                        .max_w(px(920.0))
+                        .mx_auto()
+                        .gap_1()
+                        .when_some(suggestions, |el, s| el.child(s))
+                        .child(
+                            div()
+                                .h_flex()
+                                .gap_2()
+                                .items_end()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Textarea::new(&self.prompt_input)),
+                                )
+                                .child(if running {
+                                    Button::new("btn-cancel-prompt")
+                                        .danger()
+                                        .tooltip("Esc")
+                                        .label(t(lang, "■ 停止", "■ Stop"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_current();
+                                            cx.notify();
+                                        }))
+                                } else {
+                                    Button::new("btn-send-prompt")
+                                        .primary()
+                                        .disabled(self.prompt_empty)
+                                        .tooltip("Enter")
+                                        .label(t(lang, "送信", "Send"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.send_current_prompt(window, cx);
+                                            cx.notify();
+                                        }))
+                                }),
+                        )
+                        .child(composer_bar),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// Wraps one feed item in the centered reading column.
+    fn feed_column(&self, ix: usize, child: impl IntoElement) -> AnyElement {
+        div()
+            .w_full()
             .child(
                 div()
                     .v_flex()
-                    .px_4()
-                    .pt_2()
-                    .pb_3()
-                    .gap_1()
-                    .child(
-                        div()
-                            .v_flex()
-                            .w_full()
-                            .max_w(px(920.0))
-                            .mx_auto()
-                            .gap_1()
-                            .when_some(suggestions, |el, s| el.child(s))
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .gap_2()
-                                    .items_end()
-                                    .child(div().flex_1().min_w_0().child(Textarea::new(&self.prompt_input)))
-                                    .child(if running {
-                                        Button::new("btn-cancel-prompt")
-                                            .danger()
-                                            .tooltip("Esc")
-                                            .label(t(lang, "■ 停止", "■ Stop"))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.cancel_current();
-                                                cx.notify();
-                                            }))
-                                    } else {
-                                        Button::new("btn-send-prompt")
-                                            .primary()
-                                            .disabled(self.prompt_empty)
-                                            .tooltip("Enter")
-                                            .label(t(lang, "送信", "Send"))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.send_current_prompt(window, cx);
-                                                cx.notify();
-                                            }))
-                                    }),
-                            )
-                            .child(composer_bar),
-                    ),
+                    .w_full()
+                    .max_w(px(920.0))
+                    .mx_auto()
+                    .px_5()
+                    .when(ix == 0, |d| d.pt_4())
+                    .pb_4()
+                    .child(child),
             )
             .into_any_element()
+    }
+
+    /// Renders feed item `ix`: a stored message, or (last) the trailing
+    /// item with the live reply, permission prompts and notices.
+    fn render_feed_item(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(m) = self.messages.get(ix) {
+            let el = self.render_message(m, None, cx);
+            return self.feed_column(ix, el);
+        }
+        let Some(session) = self.current_session().cloned() else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+        let running = self.is_session_running(&session.id);
+        let live = self.live_drafts.get(&session.id);
+        let pending_perms: Vec<PermissionRequest> = self
+            .pending_permissions
+            .iter()
+            .filter(|r| r.session_id == session.id)
+            .cloned()
+            .collect();
+
+        let tail = div()
+            .v_flex()
+            .w_full()
+            .gap_4()
+            .when(self.messages.is_empty() && live.is_none(), |el| {
+                let proj_label = self
+                    .current_project()
+                    .map(|p| p.workdir.clone())
+                    .unwrap_or_default();
+                el.child(
+                    div()
+                        .v_flex()
+                        .items_center()
+                        .justify_center()
+                        .py_12()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_2xl()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(shark_teal())
+                                .child("▲ SAME"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(proj_label),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(match lang {
+                                    Language::Ja => format!(
+                                        "{} に話しかけてみましょう。ファイル欄の @ でファイルを参照できます",
+                                        self.provider_name(&session.provider_id)
+                                    ),
+                                    Language::En => format!(
+                                        "Ask {} anything. Use @ in the file panel to reference files",
+                                        self.provider_name(&session.provider_id)
+                                    ),
+                                }),
+                        ),
+                )
+            })
+            .when_some(live, |el, draft| {
+                let m = Message {
+                    id: format!("live-{}", session.id),
+                    session_id: session.id.clone(),
+                    role: MessageRole::Assistant,
+                    content: draft.content.clone(),
+                    thinking: if draft.thinking.is_empty() {
+                        None
+                    } else {
+                        Some(draft.thinking.clone())
+                    },
+                    tool_calls: draft.tool_calls.clone(),
+                    provider_id: Some(session.provider_id.clone()),
+                    model: session.model.clone(),
+                    created_at: Utc::now(),
+                };
+                el.child(self.render_message(&m, Some(!pending_perms.is_empty()), cx))
+            })
+            .children(
+                pending_perms
+                    .into_iter()
+                    .map(|req| self.render_permission(req, cx)),
+            )
+            .when(
+                !running
+                    && session.status == SessionStatus::Interrupted
+                    && self
+                        .messages
+                        .last()
+                        .is_some_and(|m| m.role == MessageRole::User),
+                |el| {
+                    el.child(div().text_xs().text_color(theme.muted_foreground).child(t(
+                        lang,
+                        "前回の応答はアプリ終了で中断されました。もう一度送信してください",
+                        "The last reply was interrupted when the app closed. Send again to retry",
+                    )))
+                },
+            );
+        self.feed_column(ix, tail)
     }
 
     fn render_permission(&self, req: PermissionRequest, cx: &mut Context<Self>) -> AnyElement {
@@ -4320,6 +4575,7 @@ impl SameAppView {
                                         t(lang, "思考過程", "Thinking")
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.feed.remeasure();
                                         if !this.expanded_thinking.remove(&key) {
                                             this.expanded_thinking.insert(key.clone());
                                         }
@@ -4484,6 +4740,7 @@ impl SameAppView {
                             .child(title),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.feed.remeasure();
                         if !this.expanded_tools.remove(&key_click) {
                             this.expanded_tools.insert(key_click.clone());
                         }
@@ -5003,6 +5260,214 @@ impl Focusable for SameAppView {
     }
 }
 
+/// Height of the custom title bar. Slightly taller than gpui-component's
+/// default so it reads like the Codex / Claude desktop chrome.
+const TITLE_BAR_HEIGHT: gpui::Pixels = px(40.0);
+
+/// A borderless, icon-only button for the title bar.
+fn title_icon_button(
+    id: &'static str,
+    icon: IconName,
+    active: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(28.0))
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .text_color(if active {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        })
+        .when(active, |d| d.bg(theme.list_active))
+        .hover(|s| s.bg(theme.list_hover).text_color(theme.foreground))
+        // Keep the press for the button: without this the title bar would
+        // start a window drag on the slightest pointer motion.
+        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+            window.prevent_default();
+            cx.stop_propagation();
+        })
+        .child(Icon::new(icon).small())
+}
+
+impl SameAppView {
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+
+        // Breadcrumb: the current project (the session title is already the
+        // chat header), or the current screen.
+        let mut crumbs: Vec<String> = Vec::new();
+        match self.active_view {
+            MainView::Chat => {
+                if let Some(p) = self.current_project() {
+                    crumbs.push(p.name.clone());
+                }
+            }
+            MainView::Providers => crumbs.push(t(lang, "プロバイダ接続", "Providers").into()),
+        }
+        let crumb_count = crumbs.len();
+
+        TitleBar::new()
+            .h(TITLE_BAR_HEIGHT)
+            .bg(theme.sidebar)
+            .border_color(theme.border)
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_3()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(20.0))
+                                    .rounded(px(5.0))
+                                    .bg(shark_teal())
+                                    .text_color(gpui::white())
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .child("S"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("SAME"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .min_w_0()
+                            .text_sm()
+                            .children(crumbs.into_iter().enumerate().flat_map(|(i, c)| {
+                                let last = i + 1 == crumb_count;
+                                let mut out: Vec<AnyElement> = Vec::new();
+                                if i > 0 {
+                                    out.push(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_color(theme.muted_foreground)
+                                            .opacity(0.6)
+                                            .child("/")
+                                            .into_any_element(),
+                                    );
+                                }
+                                out.push(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(if last {
+                                            theme.foreground
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(c)
+                                        .into_any_element(),
+                                );
+                                out
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_0p5()
+                    .pr_2()
+                    .flex_shrink_0()
+                    .child(
+                        title_icon_button("tb-lang", IconName::Globe, false, &theme)
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(t(
+                                    lang,
+                                    "Switch to English",
+                                    "日本語に切り替え",
+                                ))
+                                .build(window, cx)
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.config.language = match this.config.language {
+                                    Language::Ja => Language::En,
+                                    Language::En => Language::Ja,
+                                };
+                                this.save_config();
+                                this.apply_placeholders(window, cx);
+                                this.feed.remeasure();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        title_icon_button(
+                            "tb-theme",
+                            match self.config.theme {
+                                ThemeMode::Dark => IconName::Sun,
+                                ThemeMode::Light => IconName::Moon,
+                            },
+                            false,
+                            &theme,
+                        )
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(t(
+                                lang,
+                                "テーマ切替",
+                                "Toggle theme",
+                            ))
+                            .build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.config.theme = match this.config.theme {
+                                ThemeMode::Dark => ThemeMode::Light,
+                                ThemeMode::Light => ThemeMode::Dark,
+                            };
+                            apply_gpui_theme(this.config.theme, Some(window), cx);
+                            this.save_config();
+                            cx.notify();
+                        })),
+                    )
+                    .when(self.active_view == MainView::Chat, |el| {
+                        el.child(
+                            title_icon_button(
+                                "tb-right-panel",
+                                IconName::PanelRight,
+                                self.show_right_panel,
+                                &theme,
+                            )
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(t(
+                                    lang,
+                                    "ファイル / Git パネル (Ctrl+B)",
+                                    "Files / Git panel (Ctrl+B)",
+                                ))
+                                .build(window, cx)
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_right_panel = !this.show_right_panel;
+                                cx.notify();
+                            })),
+                        )
+                    }),
+            )
+    }
+}
+
 impl Render for SameAppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if std::mem::take(&mut self.reload_open_file_pending) {
@@ -5062,18 +5527,26 @@ impl Render for SameAppView {
                     }
                 }
             }))
-            .h_flex()
+            .v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .child(self.render_sidebar(cx))
-            .child(match self.active_view {
-                MainView::Chat => self.render_chat_view(cx).into_any_element(),
-                MainView::Providers => self.render_providers_view(cx).into_any_element(),
-            })
-            .when(
-                self.active_view == MainView::Chat && self.show_right_panel,
-                |el| el.child(self.render_right_panel(cx)),
+            .child(self.render_title_bar(cx))
+            .child(
+                div()
+                    .h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(self.render_sidebar(cx))
+                    .child(match self.active_view {
+                        MainView::Chat => self.render_chat_view(cx).into_any_element(),
+                        MainView::Providers => self.render_providers_view(cx).into_any_element(),
+                    })
+                    .when(
+                        self.active_view == MainView::Chat && self.show_right_panel,
+                        |el| el.child(self.render_right_panel(cx)),
+                    ),
             )
     }
 }
