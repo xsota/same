@@ -17,7 +17,7 @@ SAME is structured as a modular Rust workspace with strict layer separation so t
 
 3. **Agent Runtime (`same-agent` & `same-acp`)**
    - `same-acp`: Spec-compliant ACP v1 client over stdio (NDJSON JSON-RPC 2.0). Supports `initialize`, `session/new`, `session/load`, `session/prompt`, `session/cancel`, model selection (`session/set_model`, or `session/set_config_option` when the agent exposes the model as a config option), `session/update` notifications, `session/request_permission`, `fs/read_text_file`, `fs/write_text_file`, and `terminal/*`.
-   - `same-agent`: Provider-agnostic `AgentRuntime` trait, `AgentManager`, and concrete adapters (`AcpAgentAdapter`, `ClaudeCliAdapter`, `CodexCliAdapter`).
+   - `same-agent`: Provider-agnostic `AgentRuntime` trait, `AgentManager`, and concrete adapters (`AcpAgentAdapter`, `ClaudeCliAdapter`, `CodexCliAdapter`). The Claude Code adapter runs `claude -p` with `stream-json` input and output plus `--permission-prompt-tool stdio`, answering `can_use_tool` control requests; the Codex adapter drives `codex app-server` (`thread/start` / `thread/resume`, `turn/start`) and answers its command and file-change approval requests. Both route prompts through the same approval UI as ACP's `session/request_permission`.
 
 ## Local Data Locations
 

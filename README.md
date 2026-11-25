@@ -11,12 +11,12 @@ A lightweight, local-first, multi-provider AI agent desktop workspace written in
 - **ACP First, Not ACP Only**: Built-in Agent Client Protocol (ACP) v1 client over stdio, plus native CLI adapters for agents without a standalone ACP wrapper installed.
 - **Multi-Provider Support**:
   - OpenCode (`opencode acp`)
-  - Claude Code (`claude-agent-acp` or native `claude` CLI adapter)
-  - Codex (`codex-acp` or native `codex` CLI adapter)
+  - Claude Code (`claude-agent-acp` or native `claude` CLI adapter over bidirectional `stream-json`)
+  - Codex (`codex-acp` or native `codex app-server` adapter)
   - Antigravity (`agy acp`)
   - Custom ACP agents (configurable command, args, env, cwd)
 - **Structured Workspace**: Organize work into `Workspace -> Project -> Quest -> Session` (with quick sessions supported without forcing hierarchy).
-- **Streaming & Tool Visibility**: Real-time streaming responses, collapsible thinking/reasoning blocks, tool call cards, interactive permission approval dialogs (with live auto-approve toggle), and file/image attachments.
+- **Streaming & Tool Visibility**: Real-time streaming responses, collapsible thinking/reasoning blocks, tool call cards, interactive permission approval dialogs for every provider (with live auto-approve toggle), and file/image attachments.
 - **Local-First Storage**: All configuration (TOML) and conversation history (SQLite) are stored locally. Zero telemetry, no mandatory account.
 - **Built-in Workspace Tools**: File browser, file viewer/editor, and optional Git status/diff viewer for software development projects.
 - **Customizable & Bilingual UI**: Dark/Light themes, 6 accent color presets, configurable UI/monospace fonts and font size, configurable submit key, and Japanese/English UI support.
