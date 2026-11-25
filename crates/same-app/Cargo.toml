@@ -13,6 +13,8 @@ anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+# Decodes the PNG window icon (X11); same major version as gpui's.
+image = { version = "0.25", default-features = false, features = ["png"] }
 tracing-subscriber.workspace = true
 uuid.workspace = true
 chrono.workspace = true
@@ -22,3 +24,6 @@ gpui-component.workspace = true
 gpui-kit-assets.workspace = true
 same-core.workspace = true
 same-agent.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0"

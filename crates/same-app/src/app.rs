@@ -13,7 +13,6 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::notification::Notification;
-use gpui_component::spinner::Spinner;
 use gpui_component::text::TextView;
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
@@ -3795,7 +3794,11 @@ impl SameAppView {
                                 .h_flex()
                                 .gap_1()
                                 .items_center()
-                                .child(Spinner::new().xsmall())
+                                .child(crate::brand::mascot_loader(
+                                    "composer-loader",
+                                    14.0,
+                                    theme.foreground,
+                                ))
                                 .child(t(lang, "応答中…", "Responding…")),
                         )
                     }),
@@ -3975,12 +3978,13 @@ impl SameAppView {
                 .items_center()
                 .gap_3()
                 .bg(theme.background)
+                .child(gpui::img(crate::brand::mascot()).size(px(112.0)))
                 .child(
                     div()
                         .text_2xl()
                         .font_weight(FontWeight::BOLD)
                         .text_color(shark_teal())
-                        .child("▲ SAME"),
+                        .child("SAME"),
                 )
                 .child(div().text_sm().text_color(theme.muted_foreground).child(t(
                     lang,
@@ -4220,12 +4224,13 @@ impl SameAppView {
                         .justify_center()
                         .py_12()
                         .gap_2()
+                        .child(gpui::img(crate::brand::mascot()).size(px(96.0)))
                         .child(
                             div()
                                 .text_2xl()
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(shark_teal())
-                                .child("▲ SAME"),
+                                .child("SAME"),
                         )
                         .child(
                             div()
@@ -4653,6 +4658,8 @@ impl SameAppView {
                 })
             })
             .when(is_live, |el| {
+                // A bigger hop while nothing has come back yet.
+                let idle = body.is_empty() && msg.tool_calls.is_empty() && !waiting_perm;
                 el.child(
                     div()
                         .h_flex()
@@ -4660,7 +4667,11 @@ impl SameAppView {
                         .items_center()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(Spinner::new().xsmall())
+                        .child(crate::brand::mascot_loader(
+                            SharedString::from(format!("loader-{}", msg.id)),
+                            if idle { 36.0 } else { 18.0 },
+                            theme.foreground,
+                        ))
                         .child(if waiting_perm {
                             t(lang, "許可を待っています", "Waiting for your approval")
                         } else if body.is_empty() && msg.tool_calls.is_empty() {
@@ -5330,19 +5341,7 @@ impl SameAppView {
                             .items_center()
                             .gap_2()
                             .flex_shrink_0()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(20.0))
-                                    .rounded(px(5.0))
-                                    .bg(shark_teal())
-                                    .text_color(gpui::white())
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("S"),
-                            )
+                            .child(gpui::img(crate::brand::mascot()).size(px(22.0)))
                             .child(
                                 div()
                                     .text_sm()

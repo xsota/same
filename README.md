@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/brand/same-mascot.svg" alt="SAME mascot" width="160">
+</p>
+
 # SAME (Shared Agentic Multi-provider Environment)
 
 A lightweight, local-first, multi-provider AI agent desktop workspace written in Rust.

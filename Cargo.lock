@@ -5617,10 +5617,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "embed-resource",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
+ "image",
  "same-agent",
  "same-core",
  "serde_json",

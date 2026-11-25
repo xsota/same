@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod brand;
 mod i18n;
 mod theme;
 mod workspace_fs;
@@ -34,6 +35,7 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(880.0), px(560.0))),
+                icon: brand::window_icon(),
                 titlebar: Some(TitlebarOptions {
                     title: Some("SAME — Shared Agentic Multi-provider Environment".into()),
                     ..TitleBar::title_bar_options()
