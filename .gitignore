@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+.env
+*.db
+*.db-wal
+*.db-shm
+
+# Private / internal notes & AI logs (never publish to OSS)
+local.md
+*.local.md
+.private/
+docs/private/
+docs/internal/
+notes/
+.same/
