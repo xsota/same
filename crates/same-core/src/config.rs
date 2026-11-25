@@ -19,6 +19,54 @@ impl Default for ThemeMode {
     }
 }
 
+/// The accent ("theme colour") used for primary buttons, highlights and
+/// focus rings. Presets avoid green / amber / red, which mean status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentColor {
+    #[default]
+    Teal,
+    Blue,
+    Indigo,
+    Purple,
+    Pink,
+    Slate,
+}
+
+impl AccentColor {
+    pub const ALL: [AccentColor; 6] = [
+        AccentColor::Teal,
+        AccentColor::Blue,
+        AccentColor::Indigo,
+        AccentColor::Purple,
+        AccentColor::Pink,
+        AccentColor::Slate,
+    ];
+
+    /// 0xRRGGBB. Dark enough to carry white text.
+    pub fn hex(self) -> u32 {
+        match self {
+            AccentColor::Teal => 0x2BA6CB,
+            AccentColor::Blue => 0x2F6FEB,
+            AccentColor::Indigo => 0x5B5BD6,
+            AccentColor::Purple => 0x8E4EC6,
+            AccentColor::Pink => 0xD6409F,
+            AccentColor::Slate => 0x5F6B7A,
+        }
+    }
+
+    pub fn label(self) -> (&'static str, &'static str) {
+        match self {
+            AccentColor::Teal => ("ティール", "Teal"),
+            AccentColor::Blue => ("ブルー", "Blue"),
+            AccentColor::Indigo => ("インディゴ", "Indigo"),
+            AccentColor::Purple => ("パープル", "Purple"),
+            AccentColor::Pink => ("ピンク", "Pink"),
+            AccentColor::Slate => ("スレート", "Slate"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Language {
@@ -75,6 +123,8 @@ impl AppPaths {
 pub struct AppConfig {
     #[serde(default)]
     pub theme: ThemeMode,
+    #[serde(default)]
+    pub accent: AccentColor,
     #[serde(default)]
     pub language: Language,
     #[serde(default = "default_provider_id")]
@@ -158,6 +208,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: ThemeMode::Dark,
+            accent: AccentColor::default(),
             language: Language::Ja,
             default_provider_id: default_provider_id(),
             auto_approve_tools: false,
@@ -202,5 +253,29 @@ impl AppConfig {
 
     pub fn find_provider(&self, id: &str) -> Option<&ProviderConfig> {
         self.providers.iter().find(|p| p.id == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_config_without_accent_loads() {
+        let raw = "theme = \"light\"\nlanguage = \"en\"\n";
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.theme, ThemeMode::Light);
+        assert_eq!(cfg.accent, AccentColor::Teal);
+        assert!(!cfg.providers.is_empty());
+    }
+
+    #[test]
+    fn default_config_round_trips() {
+        let mut cfg = AppConfig::default();
+        cfg.accent = AccentColor::Purple;
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let back: AppConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(back.accent, AccentColor::Purple);
+        assert_eq!(back.providers.len(), cfg.providers.len());
     }
 }

@@ -81,6 +81,16 @@ impl AcpClient {
     pub async fn spawn(
         config: AcpClientConfig,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpEvent>)> {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(config.auto_approve));
+        Self::spawn_with_policy(config, flag).await
+    }
+
+    /// Spawns an ACP client whose permission policy is read live from
+    /// `auto_approve_flag` on every incoming `session/request_permission`.
+    pub async fn spawn_with_policy(
+        config: AcpClientConfig,
+        auto_approve_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<AcpEvent>)> {
         let mut cmd = build_command(
             &config.target,
             &config.command,
@@ -143,7 +153,7 @@ impl AcpClient {
             let child_arc = child_arc.clone();
             let base_cwd = config.cwd.clone();
             let target = config.target.clone();
-            let auto_approve = config.auto_approve;
+            let auto_approve = auto_approve_flag.clone();
 
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout).lines();
@@ -214,6 +224,7 @@ impl AcpClient {
                         let base_cwd = base_cwd.clone();
                         let target = target.clone();
 
+                        let auto_approve = auto_approve.load(Ordering::Relaxed);
                         tokio::spawn(async move {
                             let response = handle_agent_request(
                                 id,
@@ -520,11 +531,10 @@ async fn handle_permission_request(
         .unwrap_or_default();
 
     if auto_approve {
-        if let Some(opt) = options
-            .iter()
-            .find(|o| o.kind.contains("allow"))
-            .or_else(|| options.first())
-        {
+        // Only auto-select a single-use grant (`allow_once`) so switching back
+        // to Ask reliably restores confirmation instead of leaving a persistent
+        // `allow_always` grant inside the agent.
+        if let Some(opt) = options.iter().find(|o| o.kind == "allow_once") {
             return Ok(json!({
                 "outcome": {
                     "outcome": "selected",

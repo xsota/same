@@ -1,5 +1,9 @@
+use gpui_component::Selectable;
 use crate::i18n::t;
-use crate::theme::{apply_gpui_theme, shark_teal, status_amber, status_green, status_red};
+use crate::theme::{
+    accent, accent_foreground, accent_text, apply_gpui_theme, status_amber, status_green,
+    status_red,
+};
 use crate::workspace_fs::{load_git_info, scan_directory, FileEntry, GitInfo};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
@@ -24,7 +28,7 @@ use same_agent::{
 };
 use same_core::paths::simplify_path;
 use same_core::{
-    AppConfig, AppPaths, EventBus, ExecMode, Language, Message, MessageRole, ModelInfo,
+    AccentColor, AppConfig, AppPaths, EventBus, ExecMode, Language, Message, MessageRole, ModelInfo,
     PermissionRequest, Project, ProviderConfig, ProviderKind, Quest, SameEvent, Session,
     SessionStatus, SlashCommandInfo, Storage, ThemeMode, ToolCallRecord, ToolCallStatus, Workspace,
 };
@@ -90,7 +94,39 @@ const MODELS_CACHE_FILE: &str = "models_cache.json";
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum MainView {
     Chat,
+    Settings,
+}
+
+/// A page of the settings screen.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum SettingsSection {
+    General,
+    Appearance,
     Providers,
+}
+
+impl SettingsSection {
+    const ALL: [SettingsSection; 3] = [
+        SettingsSection::General,
+        SettingsSection::Appearance,
+        SettingsSection::Providers,
+    ];
+
+    fn title(self, lang: Language) -> &'static str {
+        match self {
+            SettingsSection::General => t(lang, "一般", "General"),
+            SettingsSection::Appearance => t(lang, "外観", "Appearance"),
+            SettingsSection::Providers => t(lang, "プロバイダ接続", "Providers"),
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            SettingsSection::General => IconName::Settings2,
+            SettingsSection::Appearance => IconName::Palette,
+            SettingsSection::Providers => IconName::Bot,
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -119,6 +155,7 @@ pub struct SameAppView {
     _subscriptions: Vec<Subscription>,
 
     active_view: MainView,
+    settings_section: SettingsSection,
     workspace: Workspace,
     projects: Vec<Project>,
     selected_project_id: Option<String>,
@@ -221,11 +258,12 @@ impl SameAppView {
         // would otherwise show a Stop button that can never do anything.
         let _ = storage.reset_active_sessions();
 
-        apply_gpui_theme(config.theme, Some(window), cx);
+        apply_gpui_theme(config.theme, config.accent, Some(window), cx);
 
         let rt = Arc::new(tokio::runtime::Runtime::new()?);
         let events = EventBus::new(1024);
         let agent_manager = AgentManager::new(events.clone(), rt.handle().clone());
+        agent_manager.set_auto_approve(config.auto_approve_tools);
 
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
 
@@ -420,6 +458,7 @@ impl SameAppView {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
             active_view: MainView::Chat,
+            settings_section: SettingsSection::General,
             workspace,
             projects,
             selected_project_id,
@@ -1993,7 +2032,6 @@ impl SameAppView {
             effort: session.effort.clone().filter(|e| !e.trim().is_empty()),
             cwd: PathBuf::from(&project.workdir),
             prompt: full_prompt,
-            auto_approve: self.config.auto_approve_tools,
             exec: self.exec_pref(),
         });
     }
@@ -2027,6 +2065,51 @@ impl SameAppView {
         if let Err(err) = self.config.save(&self.paths) {
             self.note(NoteKind::Error, format!("Failed to save config: {err}"));
         }
+    }
+
+    fn open_settings(&mut self, section: SettingsSection) {
+        self.active_view = MainView::Settings;
+        self.settings_section = section;
+        if section == SettingsSection::Providers {
+            self.refresh_provider_checks();
+        }
+    }
+
+    fn set_language(&mut self, lang: Language, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.language == lang {
+            return;
+        }
+        self.config.language = lang;
+        self.save_config();
+        self.apply_placeholders(window, cx);
+        self.feed.remeasure();
+    }
+
+    fn set_theme_mode(&mut self, mode: ThemeMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.theme == mode {
+            return;
+        }
+        self.config.theme = mode;
+        apply_gpui_theme(mode, self.config.accent, Some(window), cx);
+        self.save_config();
+    }
+
+    fn set_accent(&mut self, accent_color: AccentColor, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.accent == accent_color {
+            return;
+        }
+        self.config.accent = accent_color;
+        apply_gpui_theme(self.config.theme, accent_color, Some(window), cx);
+        self.save_config();
+    }
+
+    fn set_auto_approve(&mut self, value: bool) {
+        if self.config.auto_approve_tools == value {
+            return;
+        }
+        self.config.auto_approve_tools = value;
+        self.agent_manager.set_auto_approve(value);
+        self.save_config();
     }
 }
 
@@ -2093,7 +2176,7 @@ fn section_label(text: &str, theme: &Theme) -> Div {
 
 fn status_color(status: SessionStatus) -> Hsla {
     match status {
-        SessionStatus::Running | SessionStatus::WaitingForSubagent => shark_teal().into(),
+        SessionStatus::Running | SessionStatus::WaitingForSubagent => accent().into(),
         SessionStatus::WaitingForApproval => status_amber().into(),
         SessionStatus::Completed => status_green().into(),
         SessionStatus::Failed => status_red().into(),
@@ -2143,15 +2226,15 @@ impl SameAppView {
                             })),
                     )
                     .child(
-                        Button::new("nav-providers")
+                        Button::new("nav-settings")
                             .small()
                             .flex_1()
-                            .when(self.active_view == MainView::Providers, |b| b.primary())
-                            .when(self.active_view != MainView::Providers, |b| b.ghost())
-                            .label(t(lang, "プロバイダ接続", "Providers"))
+                            .when(self.active_view == MainView::Settings, |b| b.primary())
+                            .when(self.active_view != MainView::Settings, |b| b.ghost())
+                            .label(t(lang, "設定", "Settings"))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_view = MainView::Providers;
-                                this.refresh_provider_checks();
+                                let section = this.settings_section;
+                                this.open_settings(section);
                                 cx.notify();
                             })),
                     ),
@@ -2600,7 +2683,7 @@ impl SameAppView {
                         let dot = if waiting {
                             status_amber().into()
                         } else if running {
-                            shark_teal().into()
+                            accent().into()
                         } else {
                             status_color(s.status)
                         };
@@ -2668,78 +2751,35 @@ impl SameAppView {
 }
 
 impl SameAppView {
-    /// Dedicated Provider Connection & Management Screen
-    /// (Antigravity, Claude Code, Codex, OpenCode, and Custom ACP Agents)
-    fn render_providers_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Settings → Providers: connect, authenticate and test Antigravity,
+    /// Claude Code, Codex, OpenCode and custom ACP agents.
+    fn render_providers_settings(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let lang = self.config.language;
 
         div()
-            .id("providers-page-scroll")
             .v_flex()
-            .flex_1()
-            .h_full()
-            .overflow_y_scroll()
-            .p_6()
             .gap_4()
-            .bg(theme.background)
-            // Page header
-            .child(
-                div()
-                    .h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(t(
-                                        lang,
-                                        "プロバイダ接続・管理",
-                                        "Provider Connections & Management",
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child(t(
-                                        lang,
-                                        "Antigravity / Claude Code / Codex / OpenCode / カスタム ACP エージェントの接続・認証・テストを行います",
-                                        "Connect, authenticate, and test Antigravity, Claude Code, Codex, OpenCode, and custom ACP agents",
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("refresh-all-providers")
-                                    .small()
-                                    .primary()
-                                    .label(t(lang, "すべて再確認", "Refresh All"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.refresh_provider_checks();
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("back-to-chat")
-                                    .small()
-                                    .ghost()
-                                    .label(t(lang, "チャットへ戻る", "Back to Chat"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.active_view = MainView::Chat;
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
+            .child(settings_header(
+                SettingsSection::Providers.title(lang),
+                t(
+                    lang,
+                    "Antigravity / Claude Code / Codex / OpenCode / カスタム ACP エージェントの接続・認証・テストを行います",
+                    "Connect, authenticate, and test Antigravity, Claude Code, Codex, OpenCode, and custom ACP agents",
+                ),
+                &theme,
+                Some(
+                    Button::new("refresh-all-providers")
+                        .small()
+                        .primary()
+                        .label(t(lang, "すべて再確認", "Refresh All"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_provider_checks();
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                ),
+            ))
             // Provider cards
             .children(self.config.providers.iter().enumerate().map(|(idx, p)| {
                 self.render_provider_card(idx, p, cx)
@@ -2758,7 +2798,7 @@ impl SameAppView {
                         div()
                             .text_base()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(shark_teal())
+                            .text_color(accent_text())
                             .child(t(
                                 lang,
                                 "+ カスタム ACP エージェントを登録",
@@ -2996,7 +3036,7 @@ impl SameAppView {
             .bg(theme.sidebar)
             .border_1()
             .border_color(if is_default {
-                gpui::Hsla::from(shark_teal())
+                gpui::Hsla::from(accent())
             } else {
                 theme.border
             })
@@ -3024,7 +3064,7 @@ impl SameAppView {
                                     .py(px(2.0))
                                     .rounded(px(4.0))
                                     .bg(theme.background)
-                                    .text_color(shark_teal())
+                                    .text_color(accent_text())
                                     .child(p.kind.label()),
                             )
                             .when(is_default, |el| {
@@ -3034,8 +3074,8 @@ impl SameAppView {
                                         .px_2()
                                         .py(px(2.0))
                                         .rounded(px(4.0))
-                                        .bg(shark_teal())
-                                        .text_color(gpui::rgb(0xFFFFFF))
+                                        .bg(accent())
+                                        .text_color(accent_foreground())
                                         .child(t(lang, "デフォルト", "Default")),
                                 )
                             }),
@@ -3096,7 +3136,7 @@ impl SameAppView {
                         .rounded(px(4.0))
                         .bg(theme.background)
                         .border_1()
-                        .border_color(gpui::Hsla::from(shark_teal()))
+                        .border_color(gpui::Hsla::from(accent()))
                         .child(msg),
                 )
             })
@@ -3367,6 +3407,463 @@ impl SameAppView {
     }
 }
 
+/// Section heading for the settings screen: title, description and an
+/// optional action on the right.
+fn settings_header(
+    title: &str,
+    description: &str,
+    theme: &Theme,
+    action: Option<AnyElement>,
+) -> Div {
+    div()
+        .h_flex()
+        .justify_between()
+        .items_center()
+        .gap_4()
+        .child(
+            div()
+                .v_flex()
+                .gap_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_xl()
+                        .font_weight(FontWeight::BOLD)
+                        .child(title.to_string()),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(description.to_string()),
+                ),
+        )
+        .when_some(action, |el, a| el.child(div().flex_shrink_0().child(a)))
+}
+
+/// A bordered group of settings rows.
+fn settings_card(theme: &Theme) -> Div {
+    div()
+        .v_flex()
+        .rounded(px(8.0))
+        .bg(theme.sidebar)
+        .border_1()
+        .border_color(theme.border)
+}
+
+/// One labelled setting: text on the left, the control on the right.
+fn settings_row(
+    label: &str,
+    hint: &str,
+    control: impl IntoElement,
+    first: bool,
+    theme: &Theme,
+) -> Div {
+    div()
+        .h_flex()
+        .justify_between()
+        .items_center()
+        .gap_4()
+        .px_4()
+        .py_3()
+        .when(!first, |el| el.border_t_1().border_color(theme.border))
+        .child(
+            div()
+                .v_flex()
+                .gap_0p5()
+                .min_w_0()
+                .flex_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label.to_string()),
+                )
+                .when(!hint.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(hint.to_string()),
+                    )
+                }),
+        )
+        .child(div().flex_shrink_0().child(control))
+}
+
+impl SameAppView {
+    /// The settings screen: a section list on the left, the section's page
+    /// on the right.
+    fn render_settings_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+        let current = self.settings_section;
+
+        let nav = div()
+            .v_flex()
+            .w(px(200.0))
+            .h_full()
+            .flex_shrink_0()
+            .p_3()
+            .gap_1()
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .px_2()
+                    .pb_2()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.muted_foreground)
+                    .child(t(lang, "設定", "SETTINGS")),
+            )
+            .children(SettingsSection::ALL.into_iter().map(|section| {
+                let selected = section == current;
+                Button::new(SharedString::from(format!(
+                    "settings-nav-{}",
+                    section.title(Language::En)
+                )))
+                .ghost()
+                .small()
+                .selected(selected)
+                .toggled(selected)
+                .w_full()
+                .justify_start()
+                .icon(Icon::new(section.icon()).small())
+                .label(section.title(lang))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_settings(section);
+                    cx.notify();
+                }))
+            }));
+
+        let body = match current {
+            SettingsSection::General => self.render_general_settings(cx),
+            SettingsSection::Appearance => self.render_appearance_settings(cx),
+            SettingsSection::Providers => self.render_providers_settings(cx),
+        };
+
+        div()
+            .h_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .bg(theme.background)
+            .child(nav)
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "settings-page-scroll-{}",
+                        current.title(Language::En)
+                    )))
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .child(div().p_6().max_w(px(880.0)).child(body)),
+            )
+    }
+
+    fn render_general_settings(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+
+        let language_control = div()
+            .h_flex()
+            .gap_1()
+            .children([(Language::Ja, "日本語"), (Language::En, "English")].map(
+                |(value, label)| {
+                    Button::new(SharedString::from(format!("set-lang-{label}")))
+                        .small()
+                        .label(label)
+                        .toggled(self.config.language == value)
+                        .when(self.config.language == value, |b| b.primary())
+                        .when(self.config.language != value, |b| b.ghost())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_language(value, window, cx);
+                            cx.notify();
+                        }))
+                },
+            ));
+
+        let view = cx.entity().downgrade();
+        let default_id = self.config.default_provider_id.clone();
+        let providers: Vec<(String, String, bool)> = self
+            .config
+            .providers
+            .iter()
+            .map(|p| (p.id.clone(), p.name.clone(), p.enabled))
+            .collect();
+        let default_provider_control = Button::new("settings-default-provider")
+            .small()
+            .ghost()
+            .max_w(px(240.0))
+            .overflow_hidden()
+            .label(format!("{} ▾", self.provider_name(&default_id)))
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu;
+                for (pid, name, enabled) in providers.iter() {
+                    let v = view.clone();
+                    let pid2 = pid.clone();
+                    let label = if *enabled {
+                        name.clone()
+                    } else {
+                        format!("{name}  ({})", t(lang, "無効", "disabled"))
+                    };
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(*pid == default_id)
+                            .disabled(!*enabled)
+                            .on_click(move |_, _, cx| {
+                                let pid3 = pid2.clone();
+                                let _ = v.update(cx, |this, cx| {
+                                    if this
+                                        .config
+                                        .providers
+                                        .iter()
+                                        .any(|p| p.id == pid3 && p.enabled)
+                                    {
+                                        this.config.default_provider_id = pid3;
+                                        this.save_config();
+                                        cx.notify();
+                                    }
+                                });
+                            }),
+                    );
+                }
+                menu
+            });
+
+        let auto_approve = self.config.auto_approve_tools;
+        let auto_approve_control = div()
+            .h_flex()
+            .gap_1()
+            .children([(false, t(lang, "確認する", "Ask")), (true, t(lang, "自動承認", "Auto-approve"))].map(
+                |(value, label)| {
+                    Button::new(SharedString::from(format!("set-auto-approve-{value}")))
+                        .small()
+                        .label(label)
+                        .toggled(auto_approve == value)
+                        .when(auto_approve == value, |b| {
+                            if value {
+                                b.warning()
+                            } else {
+                                b.primary()
+                            }
+                        })
+                        .when(auto_approve != value, |b| b.ghost())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_auto_approve(value);
+                            cx.notify();
+                        }))
+                },
+            ));
+
+        div()
+            .v_flex()
+            .gap_4()
+            .child(settings_header(
+                SettingsSection::General.title(lang),
+                t(
+                    lang,
+                    "言語や新しいセッションの既定値を設定します",
+                    "Language and defaults for new sessions",
+                ),
+                &theme,
+                None,
+            ))
+            .child(
+                settings_card(&theme)
+                    .child(settings_row(
+                        t(lang, "言語", "Language"),
+                        t(lang, "UI の表示言語", "Display language of the UI"),
+                        language_control,
+                        true,
+                        &theme,
+                    ))
+                    .child(settings_row(
+                        t(lang, "既定のプロバイダ", "Default provider"),
+                        t(
+                            lang,
+                            "現在のセッションがないときに新しいセッションで使うエージェント",
+                            "Agent used for new sessions when no session is selected",
+                        ),
+                        default_provider_control,
+                        false,
+                        &theme,
+                    ))
+                    .child(settings_row(
+                        t(lang, "ツール実行の承認", "Tool permissions"),
+                        t(
+                            lang,
+                            "全 ACP セッションの新しい単発承認リクエストを自動許可します。CLI エージェントでは次回実行時のプロバイダ権限モードを切り替えます",
+                            "Automatically grants new single-use ACP permission requests across all sessions; for CLI agents, selects the provider's own permission mode on the next run",
+                        ),
+                        auto_approve_control,
+                        false,
+                        &theme,
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "{}: {}",
+                        t(lang, "設定ファイル", "Config file"),
+                        self.paths.config_file.display()
+                    )),
+            )
+    }
+
+    fn render_appearance_settings(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+
+        let mode_control = div()
+            .h_flex()
+            .gap_1()
+            .children(
+                [
+                    (ThemeMode::Dark, t(lang, "ダーク", "Dark")),
+                    (ThemeMode::Light, t(lang, "ライト", "Light")),
+                ]
+                .map(|(value, label)| {
+                    Button::new(SharedString::from(format!("set-theme-{label}")))
+                        .small()
+                        .label(label)
+                        .toggled(self.config.theme == value)
+                        .when(self.config.theme == value, |b| b.primary())
+                        .when(self.config.theme != value, |b| b.ghost())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.set_theme_mode(value, window, cx);
+                            cx.notify();
+                        }))
+                }),
+            );
+
+        let swatches = div()
+            .h_flex()
+            .flex_wrap()
+            .gap_2()
+            .children(AccentColor::ALL.into_iter().map(|value| {
+                let selected = self.config.accent == value;
+                let (ja, en) = value.label();
+                let color: Hsla = gpui::rgb(value.hex()).into();
+                Button::new(SharedString::from(format!("set-accent-{en}")))
+                    .ghost()
+                    .selected(selected)
+                    .toggled(selected)
+                    .h_auto()
+                    .w(px(76.0))
+                    .py_2()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(if selected { color } else { theme.border })
+                    .child(
+                        div()
+                            .v_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .size(px(28.0))
+                                    .rounded_full()
+                                    .bg(color)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(accent_foreground())
+                                    .when(selected, |el| el.child(Icon::new(IconName::Check).small())),
+                            )
+                            .child(div().text_xs().child(t(lang, ja, en))),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_accent(value, window, cx);
+                        cx.notify();
+                    }))
+            }));
+
+        let preview = div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .child(Button::new("accent-preview-primary").small().primary().label(t(
+                lang,
+                "プライマリ",
+                "Primary",
+            )))
+            .child(
+                div()
+                    .text_xs()
+                    .px_2()
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .bg(accent())
+                    .text_color(accent_foreground())
+                    .child(t(lang, "デフォルト", "Default")),
+            )
+            .child(div().text_sm().text_color(accent_text()).child(t(
+                lang,
+                "アクセントテキスト",
+                "Accent text",
+            )));
+
+        div()
+            .v_flex()
+            .gap_4()
+            .child(settings_header(
+                SettingsSection::Appearance.title(lang),
+                t(
+                    lang,
+                    "テーマとアクセントカラーを変更します",
+                    "Theme and accent colour",
+                ),
+                &theme,
+                None,
+            ))
+            .child(
+                settings_card(&theme)
+                    .child(settings_row(
+                        t(lang, "テーマ", "Theme"),
+                        t(lang, "ダーク / ライト", "Dark or light"),
+                        mode_control,
+                        true,
+                        &theme,
+                    ))
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_3()
+                            .px_4()
+                            .py_3()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(t(lang, "テーマカラー", "Accent colour")),
+                                    )
+                                    .child(div().text_xs().text_color(theme.muted_foreground).child(
+                                        t(
+                                            lang,
+                                            "ボタン・選択状態・強調表示に使う色",
+                                            "Used for buttons, selection and highlights",
+                                        ),
+                                    )),
+                            )
+                            .child(swatches)
+                            .child(preview),
+                    ),
+            )
+    }
+}
+
 impl SameAppView {
     fn render_chat_header(
         &self,
@@ -3585,8 +4082,7 @@ impl SameAppView {
                     PopupMenuItem::new(t(lang, "プロバイダを管理…", "Manage providers…")).on_click(
                         move |_, _, cx| {
                             let _ = v.update(cx, |this, cx| {
-                                this.active_view = MainView::Providers;
-                                this.refresh_provider_checks();
+                                this.open_settings(SettingsSection::Providers);
                                 cx.notify();
                             });
                         },
@@ -3770,12 +4266,13 @@ impl SameAppView {
                     .child(
                         Button::new("toggle-auto-approve")
                             .xsmall()
+                            .toggled(self.config.auto_approve_tools)
                             .when(self.config.auto_approve_tools, |b| b.warning())
                             .when(!self.config.auto_approve_tools, |b| b.ghost())
                             .tooltip(t(
                                 lang,
-                                "ON の間はツール実行を確認なしで許可します",
-                                "When ON, tool calls run without asking",
+                                "全 ACP セッションの新しい単発承認リクエストを自動許可します（CLI エージェントは次回実行から反映）",
+                                "Applies globally: automatically grants new single-use ACP permission requests across all sessions, and sets the permission mode for future CLI runs",
                             ))
                             .label(if self.config.auto_approve_tools {
                                 t(lang, "自動承認: ON", "Auto-approve: ON")
@@ -3783,8 +4280,7 @@ impl SameAppView {
                                 t(lang, "自動承認: OFF", "Auto-approve: OFF")
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.config.auto_approve_tools = !this.config.auto_approve_tools;
-                                this.save_config();
+                                this.set_auto_approve(!this.config.auto_approve_tools);
                                 cx.notify();
                             })),
                     )
@@ -3983,7 +4479,7 @@ impl SameAppView {
                     div()
                         .text_2xl()
                         .font_weight(FontWeight::BOLD)
-                        .text_color(shark_teal())
+                        .text_color(accent_text())
                         .child("SAME"),
                 )
                 .child(div().text_sm().text_color(theme.muted_foreground).child(t(
@@ -4076,8 +4572,7 @@ impl SameAppView {
                                 .ghost()
                                 .label(t(lang, "設定を開く", "Open settings"))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.active_view = MainView::Providers;
-                                    this.refresh_provider_checks();
+                                    this.open_settings(SettingsSection::Providers);
                                     cx.notify();
                                 })),
                         ),
@@ -4098,7 +4593,7 @@ impl SameAppView {
                             div()
                                 .text_xs()
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(shark_teal())
+                                .text_color(accent_text())
                                 .child(format!("🎯 {title}")),
                         )
                         .child(
@@ -4229,7 +4724,7 @@ impl SameAppView {
                             div()
                                 .text_2xl()
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(shark_teal())
+                                .text_color(accent_text())
                                 .child("SAME"),
                         )
                         .child(
@@ -4649,8 +5144,7 @@ impl SameAppView {
                                     "Authentication needed — open Providers",
                                 ))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.active_view = MainView::Providers;
-                                    this.refresh_provider_checks();
+                                    this.open_settings(SettingsSection::Providers);
                                     cx.notify();
                                 })),
                         ),
@@ -4700,7 +5194,7 @@ impl SameAppView {
             ToolCallStatus::Failed => ("✗", status_red().into()),
             ToolCallStatus::Denied => ("⊘", status_red().into()),
             ToolCallStatus::Pending => ("○", status_amber().into()),
-            ToolCallStatus::InProgress => ("◐", shark_teal().into()),
+            ToolCallStatus::InProgress => ("◐", accent_text().into()),
         };
         let key_click = tc_key.clone();
         let title = if tc.title.trim().is_empty() {
@@ -5141,7 +5635,7 @@ impl SameAppView {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::BOLD)
-                    .text_color(shark_teal())
+                    .text_color(accent_text())
                     .child(format!("⎇ {}", self.git_info.branch)),
             )
             .child(section_label(t(lang, "変更ファイル", "Changes"), &theme))
@@ -5193,7 +5687,7 @@ impl SameAppView {
                             Some(Hsla::from(status_red()).opacity(0.08)),
                         )
                     } else if line.starts_with("@@") {
-                        (Hsla::from(shark_teal()), None)
+                        (Hsla::from(accent_text()), None)
                     } else if line.starts_with("diff ") {
                         (theme.foreground, Some(theme.secondary))
                     } else {
@@ -5320,7 +5814,10 @@ impl SameAppView {
                     crumbs.push(p.name.clone());
                 }
             }
-            MainView::Providers => crumbs.push(t(lang, "プロバイダ接続", "Providers").into()),
+            MainView::Settings => {
+                crumbs.push(t(lang, "設定", "Settings").into());
+                crumbs.push(self.settings_section.title(lang).into());
+            }
         }
         let crumb_count = crumbs.len();
 
@@ -5403,13 +5900,11 @@ impl SameAppView {
                                 .build(window, cx)
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.config.language = match this.config.language {
+                                let next = match this.config.language {
                                     Language::Ja => Language::En,
                                     Language::En => Language::Ja,
                                 };
-                                this.save_config();
-                                this.apply_placeholders(window, cx);
-                                this.feed.remeasure();
+                                this.set_language(next, window, cx);
                                 cx.notify();
                             })),
                     )
@@ -5432,12 +5927,32 @@ impl SameAppView {
                             .build(window, cx)
                         })
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.config.theme = match this.config.theme {
+                            let next = match this.config.theme {
                                 ThemeMode::Dark => ThemeMode::Light,
                                 ThemeMode::Light => ThemeMode::Dark,
                             };
-                            apply_gpui_theme(this.config.theme, Some(window), cx);
-                            this.save_config();
+                            this.set_theme_mode(next, window, cx);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        title_icon_button(
+                            "tb-settings",
+                            IconName::Settings,
+                            self.active_view == MainView::Settings,
+                            &theme,
+                        )
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(t(lang, "設定", "Settings"))
+                                .build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.active_view == MainView::Settings {
+                                this.active_view = MainView::Chat;
+                            } else {
+                                let section = this.settings_section;
+                                this.open_settings(section);
+                            }
                             cx.notify();
                         })),
                     )
@@ -5540,7 +6055,7 @@ impl Render for SameAppView {
                     .child(self.render_sidebar(cx))
                     .child(match self.active_view {
                         MainView::Chat => self.render_chat_view(cx).into_any_element(),
-                        MainView::Providers => self.render_providers_view(cx).into_any_element(),
+                        MainView::Settings => self.render_settings_view(cx).into_any_element(),
                     })
                     .when(
                         self.active_view == MainView::Chat && self.show_right_panel,

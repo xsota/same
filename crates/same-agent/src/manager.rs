@@ -28,7 +28,6 @@ pub struct PromptRequest {
     pub effort: Option<String>,
     pub cwd: PathBuf,
     pub prompt: String,
-    pub auto_approve: bool,
     /// Where the project's agents should run (see [`ExecPreference`]).
     pub exec: ExecPreference,
 }
@@ -111,6 +110,9 @@ pub struct AgentManager {
     /// Per ACP provider: the model and effort a fresh session starts with,
     /// restored when a session goes back to "Default".
     acp_defaults: Arc<Mutex<HashMap<String, AcpDefaults>>>,
+    /// Live tool auto-approval policy shared with all running and starting ACP
+    /// clients.
+    auto_approve: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -129,7 +131,15 @@ impl AgentManager {
             cancellers: Arc::new(Mutex::new(HashMap::new())),
             permission_responders: Arc::new(Mutex::new(HashMap::new())),
             acp_defaults: Arc::new(Mutex::new(HashMap::new())),
+            auto_approve: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Updates the live tool auto-approval policy synchronously for all
+    /// running and starting ACP clients.
+    pub fn set_auto_approve(&self, auto_approve: bool) {
+        self.auto_approve
+            .store(auto_approve, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn capabilities_for(kind: ProviderKind) -> ProviderCapabilities {
@@ -413,6 +423,9 @@ impl AgentManager {
 
     pub fn start_prompt(&self, req: PromptRequest) {
         let manager = self.clone();
+        // Snapshot the CLI permission flag at submission time; ACP clients
+        // continue reading the live shared flag.
+        let cli_auto_approve = self.auto_approve.load(std::sync::atomic::Ordering::SeqCst);
         self.runtime.spawn(async move {
             let sid = req.session_id.clone();
             let pid = req.provider.id.clone();
@@ -445,7 +458,7 @@ impl AgentManager {
                         &req.cwd,
                         &target,
                         &req.prompt,
-                        req.auto_approve,
+                        cli_auto_approve,
                         manager.events.clone(),
                         cancel_rx,
                     )
@@ -461,7 +474,7 @@ impl AgentManager {
                         &req.cwd,
                         &target,
                         &req.prompt,
-                        req.auto_approve,
+                        cli_auto_approve,
                         manager.events.clone(),
                         cancel_rx,
                     )
@@ -685,14 +698,17 @@ impl AgentManager {
             }
         }
 
-        let (client, mut acp_rx) = AcpClient::spawn(AcpClientConfig {
-            command: req.provider.command.clone(),
-            args: req.provider.args.clone(),
-            env: req.provider.env.clone(),
-            cwd: req.cwd.clone(),
-            auto_approve: req.auto_approve,
-            target: target.clone(),
-        })
+        let (client, mut acp_rx) = AcpClient::spawn_with_policy(
+            AcpClientConfig {
+                command: req.provider.command.clone(),
+                args: req.provider.args.clone(),
+                env: req.provider.env.clone(),
+                cwd: req.cwd.clone(),
+                auto_approve: self.auto_approve.load(std::sync::atomic::Ordering::SeqCst),
+                target: target.clone(),
+            },
+            self.auto_approve.clone(),
+        )
         .await?;
 
         let client = Arc::new(client);
@@ -703,6 +719,7 @@ impl AgentManager {
             let events = self.events.clone();
             let responders = self.permission_responders.clone();
             let acp_sessions = self.acp_sessions.clone();
+            let this_client = client.clone();
             let model_state = model_state.clone();
             let same_session_id = req.session_id.clone();
             let provider_id = req.provider.id.clone();
@@ -840,7 +857,13 @@ impl AgentManager {
                             });
                         }
                         AcpEvent::ProcessExited(_) => {
-                            acp_sessions.lock().await.remove(&same_session_id);
+                            let mut guard = acp_sessions.lock().await;
+                            if guard
+                                .get(&same_session_id)
+                                .is_some_and(|h| Arc::ptr_eq(&h.client, &this_client))
+                            {
+                                guard.remove(&same_session_id);
+                            }
                             break;
                         }
                     }
@@ -881,7 +904,7 @@ impl AgentManager {
             external_session_id: acp_session_id.clone(),
         });
 
-        self.acp_sessions.lock().await.insert(
+        let displaced = self.acp_sessions.lock().await.insert(
             req.session_id.clone(),
             AcpSessionHandle {
                 provider_id: req.provider.id.clone(),
@@ -891,6 +914,11 @@ impl AgentManager {
                 model_state: model_state.clone(),
             },
         );
+        if let Some(old) = displaced {
+            tokio::spawn(async move {
+                old.client.shutdown().await;
+            });
+        }
 
         Ok((client, acp_session_id, model_state))
     }
@@ -1006,7 +1034,6 @@ mod tests {
             effort: other_effort.clone(),
             cwd: cwd.clone(),
             prompt: String::new(),
-            auto_approve: false,
             exec: ExecPreference::Auto,
         };
         let apply = |req: PromptRequest| {
@@ -1051,6 +1078,7 @@ mod tests {
         let fake = std::env::var("SAME_WSL_FAKE_ACP").unwrap();
         let events = EventBus::new(4096);
         let mgr = AgentManager::new(events.clone(), tokio::runtime::Handle::current());
+        mgr.set_auto_approve(true);
 
         let run = |provider: ProviderConfig, sid: &str| {
             let mut rx = events.subscribe();
@@ -1062,7 +1090,6 @@ mod tests {
                 effort: None,
                 cwd: dir.clone(),
                 prompt: "Reply with just the word OK.".to_string(),
-                auto_approve: true,
                 exec: ExecPreference::Auto,
             });
             async move {
