@@ -246,19 +246,33 @@ pub(crate) async fn run_codex_turn(
     if process.last_skill_roots.as_slice() != t.skill_roots
         || process.last_skill_hash != t.skill_hash
     {
-        match process
-            .call(
-                "skills/extraRoots/set",
-                json!({ "extraRoots": t.skill_roots }),
-            )
-            .await
-        {
+        let reg = tokio::select! {
+            _ = &mut cancel_rx => {
+                lease.discard().await;
+                t.events.publish(SameEvent::SessionCancelled {
+                    session_id: t.session_id.to_string(),
+                });
+                return Ok(());
+            }
+            res = async {
+                let r = process
+                    .call(
+                        "skills/extraRoots/set",
+                        json!({ "extraRoots": t.skill_roots }),
+                    )
+                    .await;
+                if r.is_ok() {
+                    let _ = process
+                        .call("skills/list", json!({ "forceReload": true }))
+                        .await;
+                }
+                r
+            } => res,
+        };
+        match reg {
             Ok(_) => {
                 process.last_skill_roots = t.skill_roots.to_vec();
                 process.last_skill_hash = t.skill_hash.to_string();
-                let _ = process
-                    .call("skills/list", json!({ "forceReload": true }))
-                    .await;
             }
             Err(err) => {
                 t.events.publish(SameEvent::AgentLog {

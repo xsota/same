@@ -772,6 +772,35 @@ impl SkillManager {
                 return Err(err);
             }
 
+            let (staged_parsed, staged_related, staged_report) = validate_skill_dir(&stage_dir);
+            // Ignore expected dir_name_mismatch because `stage_dir` uses a temporary name.
+            let staged_errors: Vec<_> = staged_report
+                .errors()
+                .into_iter()
+                .filter(|e| e.code != "dir_name_mismatch")
+                .collect();
+            if !staged_errors.is_empty() {
+                let _ = fs::remove_dir_all(&stage_dir);
+                let msg = staged_errors
+                    .into_iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("Staged skill '{}' failed revalidation: {msg}", final_name);
+            }
+            if !cand.has_executable_scripts && staged_related.iter().any(|f| f.is_executable) {
+                let _ = fs::remove_dir_all(&stage_dir);
+                bail!(
+                    "Import source for '{}' changed after preview and now contains unexpected executable scripts",
+                    final_name
+                );
+            }
+            let final_description = staged_parsed
+                .as_ref()
+                .map(|p| p.description.clone())
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| cand.description.clone());
+
             let content_hash = match compute_dir_hash(&stage_dir) {
                 Ok(h) => h,
                 Err(err) => {
@@ -803,7 +832,7 @@ impl SkillManager {
                 }
 
                 old.name = final_name;
-                old.description = cand.description.clone();
+                old.description = final_description;
                 old.path = dst_dir.to_string_lossy().to_string();
                 old.source_type = source_type;
                 old.source_uri = Some(cand.source_path.to_string_lossy().to_string());
@@ -826,7 +855,7 @@ impl SkillManager {
                 let skill = Skill {
                     id: Uuid::new_v4().to_string(),
                     name: final_name,
-                    description: cand.description.clone(),
+                    description: final_description,
                     scope: target_scope,
                     project_id: match target_scope {
                         SkillScope::Global => None,
@@ -939,10 +968,30 @@ impl SkillManager {
     }
 }
 
-/// Recursively copies `src` into `dst`, rejecting symlinks that point outside `src`.
+/// Recursively copies `src` into `dst`, rejecting symlinks that point outside `src`
+/// and rejecting destinations located inside `src` (preventing infinite recursion).
 pub fn copy_dir_safe(src: &Path, dst: &Path) -> Result<()> {
     let canon_src = fs::canonicalize(src)
         .with_context(|| format!("Failed to canonicalize {}", src.display()))?;
+    // Resolve the nearest existing ancestor of `dst` to detect recursive copies.
+    let mut check = dst.to_path_buf();
+    while !check.exists() {
+        let Some(parent) = check.parent() else {
+            break;
+        };
+        check = parent.to_path_buf();
+    }
+    if check.exists() {
+        if let Ok(canon_ancestor) = fs::canonicalize(&check) {
+            if canon_ancestor.starts_with(&canon_src) {
+                bail!(
+                    "Destination '{}' is inside source directory '{}' (recursive copy rejected)",
+                    dst.display(),
+                    src.display()
+                );
+            }
+        }
+    }
     copy_dir_inner(&canon_src, &canon_src, dst)
 }
 

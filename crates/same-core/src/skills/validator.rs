@@ -688,6 +688,9 @@ pub fn compute_dir_hash(dir: &Path) -> Result<String> {
     for (rel, path) in files {
         hasher.update(rel.as_bytes());
         hasher.update(&[0u8]);
+        let meta = fs::metadata(&path)
+            .with_context(|| format!("Failed to stat {} for hashing", path.display()))?;
+        hasher.update(&[is_executable_file(&path, &meta) as u8]);
         let bytes = fs::read(&path)
             .with_context(|| format!("Failed to read {} for hashing", path.display()))?;
         hasher.update(&(bytes.len() as u64).to_le_bytes());

@@ -25,23 +25,43 @@ pub struct GeneratedSkillDraft {
 pub async fn generate_skill_draft(
     provider: &ProviderConfig,
     target: &ExecTarget,
-    cwd: &Path,
+    _cwd: &Path,
     user_request: &str,
     scope: SkillScope,
     existing_draft: Option<(&str, &str, &str)>,
 ) -> Result<GeneratedSkillDraft> {
     let prompt = build_generation_prompt(user_request, scope, existing_draft);
+    // Run drafting inside an isolated empty temporary directory so agents with
+    // agent-side tools cannot inspect or mutate the user's project workspace.
+    let isolated_dir = create_isolated_draft_dir()?;
     let fut = async {
         match provider.kind {
-            ProviderKind::ClaudeCli => run_claude_oneshot(provider, target, cwd, &prompt).await,
-            ProviderKind::CodexCli => run_codex_oneshot(provider, target, cwd, &prompt).await,
-            ProviderKind::Acp => run_acp_oneshot(provider, target, cwd, &prompt).await,
+            ProviderKind::ClaudeCli => {
+                run_claude_oneshot(provider, target, &isolated_dir, &prompt).await
+            }
+            ProviderKind::CodexCli => {
+                run_codex_oneshot(provider, target, &isolated_dir, &prompt).await
+            }
+            ProviderKind::Acp => run_acp_oneshot(provider, target, &isolated_dir, &prompt).await,
         }
     };
-    let raw = tokio::time::timeout(GENERATE_TIMEOUT, fut)
-        .await
+    let raw_res = tokio::time::timeout(GENERATE_TIMEOUT, fut).await;
+    let _ = std::fs::remove_dir_all(&isolated_dir);
+    let raw = raw_res
         .map_err(|_| anyhow!("AI generation timed out after {}s", GENERATE_TIMEOUT.as_secs()))??;
     extract_skill_draft_from_ai_output(&raw, user_request)
+}
+
+fn create_isolated_draft_dir() -> Result<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let id = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "same-skill-draft-{}-{id}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 fn build_generation_prompt(

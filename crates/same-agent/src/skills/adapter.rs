@@ -289,6 +289,7 @@ impl SkillSynchronizer {
                     format!("Failed to remove stale staged skill {}", dir.display())
                 })?;
                 manifest.skills.remove(&name);
+                let _ = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
             }
         }
 
@@ -326,6 +327,8 @@ impl SkillSynchronizer {
                         manifest
                             .skills
                             .insert(skill.name.clone(), current_src_hash.clone());
+                        let _ =
+                            fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
                     }
                 } else {
                     // Unmanaged directory at target path: treat as conflict and never
@@ -348,6 +351,7 @@ impl SkillSynchronizer {
                 manifest
                     .skills
                     .insert(skill.name.clone(), current_src_hash.clone());
+                let _ = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
             }
 
             if status == SkillDeploymentStatus::Synced {
@@ -472,13 +476,20 @@ impl SkillSynchronizer {
     }
 }
 
-/// Merges `skills.paths` into any existing `OPENCODE_CONFIG_CONTENT` JSON without
-/// clobbering the user's other inline config keys.
+/// Merges `skills.paths` into any existing `OPENCODE_CONFIG_CONTENT` (JSON or JSONC)
+/// without clobbering the user's other inline config keys. If an existing non-empty
+/// config cannot be parsed, preserves it verbatim rather than discarding it.
 pub fn merge_opencode_config_env(existing: Option<&str>, skills_dir: &str) -> String {
-    let mut root = existing
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .filter(|v| v.is_object())
-        .unwrap_or_else(|| json!({}));
+    let mut root = match existing.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            let stripped = strip_jsonc(raw);
+            match serde_json::from_str::<Value>(&stripped) {
+                Ok(v) if v.is_object() => v,
+                _ => return raw.to_string(),
+            }
+        }
+        None => json!({}),
+    };
 
     let obj = root.as_object_mut().expect("object");
     let skills_entry = obj.entry("skills").or_insert_with(|| json!({}));
@@ -501,6 +512,87 @@ pub fn merge_opencode_config_env(existing: Option<&str>, skills_dir: &str) -> St
             serde_json::to_string(skills_dir).unwrap_or_default()
         )
     })
+}
+
+fn strip_jsonc(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut no_comments = String::with_capacity(input.len());
+    let mut i = 0;
+    let mut in_str = false;
+    let mut escape = false;
+    while i < bytes.len() {
+        let ch = input[i..].chars().next().unwrap();
+        let len = ch.len_utf8();
+        if in_str {
+            no_comments.push(ch);
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            i += len;
+        } else if ch == '"' {
+            in_str = true;
+            no_comments.push(ch);
+            i += len;
+        } else if ch == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if ch == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            no_comments.push(ch);
+            i += len;
+        }
+    }
+    // Strip trailing commas before `}` or `]`.
+    let mut out = String::with_capacity(no_comments.len());
+    let chars: Vec<char> = no_comments.chars().collect();
+    let mut in_s = false;
+    let mut esc = false;
+    let mut j = 0;
+    while j < chars.len() {
+        let c = chars[j];
+        if in_s {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_s = false;
+            }
+            j += 1;
+            continue;
+        }
+        if c == '"' {
+            in_s = true;
+            out.push(c);
+            j += 1;
+            continue;
+        }
+        if c == ',' {
+            let mut k = j + 1;
+            while k < chars.len() && chars[k].is_whitespace() {
+                k += 1;
+            }
+            if k < chars.len() && matches!(chars[k], '}' | ']') {
+                j += 1;
+                continue;
+            }
+        }
+        out.push(c);
+        j += 1;
+    }
+    out
 }
 
 fn sanitize_key(raw: &str) -> String {

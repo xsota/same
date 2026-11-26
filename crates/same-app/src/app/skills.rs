@@ -113,6 +113,7 @@ pub(super) struct SkillsUiState {
     pub(super) validation_error: Option<String>,
     pub(super) syncing: bool,
     pub(super) discovering: bool,
+    pub(super) discovery_generation: u64,
 
     // New skill form (rendered in the full right-hand pane when selected == Creating)
     pub(super) new_name: Entity<InputState>,
@@ -187,6 +188,7 @@ impl SkillsUiState {
             validation_error: None,
             syncing: false,
             discovering: false,
+            discovery_generation: 0,
             new_name,
             new_desc,
             new_body,
@@ -551,18 +553,20 @@ impl SameAppView {
     }
 
     pub(super) fn trigger_external_skill_discovery(&mut self) {
-        if self.skills_ui.discovering {
-            return;
-        }
+        self.skills_ui.discovery_generation = self.skills_ui.discovery_generation.wrapping_add(1);
+        let generation = self.skills_ui.discovery_generation;
         self.skills_ui.discovering = true;
+        // Clear stale project-scoped external skills immediately on context change.
+        self.skills_ui.external_skills.clear();
+        self.recompute_skill_resolution();
         let exec = self.exec_pref();
         let cwd = self.current_project().map(|p| PathBuf::from(&p.workdir));
         let tx = self.ui_tx.clone();
         self.rt.spawn(async move {
             let probe_cwd = cwd.as_deref().unwrap_or_else(|| Path::new("."));
             let target = agent_exec::resolve_target(exec, probe_cwd).await;
-            let found = discover_external_skills(&target, cwd.as_deref()).await;
-            let _ = tx.send(UiAsyncMsg::ExternalSkillsDiscovered(found));
+            let skills = discover_external_skills(&target, cwd.as_deref()).await;
+            let _ = tx.send(UiAsyncMsg::ExternalSkillsDiscovered { generation, skills });
         });
     }
 

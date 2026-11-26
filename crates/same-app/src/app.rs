@@ -171,7 +171,10 @@ enum UiAsyncMsg {
         target: String,
         result: Result<same_core::StatsReport, String>,
     },
-    ExternalSkillsDiscovered(Vec<same_core::ExternalSkill>),
+    ExternalSkillsDiscovered {
+        generation: u64,
+        skills: Vec<same_core::ExternalSkill>,
+    },
     SkillsSynced {
         result: Result<usize, String>,
         manual: bool,
@@ -1972,10 +1975,12 @@ impl SameAppView {
 
     fn handle_async_msg(&mut self, msg: UiAsyncMsg) {
         match msg {
-            UiAsyncMsg::ExternalSkillsDiscovered(found) => {
-                self.skills_ui.discovering = false;
-                self.skills_ui.external_skills = found;
-                self.recompute_skill_resolution();
+            UiAsyncMsg::ExternalSkillsDiscovered { generation, skills } => {
+                if self.skills_ui.discovery_generation == generation {
+                    self.skills_ui.discovering = false;
+                    self.skills_ui.external_skills = skills;
+                    self.recompute_skill_resolution();
+                }
             }
             UiAsyncMsg::SkillDraftGenerated { request_id, result } => {
                 if self.skills_ui.ai_request_id != request_id {
