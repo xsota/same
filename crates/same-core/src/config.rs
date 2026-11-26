@@ -19,50 +19,35 @@ impl Default for ThemeMode {
     }
 }
 
-/// The accent ("theme colour") used for primary buttons, highlights and
-/// focus rings. Presets avoid green / amber / red, which mean status.
+/// The colour theme. Each theme has a light and a dark palette; which one
+/// is shown follows [`ThemeMode`]. Themes avoid green / amber / red as their
+/// primary colour, since those mean status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AccentColor {
+pub enum ColorTheme {
+    /// Deep Ocean / Shark Blue / Sea Foam — the brand theme.
     #[default]
-    Teal,
-    Blue,
-    Indigo,
-    Purple,
-    Pink,
-    Slate,
+    Ocean,
+    /// Neutral greys with a teal accent (the look before themes existed).
+    Classic,
+    Twilight,
+    Sakura,
 }
 
-impl AccentColor {
-    pub const ALL: [AccentColor; 6] = [
-        AccentColor::Teal,
-        AccentColor::Blue,
-        AccentColor::Indigo,
-        AccentColor::Purple,
-        AccentColor::Pink,
-        AccentColor::Slate,
+impl ColorTheme {
+    pub const ALL: [ColorTheme; 4] = [
+        ColorTheme::Ocean,
+        ColorTheme::Classic,
+        ColorTheme::Twilight,
+        ColorTheme::Sakura,
     ];
-
-    /// 0xRRGGBB. Dark enough to carry white text.
-    pub fn hex(self) -> u32 {
-        match self {
-            AccentColor::Teal => 0x2BA6CB,
-            AccentColor::Blue => 0x2F6FEB,
-            AccentColor::Indigo => 0x5B5BD6,
-            AccentColor::Purple => 0x8E4EC6,
-            AccentColor::Pink => 0xD6409F,
-            AccentColor::Slate => 0x5F6B7A,
-        }
-    }
 
     pub fn label(self) -> (&'static str, &'static str) {
         match self {
-            AccentColor::Teal => ("ティール", "Teal"),
-            AccentColor::Blue => ("ブルー", "Blue"),
-            AccentColor::Indigo => ("インディゴ", "Indigo"),
-            AccentColor::Purple => ("パープル", "Purple"),
-            AccentColor::Pink => ("ピンク", "Pink"),
-            AccentColor::Slate => ("スレート", "Slate"),
+            ColorTheme::Ocean => ("オーシャン", "Ocean"),
+            ColorTheme::Classic => ("クラシック", "Classic"),
+            ColorTheme::Twilight => ("トワイライト", "Twilight"),
+            ColorTheme::Sakura => ("サクラ", "Sakura"),
         }
     }
 }
@@ -134,8 +119,10 @@ impl AppPaths {
 pub struct AppConfig {
     #[serde(default)]
     pub theme: ThemeMode,
+    /// Colour theme; `theme` picks its light or dark palette. (Older configs
+    /// had an `accent` key instead, which is now ignored.)
     #[serde(default)]
-    pub accent: AccentColor,
+    pub color_theme: ColorTheme,
     /// UI font family. `None` uses the platform default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_font: Option<String>,
@@ -250,7 +237,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: ThemeMode::Dark,
-            accent: AccentColor::default(),
+            color_theme: ColorTheme::default(),
             ui_font: None,
             mono_font: None,
             font_size: None,
@@ -358,22 +345,32 @@ mod tests {
     }
 
     #[test]
-    fn legacy_config_without_accent_loads() {
+    fn legacy_config_without_color_theme_loads() {
         let raw = "theme = \"light\"\nlanguage = \"en\"\n";
         let cfg: AppConfig = toml::from_str(raw).unwrap();
         assert_eq!(cfg.theme, ThemeMode::Light);
-        assert_eq!(cfg.accent, AccentColor::Teal);
+        assert_eq!(cfg.color_theme, ColorTheme::Ocean);
         assert_eq!(cfg.submit_key, SubmitKey::Enter);
         assert!(!cfg.providers.is_empty());
     }
 
     #[test]
+    fn old_accent_key_is_ignored() {
+        let raw = "theme = \"dark\"\naccent = \"purple\"\n";
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.theme, ThemeMode::Dark);
+        assert_eq!(cfg.color_theme, ColorTheme::Ocean);
+        let saved = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!saved.contains("accent"));
+    }
+
+    #[test]
     fn default_config_round_trips() {
         let mut cfg = AppConfig::default();
-        cfg.accent = AccentColor::Purple;
+        cfg.color_theme = ColorTheme::Sakura;
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let back: AppConfig = toml::from_str(&raw).unwrap();
-        assert_eq!(back.accent, AccentColor::Purple);
+        assert_eq!(back.color_theme, ColorTheme::Sakura);
         assert_eq!(back.providers.len(), cfg.providers.len());
     }
 

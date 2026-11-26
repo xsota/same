@@ -6,7 +6,7 @@
 
 use super::{settings_card, settings_header, MainView, SameAppView, UiAsyncMsg};
 use crate::i18n::t;
-use crate::theme::{accent, status_amber, status_red};
+use crate::theme::{status_amber, status_red};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
     canvas, div, point, prelude::FluentBuilder as _, px, relative, AnyElement, Context, Div,
@@ -718,7 +718,7 @@ fn usage_color(used: f64, expired: bool, theme: &Theme) -> Hsla {
     } else if used >= WARN_PERCENT {
         status_amber().into()
     } else {
-        accent().into()
+        theme.ring
     }
 }
 

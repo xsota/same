@@ -4,8 +4,8 @@ mod usage;
 
 use crate::i18n::t;
 use crate::theme::{
-    accent, accent_foreground, accent_text, apply_gpui_theme, default_font_size, default_mono_font,
-    default_ui_font, status_amber, status_green, status_red,
+    accent, accent_foreground, accent_indicator, accent_text, apply_gpui_theme, default_font_size,
+    default_mono_font, default_ui_font, palette, status_amber, status_green, status_red,
 };
 use crate::updater::{self, ReleaseInfo, UpdateCheckOutcome, CURRENT_VERSION};
 use crate::workspace_fs::{load_git_info, scan_directory, FileEntry, GitInfo};
@@ -36,7 +36,7 @@ use same_agent::{
 };
 use same_core::paths::simplify_path;
 use same_core::{
-    AccentColor, AppConfig, AppPaths, ApprovalMode, EventBus, ExecMode, Language, Message,
+    AppConfig, AppPaths, ApprovalMode, ColorTheme, EventBus, ExecMode, Language, Message,
     MessageRole, ModelInfo, PermissionRequest, Project, ProviderConfig, ProviderKind, Quest,
     SameEvent, Session, SessionStatus, SlashCommandInfo, Storage, SubmitKey, ThemeMode,
     ToolCallRecord, ToolCallStatus, Workspace, MAX_FONT_SIZE, MIN_FONT_SIZE,
@@ -2773,16 +2773,16 @@ impl SameAppView {
         self.save_config();
     }
 
-    fn set_accent(
+    fn set_color_theme(
         &mut self,
-        accent_color: AccentColor,
+        color_theme: ColorTheme,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.config.accent == accent_color {
+        if self.config.color_theme == color_theme {
             return;
         }
-        self.config.accent = accent_color;
+        self.config.color_theme = color_theme;
         apply_gpui_theme(&self.config, Some(window), cx);
         self.save_config();
     }
@@ -3005,14 +3005,14 @@ fn section_label(text: &str, theme: &Theme) -> Div {
         .child(text.to_string())
 }
 
-fn status_color(status: SessionStatus) -> Hsla {
+fn status_color(status: SessionStatus, theme: &Theme) -> Hsla {
     match status {
-        SessionStatus::Running | SessionStatus::WaitingForSubagent => accent().into(),
+        SessionStatus::Running | SessionStatus::WaitingForSubagent => accent_indicator().into(),
         SessionStatus::WaitingForApproval => status_amber().into(),
         SessionStatus::Completed => status_green().into(),
         SessionStatus::Failed => status_red().into(),
-        SessionStatus::Interrupted | SessionStatus::Cancelled => gpui::rgb(0xA0A0A0).into(),
-        SessionStatus::Idle => gpui::rgb(0x666666).into(),
+        SessionStatus::Interrupted | SessionStatus::Cancelled => theme.muted_foreground,
+        SessionStatus::Idle => theme.muted_foreground.opacity(0.55),
     }
 }
 
@@ -3548,9 +3548,9 @@ impl SameAppView {
                         let dot = if waiting {
                             status_amber().into()
                         } else if running {
-                            accent().into()
+                            accent_indicator().into()
                         } else {
-                            status_color(s.status)
+                            status_color(s.status, &theme)
                         };
 
                         if renaming {
@@ -4977,47 +4977,85 @@ impl SameAppView {
             }),
         );
 
-        let swatches =
+        let mode = self.config.theme;
+        let theme_cards =
             div()
                 .h_flex()
                 .flex_wrap()
                 .gap_2()
-                .children(AccentColor::ALL.into_iter().map(|value| {
-                    let selected = self.config.accent == value;
+                .children(ColorTheme::ALL.into_iter().map(|value| {
+                    let selected = self.config.color_theme == value;
                     let (ja, en) = value.label();
-                    let color: Hsla = gpui::rgb(value.hex()).into();
-                    Button::new(SharedString::from(format!("set-accent-{en}")))
+                    let pal = palette(value, mode);
+                    let rgb = |hex: u32| -> Hsla { gpui::rgb(hex).into() };
+                    // A miniature window: sidebar strip, a text line and the
+                    // primary colour, drawn in the theme's own colours.
+                    let swatch = div()
+                        .h_flex()
+                        .w_full()
+                        .h(px(44.0))
+                        .rounded(px(6.0))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(rgb(pal.surface))
+                        .bg(rgb(pal.background))
+                        .child(div().w(px(18.0)).h_full().bg(rgb(pal.surface)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .v_flex()
+                                .justify_center()
+                                .gap_1()
+                                .px_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(pal.foreground))
+                                        .child("Aa"),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(6.0))
+                                        .w(px(36.0))
+                                        .rounded_full()
+                                        .bg(rgb(pal.primary)),
+                                ),
+                        )
+                        .when(selected, |el| {
+                            el.child(
+                                div()
+                                    .size(px(18.0))
+                                    .mr_1p5()
+                                    .rounded_full()
+                                    .bg(rgb(pal.primary))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(rgb(pal.primary_foreground))
+                                    .child(Icon::new(IconName::Check).xsmall()),
+                            )
+                        });
+                    Button::new(SharedString::from(format!("set-color-theme-{en}")))
                         .ghost()
                         .selected(selected)
                         .toggled(selected)
                         .h_auto()
-                        .w(px(76.0))
-                        .py_2()
+                        .w(px(120.0))
+                        .p_1p5()
                         .rounded(px(8.0))
                         .border_1()
-                        .border_color(if selected { color } else { theme.border })
+                        .border_color(if selected { theme.ring } else { theme.border })
                         .child(
                             div()
                                 .v_flex()
-                                .items_center()
+                                .w_full()
                                 .gap_1p5()
-                                .child(
-                                    div()
-                                        .size(px(28.0))
-                                        .rounded_full()
-                                        .bg(color)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_color(accent_foreground())
-                                        .when(selected, |el| {
-                                            el.child(Icon::new(IconName::Check).small())
-                                        }),
-                                )
+                                .child(swatch)
                                 .child(div().text_xs().child(t(lang, ja, en))),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.set_accent(value, window, cx);
+                            this.set_color_theme(value, window, cx);
                             cx.notify();
                         }))
                 }));
@@ -5055,8 +5093,8 @@ impl SameAppView {
                 SettingsSection::Appearance.title(lang),
                 t(
                     lang,
-                    "テーマ・アクセントカラー・フォントを変更します",
-                    "Theme, accent colour and fonts",
+                    "テーマ・モード・フォントを変更します",
+                    "Theme, light/dark mode and fonts",
                 ),
                 &theme,
                 None,
@@ -5064,8 +5102,12 @@ impl SameAppView {
             .child(
                 settings_card(&theme)
                     .child(settings_row(
-                        t(lang, "テーマ", "Theme"),
-                        t(lang, "ダーク / ライト", "Dark or light"),
+                        t(lang, "モード", "Mode"),
+                        t(
+                            lang,
+                            "テーマのダーク / ライトを切り替えます",
+                            "Dark or light variant of the theme",
+                        ),
                         mode_control,
                         true,
                         &theme,
@@ -5085,21 +5127,21 @@ impl SameAppView {
                                     .child(
                                         div().text_sm().font_weight(FontWeight::MEDIUM).child(t(
                                             lang,
-                                            "テーマカラー",
-                                            "Accent colour",
+                                            "テーマ",
+                                            "Theme",
                                         )),
                                     )
                                     .child(
                                         div().text_xs().text_color(theme.muted_foreground).child(
                                             t(
                                                 lang,
-                                                "ボタン・選択状態・強調表示に使う色",
-                                                "Used for buttons, selection and highlights",
+                                                "背景・文字・ボタンなどの配色。各テーマにダークとライトがあります",
+                                                "Colours for backgrounds, text and buttons. Each theme has a dark and a light variant",
                                             ),
                                         ),
                                     ),
                             )
-                            .child(swatches)
+                            .child(theme_cards)
                             .child(preview),
                     ),
             )
