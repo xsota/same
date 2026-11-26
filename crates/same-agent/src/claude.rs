@@ -194,9 +194,11 @@ fn claude_fingerprint(
     effort: Option<&str>,
     cwd: &Path,
     target: &ExecTarget,
+    skill_args: &[String],
+    skill_hash: &str,
 ) -> String {
     format!(
-        "{}\u{0}{:?}\u{0}{:?}\u{0}{}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
+        "{}\u{0}{:?}\u{0}{:?}\u{0}{}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{}",
         provider.command,
         provider.args,
         provider.env,
@@ -204,6 +206,8 @@ fn claude_fingerprint(
         target,
         model.unwrap_or(""),
         effort.unwrap_or(""),
+        skill_args,
+        skill_hash,
     )
 }
 
@@ -222,6 +226,8 @@ pub(crate) struct ClaudeTurn<'a> {
     pub cwd: &'a Path,
     pub target: &'a ExecTarget,
     pub prompt: &'a str,
+    pub skill_args: &'a [String],
+    pub skill_hash: &'a str,
     pub gate: &'a PermissionGate,
     pub events: &'a EventBus,
 }
@@ -232,7 +238,15 @@ pub(crate) async fn run_claude_turn(
     t: ClaudeTurn<'_>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let fingerprint = claude_fingerprint(t.provider, t.model, t.effort, t.cwd, t.target);
+    let fingerprint = claude_fingerprint(
+        t.provider,
+        t.model,
+        t.effort,
+        t.cwd,
+        t.target,
+        t.skill_args,
+        t.skill_hash,
+    );
     let mut lease = t.pool.lease(t.session_id).await;
     let mut resume = t.external_session_id.filter(|s| !s.trim().is_empty());
     let mut mode_restarted = false;
@@ -341,6 +355,9 @@ async fn spawn_claude(
     }
     if let Some(ext) = resume {
         args.arg("--resume").arg(ext);
+    }
+    for a in t.skill_args {
+        args.arg(a);
     }
     let proc =
         LineProcess::spawn(t.provider, &args.0, t.cwd, t.target, t.events, t.session_id).await?;

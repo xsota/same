@@ -50,6 +50,9 @@ pub(crate) struct CodexProcess {
     /// model in a collaboration mode).
     thread_id: Option<String>,
     thread_model: Option<String>,
+    /// Last extra skill roots registered via `skills/extraRoots/set`.
+    last_skill_roots: Vec<String>,
+    last_skill_hash: String,
 }
 
 impl Pooled for CodexProcess {
@@ -180,6 +183,8 @@ pub(crate) struct CodexTurnRequest<'a> {
     pub target: &'a ExecTarget,
     pub prompt: &'a str,
     pub images: &'a [String],
+    pub skill_roots: &'a [String],
+    pub skill_hash: &'a str,
     pub gate: &'a PermissionGate,
     pub events: &'a EventBus,
 }
@@ -203,6 +208,8 @@ pub(crate) async fn run_codex_turn(
             next_id: 0,
             thread_id: None,
             thread_model: None,
+            last_skill_roots: Vec::new(),
+            last_skill_hash: String::new(),
         };
         let init = tokio::select! {
             _ = &mut cancel_rx => {
@@ -233,6 +240,35 @@ pub(crate) async fn run_codex_turn(
         lease.put(process);
     }
     let process = lease.get().expect("process just ensured");
+
+    // Register or refresh SAME-managed skill roots via Codex app-server's native
+    // `skills/extraRoots/set` RPC (non-fatal if an older CLI doesn't support it).
+    if process.last_skill_roots.as_slice() != t.skill_roots
+        || process.last_skill_hash != t.skill_hash
+    {
+        match process
+            .call(
+                "skills/extraRoots/set",
+                json!({ "extraRoots": t.skill_roots }),
+            )
+            .await
+        {
+            Ok(_) => {
+                process.last_skill_roots = t.skill_roots.to_vec();
+                process.last_skill_hash = t.skill_hash.to_string();
+                let _ = process
+                    .call("skills/list", json!({ "forceReload": true }))
+                    .await;
+            }
+            Err(err) => {
+                t.events.publish(SameEvent::AgentLog {
+                    session_id: Some(t.session_id.to_string()),
+                    provider_id: t.provider.id.clone(),
+                    line: format!("Codex skills/extraRoots/set not applied: {err:#}"),
+                });
+            }
+        }
+    }
 
     let open = tokio::select! {
         _ = &mut cancel_rx => {

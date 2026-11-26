@@ -86,6 +86,8 @@ impl Session {
             attachments: vec![],
             exec: ExecPreference::Auto,
             mode: self.mode,
+            skill_delivery: None,
+            skill_sync: None,
         });
 
         let mut out = Outcome {

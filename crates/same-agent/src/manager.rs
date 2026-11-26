@@ -27,6 +27,27 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
+/// Deferred skill staging & explicit skill activation to execute inside
+/// [`AgentManager::start_prompt`] after cancellation is registered and the
+/// actual [`ExecTarget`] is resolved.
+#[derive(Clone)]
+pub struct PromptSkillSync {
+    pub synchronizer: crate::skills::SkillSynchronizer,
+    pub project_id: Option<String>,
+    pub resolution: same_core::SkillResolution,
+    /// Explicitly invoked skills `(skill_name, host_skill_md_path)`.
+    pub explicit_skills: Vec<(String, PathBuf)>,
+}
+
+impl std::fmt::Debug for PromptSkillSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PromptSkillSync")
+            .field("project_id", &self.project_id)
+            .field("explicit_skills", &self.explicit_skills)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PromptRequest {
     pub session_id: String,
@@ -44,6 +65,11 @@ pub struct PromptRequest {
     pub exec: ExecPreference,
     /// The session's approval mode.
     pub mode: ApprovalMode,
+    /// Optional SAME-managed skill delivery plan prepared for this turn.
+    pub skill_delivery: Option<crate::skills::SkillDeliveryPlan>,
+    /// Optional deferred skill sync + explicit skill formatting performed
+    /// inside `start_prompt` under the session's cancellation token.
+    pub skill_sync: Option<PromptSkillSync>,
 }
 
 /// A one-off setup step for a provider's CLI.
@@ -124,6 +150,81 @@ fn drain_utf8_chunks(pending: &mut Vec<u8>) -> String {
     out
 }
 
+fn has_dollar_skill_token(prompt: &str, name: &str) -> bool {
+    let bytes = prompt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let preceded_ok =
+                i == 0 || prompt[..i].chars().next_back().is_some_and(char::is_whitespace);
+            if preceded_ok {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() {
+                    let b = bytes[end];
+                    if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+                        end += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if end > start && prompt[start..end].eq_ignore_ascii_case(name) {
+                    return true;
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn format_explicit_skills_prompt(
+    prompt: &str,
+    skills: &[(String, PathBuf)],
+    provider: &ProviderConfig,
+    target: &ExecTarget,
+) -> String {
+    if skills.is_empty() {
+        return prompt.to_string();
+    }
+    match provider.kind {
+        ProviderKind::CodexCli => {
+            let missing: Vec<String> = skills
+                .iter()
+                .filter(|(name, _)| !has_dollar_skill_token(prompt, name))
+                .map(|(name, _)| format!("${name}"))
+                .collect();
+            if missing.is_empty() {
+                prompt.to_string()
+            } else if prompt.trim().is_empty() {
+                missing.join(" ")
+            } else {
+                format!("{}\n\n{prompt}", missing.join(" "))
+            }
+        }
+        ProviderKind::ClaudeCli | ProviderKind::Acp => {
+            let lines: Vec<String> = skills
+                .iter()
+                .map(|(name, md_path)| {
+                    let target_path = target.to_target_path(md_path);
+                    format!("- `{name}` ({target_path})")
+                })
+                .collect();
+            let header = format!(
+                "[Explicitly requested skills — read and follow their SKILL.md instructions:]\n{}",
+                lines.join("\n")
+            );
+            if prompt.trim().is_empty() {
+                header
+            } else {
+                format!("{header}\n\n{prompt}")
+            }
+        }
+    }
+}
+
 /// `C:\x\agy.exe` or `/usr/bin/agy` -> `agy`.
 fn command_name(command: &str) -> String {
     let base = command.rsplit(['/', '\\']).next().unwrap_or(command);
@@ -146,6 +247,11 @@ pub struct ProviderCheckResult {
 struct AcpSessionHandle {
     provider_id: String,
     target: ExecTarget,
+    /// Skill launch args/env used when this ACP process was spawned; if they
+    /// change between turns, the pooled process is replaced so the agent sees
+    /// the updated skill roots.
+    skill_args: Vec<String>,
+    skill_env: std::collections::BTreeMap<String, String>,
     client: Arc<AcpClient>,
     acp_session_id: String,
     /// The models the agent offers and the one in use; also updated by the
@@ -821,14 +927,69 @@ impl AgentManager {
                 status: SessionStatus::Running,
             });
 
-            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let (cancel_tx, mut cancel_rx) = oneshot::channel();
             manager
                 .cancellers
                 .lock()
                 .await
                 .insert(sid.clone(), cancel_tx);
 
-            let target = resolve_target(req.exec, &req.cwd).await;
+            let mut req = req;
+            let target = tokio::select! {
+                _ = &mut cancel_rx => {
+                    manager.cancellers.lock().await.remove(&sid);
+                    manager.events.publish(SameEvent::SessionCancelled {
+                        session_id: sid.clone(),
+                    });
+                    manager.events.publish(SameEvent::SessionStatusChanged {
+                        session_id: sid,
+                        status: SessionStatus::Cancelled,
+                    });
+                    return;
+                }
+                t = resolve_target(req.exec, &req.cwd) => t,
+            };
+
+            if let Some(sync_cfg) = req.skill_sync.take() {
+                if !sync_cfg.explicit_skills.is_empty() {
+                    req.prompt = format_explicit_skills_prompt(
+                        &req.prompt,
+                        &sync_cfg.explicit_skills,
+                        &req.provider,
+                        &target,
+                    );
+                }
+                let sync_provider = req.provider.clone();
+                let sync_target = target.clone();
+                let sync_fut = tokio::task::spawn_blocking(move || {
+                    sync_cfg
+                        .synchronizer
+                        .sync_for_provider(
+                            &sync_provider,
+                            sync_cfg.project_id.as_deref(),
+                            &sync_target,
+                            &sync_cfg.resolution,
+                        )
+                        .ok()
+                });
+                let delivery = tokio::select! {
+                    _ = &mut cancel_rx => {
+                        manager.cancellers.lock().await.remove(&sid);
+                        manager.events.publish(SameEvent::SessionCancelled {
+                            session_id: sid.clone(),
+                        });
+                        manager.events.publish(SameEvent::SessionStatusChanged {
+                            session_id: sid,
+                            status: SessionStatus::Cancelled,
+                        });
+                        return;
+                    }
+                    res = sync_fut => res.ok().flatten(),
+                };
+                if req.skill_delivery.is_none() {
+                    req.skill_delivery = delivery;
+                }
+            }
             let files_res: Result<Vec<String>> = req
                 .attachments
                 .iter()
@@ -859,6 +1020,16 @@ impl AgentManager {
                     }
                     ProviderKind::ClaudeCli => {
                         let prompt = claude_prompt_with_attachments(&req.prompt, &files);
+                        let skill_args = req
+                            .skill_delivery
+                            .as_ref()
+                            .map(|d| d.extra_args.as_slice())
+                            .unwrap_or(&[]);
+                        let skill_hash = req
+                            .skill_delivery
+                            .as_ref()
+                            .map(|d| d.deployment_hash.as_str())
+                            .unwrap_or("");
                         run_claude_turn(
                             ClaudeTurn {
                                 pool: &manager.claude_pool,
@@ -871,6 +1042,8 @@ impl AgentManager {
                                 cwd: &req.cwd,
                                 target: &target,
                                 prompt: &prompt,
+                                skill_args,
+                                skill_hash,
                                 gate: &manager.gate,
                                 events: &manager.events,
                             },
@@ -882,6 +1055,16 @@ impl AgentManager {
                         let images: Vec<String> =
                             files.iter().filter(|f| is_image_path(f)).cloned().collect();
                         let prompt = codex_prompt_with_attachments(&req.prompt, &files);
+                        let skill_roots = req
+                            .skill_delivery
+                            .as_ref()
+                            .map(|d| d.codex_extra_roots.as_slice())
+                            .unwrap_or(&[]);
+                        let skill_hash = req
+                            .skill_delivery
+                            .as_ref()
+                            .map(|d| d.deployment_hash.as_str())
+                            .unwrap_or("");
                         run_codex_turn(
                             CodexTurnRequest {
                                 pool: &manager.codex_pool,
@@ -894,6 +1077,8 @@ impl AgentManager {
                                 target: &target,
                                 prompt: &prompt,
                                 images: &images,
+                                skill_roots,
+                                skill_hash,
                                 gate: &manager.gate,
                                 events: &manager.events,
                             },
@@ -1108,11 +1293,25 @@ impl AgentManager {
         req: &PromptRequest,
         target: ExecTarget,
     ) -> Result<(Arc<AcpClient>, String, SharedModelState)> {
+        let wanted_skill_args = req
+            .skill_delivery
+            .as_ref()
+            .map(|d| d.extra_args.clone())
+            .unwrap_or_default();
+        let wanted_skill_env = req
+            .skill_delivery
+            .as_ref()
+            .map(|d| d.extra_env.clone())
+            .unwrap_or_default();
         {
             let existing = {
                 let guard = self.acp_sessions.lock().await;
                 guard.get(&req.session_id).and_then(|handle| {
-                    if handle.provider_id == req.provider.id && handle.target == target {
+                    if handle.provider_id == req.provider.id
+                        && handle.target == target
+                        && handle.skill_args == wanted_skill_args
+                        && handle.skill_env == wanted_skill_env
+                    {
                         Some((
                             handle.client.clone(),
                             handle.acp_session_id.clone(),
@@ -1158,14 +1357,27 @@ impl AgentManager {
                 if let Some(old) = self.acp_sessions.lock().await.remove(&req.session_id) {
                     old.client.shutdown().await;
                 }
+            } else if let Some(old) = self.acp_sessions.lock().await.remove(&req.session_id) {
+                // Provider, target, or skill delivery config changed; shut down
+                // the stale pooled process cleanly before spawning a new one.
+                old.client.shutdown().await;
+            }
+        }
+
+        let mut spawn_args = req.provider.args.clone();
+        let mut spawn_env = req.provider.env.clone();
+        if let Some(delivery) = &req.skill_delivery {
+            spawn_args.extend(delivery.extra_args.iter().cloned());
+            for (k, v) in &delivery.extra_env {
+                spawn_env.insert(k.clone(), v.clone());
             }
         }
 
         let (client, mut acp_rx) = AcpClient::spawn_with_policy(
             AcpClientConfig {
                 command: req.provider.command.clone(),
-                args: req.provider.args.clone(),
-                env: req.provider.env.clone(),
+                args: spawn_args,
+                env: spawn_env,
                 cwd: req.cwd.clone(),
                 // The approval mode is applied below, per prompt.
                 auto_approve: false,
@@ -1439,6 +1651,8 @@ impl AgentManager {
             AcpSessionHandle {
                 provider_id: req.provider.id.clone(),
                 target,
+                skill_args: wanted_skill_args,
+                skill_env: wanted_skill_env,
                 client: client.clone(),
                 acp_session_id: acp_session_id.clone(),
                 model_state: model_state.clone(),
@@ -1717,6 +1931,8 @@ mod tests {
             attachments: Vec::new(),
             exec: ExecPreference::Auto,
             mode: ApprovalMode::Ask,
+            skill_delivery: None,
+            skill_sync: None,
         };
         let apply = |req: PromptRequest| {
             let (mgr, client, sid, state) = (&mgr, &client, res.session_id.clone(), state.clone());
