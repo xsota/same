@@ -1,4 +1,5 @@
 mod approvals;
+mod skills;
 mod token_stats;
 mod usage;
 
@@ -170,6 +171,15 @@ enum UiAsyncMsg {
         target: String,
         result: Result<same_core::StatsReport, String>,
     },
+    ExternalSkillsDiscovered(Vec<same_core::ExternalSkill>),
+    SkillsSynced {
+        result: Result<usize, String>,
+        manual: bool,
+    },
+    SkillDraftGenerated {
+        request_id: u64,
+        result: Result<same_agent::GeneratedSkillDraft, String>,
+    },
 }
 
 enum UpdateState {
@@ -189,6 +199,7 @@ const MODELS_CACHE_FILE: &str = "models_cache.json";
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum MainView {
     Chat,
+    Skills,
     Usage,
     Settings,
 }
@@ -332,6 +343,11 @@ pub struct SameAppView {
     prompt_empty: bool,
     /// Files attached to the next prompt (host paths).
     attachments: Vec<PathBuf>,
+    /// Skills explicitly attached to the next prompt via the `+` menu.
+    selected_prompt_skills: Vec<skills::PromptSkillRef>,
+    /// Whether the searchable skill picker popover is open above the composer.
+    show_skill_picker: bool,
+    skill_picker_search: Entity<InputState>,
     /// Temp image files created by pasting into the current draft; deleted if
     /// removed or cleared before sending.
     pasted_attachments: HashSet<PathBuf>,
@@ -340,6 +356,8 @@ pub struct SameAppView {
     history_recall: Option<(usize, String)>,
     /// The prompt is a `/command` being typed: show suggestions.
     prompt_is_command: bool,
+    /// The prompt ends with a `$skill` token being typed: show skill suggestions.
+    prompt_is_skill_mention: bool,
     /// Virtualized chat feed: one item per stored message, plus a trailing
     /// item for the live reply / permission prompts / empty state. Only the
     /// items on screen are laid out, so long sessions stay cheap to render.
@@ -388,6 +406,8 @@ pub struct SameAppView {
     font_names: Vec<String>,
     /// The open font dropdown: `Some(false)` UI font, `Some(true)` code font.
     font_menu_open: Option<bool>,
+    // Skills Manager
+    skills_ui: skills::SkillsUiState,
     /// Virtualized rows of the font dropdown, one per `font_rows` entry.
     /// Shared by both pickers (only one is open at a time).
     font_list: ListState,
@@ -401,6 +421,7 @@ pub struct SameAppView {
 impl Drop for SameAppView {
     fn drop(&mut self) {
         self.clear_attachments();
+        self.selected_prompt_skills.clear();
     }
 }
 
@@ -621,6 +642,46 @@ impl SameAppView {
             }
         }));
 
+        let skills_ui = skills::SkillsUiState::new(
+            paths.data_dir.clone(),
+            storage.clone(),
+            events.clone(),
+            window,
+            cx,
+        );
+        subscriptions.push(cx.subscribe_in(
+            &skills_ui.editor_input,
+            window,
+            |this, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    let cur = this.skills_ui.editor_input.read(cx).value().to_string();
+                    this.skills_ui.editor_dirty = cur != this.skills_ui.editor_saved;
+                    cx.notify();
+                }
+            },
+        ));
+        let skill_picker_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("スキル名・説明でフィルタ...")
+        });
+        subscriptions.push(cx.subscribe_in(
+            &skill_picker_search,
+            window,
+            |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &skills_ui.search_input,
+            window,
+            |_, _, ev: &InputEvent, _, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
+
         let mut app = Self {
             rt,
             paths,
@@ -677,9 +738,13 @@ impl SameAppView {
             prompt_input,
             prompt_empty: true,
             attachments: Vec::new(),
+            selected_prompt_skills: Vec::new(),
+            show_skill_picker: false,
+            skill_picker_search,
             pasted_attachments: HashSet::new(),
             history_recall: None,
             prompt_is_command: false,
+            prompt_is_skill_mention: false,
             feed: {
                 let feed = ListState::new(0, ListAlignment::Top, px(1000.0));
                 feed.set_follow_mode(FollowMode::Tail);
@@ -721,6 +786,7 @@ impl SameAppView {
             font_names,
             font_menu_open: None,
             font_search,
+            skills_ui,
         };
 
         if app.config.migrated_auto_approve {
@@ -737,6 +803,8 @@ impl SameAppView {
         }
         app.apply_placeholders(window, cx);
         app.reload_project_state(window, cx);
+        app.reload_skills_state();
+        app.trigger_external_skill_discovery();
         app.refresh_provider_checks();
         app.check_for_updates(false);
         // Keeps the usage limits (title bar rings, dashboard) current.
@@ -920,6 +988,7 @@ impl SameAppView {
         if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
             self.commit_rename(cx);
             self.clear_attachments();
+        self.selected_prompt_skills.clear();
         }
         self.selected_session_id = Some(session_id);
         self.active_view = MainView::Chat;
@@ -989,6 +1058,7 @@ impl SameAppView {
             self.sessions.clear();
             self.selected_session_id = None;
             self.clear_attachments();
+        self.selected_prompt_skills.clear();
             self.messages.clear();
             self.file_entries.clear();
             self.git_info = GitInfo::default();
@@ -1022,6 +1092,7 @@ impl SameAppView {
         if !keep_selected {
             self.selected_session_id = self.sessions.first().map(|s| s.id.clone());
             self.clear_attachments();
+        self.selected_prompt_skills.clear();
         }
 
         self.expanded_dirs.clear();
@@ -1295,6 +1366,7 @@ impl SameAppView {
         if self.selected_session_id.as_deref() == Some(sid.as_str()) {
             self.selected_session_id = self.sessions.first().map(|x| x.id.clone());
             self.clear_attachments();
+        self.selected_prompt_skills.clear();
             if self.selected_session_id.is_none() {
                 // Always keep a session to type into.
                 self.reload_project_state(window, cx);
@@ -1309,6 +1381,7 @@ impl SameAppView {
         self.selected_quest_filter = None;
         self.selected_session_id = None;
         self.clear_attachments();
+        self.selected_prompt_skills.clear();
         self.opened_file_path = None;
         self.file_dirty = false;
         self.active_view = MainView::Chat;
@@ -1316,6 +1389,8 @@ impl SameAppView {
         self.file_filter_input
             .update(cx, |i, cx| i.set_value("", window, cx));
         self.reload_project_state(window, cx);
+        self.reload_skills_state();
+        self.trigger_external_skill_discovery();
         // Another project may run its agents somewhere else (e.g. WSL).
         self.refresh_provider_checks();
     }
@@ -1897,6 +1972,72 @@ impl SameAppView {
 
     fn handle_async_msg(&mut self, msg: UiAsyncMsg) {
         match msg {
+            UiAsyncMsg::ExternalSkillsDiscovered(found) => {
+                self.skills_ui.discovering = false;
+                self.skills_ui.external_skills = found;
+                self.recompute_skill_resolution();
+            }
+            UiAsyncMsg::SkillDraftGenerated { request_id, result } => {
+                if self.skills_ui.ai_request_id != request_id {
+                    return;
+                }
+                let lang = self.config.language;
+                self.skills_ui.ai_generating = false;
+                match result {
+                    Ok(draft) => {
+                        self.skills_ui.ai_error = None;
+                        self.skills_ui.pending_generated_draft = Some(draft);
+                        self.pending_notes.push((
+                            NoteKind::Success,
+                            t(
+                                lang,
+                                "AIがスキルの下書きを生成しました。内容を確認・編集して「作成」を押してください。",
+                                "AI generated a skill draft. Review or edit it, then click Create.",
+                            )
+                            .to_string(),
+                        ));
+                    }
+                    Err(err) => {
+                        self.skills_ui.ai_error = Some(err.clone());
+                        self.pending_notes.push((
+                            NoteKind::Error,
+                            match lang {
+                                Language::Ja => format!("AI生成に失敗しました: {err}"),
+                                Language::En => format!("AI generation failed: {err}"),
+                            },
+                        ));
+                    }
+                }
+            }
+            UiAsyncMsg::SkillsSynced { result, manual } => {
+                let lang = self.config.language;
+                self.skills_ui.syncing = false;
+                self.skills_ui.deployments = self
+                    .storage
+                    .list_skill_deployments(None)
+                    .unwrap_or_default();
+                match result {
+                    Ok(count) if manual => {
+                        self.pending_notes.push((
+                            NoteKind::Success,
+                            match lang {
+                                Language::Ja => format!("{count} 件のエージェントへスキルを同期しました"),
+                                Language::En => format!("Synced skills for {count} provider(s)"),
+                            },
+                        ));
+                    }
+                    Err(err) => {
+                        self.pending_notes.push((
+                            NoteKind::Error,
+                            match lang {
+                                Language::Ja => format!("スキル同期エラー: {err}"),
+                                Language::En => format!("Skill sync failed: {err}"),
+                            },
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             UiAsyncMsg::UpdateChecked { result, manual } => {
                 let lang = self.config.language;
                 match result {
@@ -2372,6 +2513,36 @@ impl SameAppView {
                 }
             }
             SameEvent::ProviderCapabilitiesUpdated { .. } => {}
+            SameEvent::SkillCreated { .. }
+            | SameEvent::SkillUpdated { .. }
+            | SameEvent::SkillDeleted { .. }
+            | SameEvent::SkillImported { .. }
+            | SameEvent::SkillEnabled { .. }
+            | SameEvent::SkillDisabled { .. }
+            | SameEvent::SkillAssignmentChanged { .. } => {
+                self.reload_skills_state();
+            }
+            SameEvent::SkillSyncStarted { .. } => {
+                self.skills_ui.syncing = true;
+            }
+            SameEvent::SkillSyncCompleted { .. } => {
+                self.skills_ui.syncing = false;
+                self.skills_ui.deployments = self
+                    .storage
+                    .list_skill_deployments(None)
+                    .unwrap_or_default();
+            }
+            SameEvent::SkillSyncFailed {
+                provider_id, error, ..
+            } => {
+                self.skills_ui.syncing = false;
+                self.logs
+                    .push(format!("[skills] sync failed for {provider_id}: {error}"));
+            }
+            SameEvent::SkillConflictDetected { skill_name, detail } => {
+                self.logs
+                    .push(format!("[skills] conflict on '{skill_name}': {detail}"));
+            }
         }
     }
 
@@ -2498,7 +2669,8 @@ impl SameAppView {
     fn send_current_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let lang = self.config.language;
         let text = self.prompt_input.read(cx).value().trim().to_string();
-        if text.is_empty() && self.attachments.is_empty() {
+        if text.is_empty() && self.attachments.is_empty() && self.selected_prompt_skills.is_empty()
+        {
             return;
         }
         // Local commands never reach the agent (and work while it runs).
@@ -2558,17 +2730,45 @@ impl SameAppView {
         });
         self.prompt_empty = true;
         self.prompt_is_command = false;
+        self.prompt_is_skill_mention = false;
         let attachments = std::mem::take(&mut self.attachments);
+        let picked_skills = std::mem::take(&mut self.selected_prompt_skills);
         self.pasted_attachments.clear();
         let attachment_names: Vec<String> =
             attachments.iter().map(|p| attachment_name(p)).collect();
+
+        // Combine skills picked from the `+` menu with any `$skill-name` mentions in text.
+        let mut explicit_skills = picked_skills.clone();
+        let available_skills = self.available_prompt_skills();
+        for mentioned_name in skills::extract_dollar_skill_names(&text) {
+            if let Some(found) = available_skills
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&mentioned_name))
+            {
+                if !explicit_skills.iter().any(|s| s.name == found.name) {
+                    explicit_skills.push(found.clone());
+                }
+            }
+        }
+        let picked_skill_names: Vec<String> = picked_skills.iter().map(|s| s.name.clone()).collect();
 
         if session.title == DEFAULT_SESSION_TITLE {
             let first_line = text
                 .lines()
                 .next()
                 .map(str::to_string)
-                .unwrap_or_else(|| attachment_names.join(", "));
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    if !picked_skill_names.is_empty() {
+                        picked_skill_names
+                            .iter()
+                            .map(|n| format!("${n}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    } else {
+                        attachment_names.join(", ")
+                    }
+                });
             let first_line = first_line.as_str();
             let mut new_title: String = first_line.chars().take(40).collect();
             if first_line.chars().count() > 40 {
@@ -2599,18 +2799,21 @@ impl SameAppView {
             role: MessageRole::User,
             // Attachments are noted in the stored text; the agent gets the
             // files themselves.
-            content: if attachment_names.is_empty() {
-                text.clone()
-            } else {
-                let list = attachment_names
+            content: {
+                let mut badges: Vec<String> = picked_skill_names
                     .iter()
-                    .map(|n| format!("📎 `{n}`"))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                if text.is_empty() {
-                    list
+                    .map(|n| format!("✦ `${n}`"))
+                    .collect();
+                badges.extend(attachment_names.iter().map(|n| format!("📎 `{n}`")));
+                if badges.is_empty() {
+                    text.clone()
                 } else {
-                    format!("{text}\n\n{list}")
+                    let list = badges.join("  ");
+                    if text.is_empty() {
+                        list
+                    } else {
+                        format!("{text}\n\n{list}")
+                    }
                 }
             },
             thinking: None,
@@ -2643,20 +2846,35 @@ impl SameAppView {
         }
 
         let mode = self.session_mode(&session);
+        let cwd = PathBuf::from(&project.workdir);
+        let exec = self.exec_pref();
+        let explicit_skill_pairs: Vec<(String, PathBuf)> = explicit_skills
+            .into_iter()
+            .map(|s| (s.name, s.skill_md_path))
+            .collect();
+
         self.live_drafts
             .insert(session.id.clone(), LiveDraft::default());
         self.scroll_feed_to_end();
+
         self.agent_manager.start_prompt(PromptRequest {
             session_id: session.id,
             external_session_id: session.external_session_id,
             provider,
             model,
             effort: session.effort.clone().filter(|e| !e.trim().is_empty()),
-            cwd: PathBuf::from(&project.workdir),
+            cwd,
             prompt: full_prompt,
             attachments,
-            exec: self.exec_pref(),
+            exec,
             mode,
+            skill_delivery: None,
+            skill_sync: Some(same_agent::PromptSkillSync {
+                synchronizer: self.skills_ui.synchronizer.clone(),
+                project_id: self.selected_project_id.clone(),
+                resolution: self.skills_ui.resolution.clone(),
+                explicit_skills: explicit_skill_pairs,
+            }),
         });
     }
 
@@ -2735,6 +2953,7 @@ impl SameAppView {
     fn set_prompt_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.prompt_empty = text.trim().is_empty();
         self.prompt_is_command = text.starts_with('/') && !text.contains('\n');
+        self.prompt_is_skill_mention = skills::detect_dollar_skill_token(&text).is_some();
         self.prompt_input.update(cx, |ta, cx| {
             ta.set_value(text, window, cx);
         });
@@ -3091,12 +3310,18 @@ impl SameAppView {
                 let value = state.read(cx).value();
                 let empty = value.trim().is_empty();
                 let is_command = value.starts_with('/') && !value.contains('\n');
-                // Suggestions filter on every keystroke while a command is
-                // typed, so notify for those too.
-                if empty != self.prompt_empty || is_command || is_command != self.prompt_is_command
+                let is_skill = skills::detect_dollar_skill_token(&value).is_some();
+                // Suggestions filter on every keystroke while a command or `$skill`
+                // token is typed, so notify for those too.
+                if empty != self.prompt_empty
+                    || is_command
+                    || is_command != self.prompt_is_command
+                    || is_skill
+                    || is_skill != self.prompt_is_skill_mention
                 {
                     self.prompt_empty = empty;
                     self.prompt_is_command = is_command;
+                    self.prompt_is_skill_mention = is_skill;
                     cx.notify();
                 }
             }
@@ -3203,6 +3428,25 @@ impl SameAppView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let lang = self.config.language;
+        let skills_button = title_icon_button(
+            "sidebar-skills",
+            IconName::BookOpen,
+            self.active_view == MainView::Skills,
+            &theme,
+        )
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(t(lang, "スキル管理", "Skills Manager"))
+                .build(window, cx)
+        })
+        .on_click(cx.listener(|this, _, _, cx| {
+            if this.active_view == MainView::Skills {
+                this.active_view = MainView::Chat;
+            } else {
+                this.open_skills_view();
+            }
+            cx.notify();
+        }));
+
         // The one way into the settings (and back out).
         let settings_button = title_icon_button(
             "sidebar-settings",
@@ -3252,6 +3496,7 @@ impl SameAppView {
                             .items_center()
                             .gap_1()
                             .child(settings_button)
+                            .child(skills_button)
                             .child(format!("SAME {}", updater::display_version())),
                     )
                     .when_some(
@@ -5769,6 +6014,31 @@ impl SameAppView {
                             .items_center()
                             .gap_1()
                             .flex_shrink_0()
+                            .child({
+                                let active_n = self.skills_ui.resolution.active_skills.len();
+                                let ext_n = self.skills_ui.external_skills.len();
+                                let label = if active_n > 0 {
+                                    format!("Skills ({active_n})")
+                                } else {
+                                    "Skills".to_string()
+                                };
+                                Button::new("chat-header-skills")
+                                    .xsmall()
+                                    .ghost()
+                                    .tooltip(match lang {
+                                        Language::Ja => format!(
+                                            "有効なスキル: {active_n} 件 / 外部スキル: {ext_n} 件（クリックで管理画面を開く）"
+                                        ),
+                                        Language::En => format!(
+                                            "Active skills: {active_n} / External: {ext_n} (click to manage)"
+                                        ),
+                                    })
+                                    .label(label)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_skills_view();
+                                        cx.notify();
+                                    }))
+                            })
                             // Where this project's agents run (Windows only: WSL or not).
                             .when(cfg!(windows), |el| {
                                 let mode = self.exec_mode();
@@ -6106,6 +6376,7 @@ impl SameAppView {
                 menu
             });
 
+        let plus_view = cx.entity().downgrade();
         let attach_button = Button::new("composer-attach")
             .small()
             .ghost()
@@ -6113,14 +6384,53 @@ impl SameAppView {
             .rounded(ButtonRounded::Size(px(999.0)))
             .tooltip(t(
                 lang,
-                "ファイルを添付 (ドラッグ＆ドロップでも追加できます)",
-                "Attach files (or drag and drop them here)",
+                "ファイルを追加・スキルを選択 ($スキル名 でも補完できます)",
+                "Attach files or select skills (or type $skill-name)",
             ))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.pick_attachments(window, cx);
-            }));
+            .dropdown_menu(move |mut menu, _, _| {
+                let v_file = plus_view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t(lang, "📎 ファイルを追加...", "📎 Attach files..."))
+                        .on_click(move |_, window, cx| {
+                            let _ = v_file.update(cx, |this, cx| {
+                                this.show_skill_picker = false;
+                                this.pick_attachments(window, cx);
+                                cx.notify();
+                            });
+                        }),
+                );
+                let v_skill = plus_view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t(lang, "✦ スキルを選択...", "✦ Select skills..."))
+                        .on_click(move |_, window, cx| {
+                            let _ = v_skill.update(cx, |this, cx| {
+                                this.show_skill_picker = true;
+                                this.skill_picker_search.update(cx, |i, cx| {
+                                    i.set_value("", window, cx);
+                                    i.focus(window, cx);
+                                });
+                                cx.notify();
+                            });
+                        }),
+                );
+                menu = menu.separator();
+                let v_mgr = plus_view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t(lang, "⚙ スキル管理を開く...", "⚙ Manage Skills..."))
+                        .on_click(move |_, _, cx| {
+                            let _ = v_mgr.update(cx, |this, cx| {
+                                this.show_skill_picker = false;
+                                this.open_skills_view();
+                                cx.notify();
+                            });
+                        }),
+                );
+                menu
+            });
 
-        let can_send = !self.prompt_empty || !self.attachments.is_empty();
+        let can_send = !self.prompt_empty
+            || !self.attachments.is_empty()
+            || !self.selected_prompt_skills.is_empty();
         let submit_hint = match self.config.submit_key {
             SubmitKey::Enter => "Enter",
             SubmitKey::ModEnter => {
@@ -6187,18 +6497,61 @@ impl SameAppView {
             )
     }
 
-    /// Chips for the files attached to the next prompt, each removable.
+    /// Chips for the skills and files attached to the next prompt, each removable.
     fn render_attachment_chips(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.attachments.is_empty() {
+        if self.attachments.is_empty() && self.selected_prompt_skills.is_empty() {
             return None;
         }
         let theme = cx.theme().clone();
         let lang = self.config.language;
+        let skill_chips: Vec<AnyElement> = self
+            .selected_prompt_skills
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| {
+                let desc = sk.description.clone();
+                div()
+                    .id(SharedString::from(format!("prompt-skill-chip-{i}")))
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .max_w(px(240.0))
+                    .pl_2()
+                    .pr_0p5()
+                    .py_0p5()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(accent().opacity(0.5))
+                    .bg(accent().opacity(0.12))
+                    .text_xs()
+                    .text_color(accent_text())
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(desc.clone()).build(window, cx)
+                    })
+                    .child(div().min_w_0().truncate().child(format!("✦ ${}", sk.name)))
+                    .child(
+                        Button::new(SharedString::from(format!("prompt-skill-rm-{i}")))
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::Close)
+                            .rounded(ButtonRounded::Size(px(999.0)))
+                            .tooltip(t(lang, "スキルを外す", "Remove skill"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if i < this.selected_prompt_skills.len() {
+                                    this.selected_prompt_skills.remove(i);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
         Some(
             div()
                 .h_flex()
                 .flex_wrap()
                 .gap_1p5()
+                .children(skill_chips)
                 .children(self.attachments.iter().enumerate().map(|(i, path)| {
                     let name = attachment_name(path);
                     let image = same_agent::adapters::is_image_path(&name);
@@ -6508,7 +6861,10 @@ impl SameAppView {
             .get(&session.provider_id)
             .is_some_and(|c| !c.available);
 
-        let suggestions = self.render_command_suggestions(&session, &slash_cmds, cx);
+        let suggestions = self
+            .render_skill_picker_popover(cx)
+            .or_else(|| self.render_command_suggestions(&session, &slash_cmds, cx))
+            .or_else(|| self.render_skill_suggestions(cx));
         let composer_bar = self.render_composer_bar(&session, running, cx);
         let attachment_chips = self.render_attachment_chips(cx);
         let paste_view = cx.entity();
@@ -7763,6 +8119,9 @@ impl SameAppView {
                     crumbs.push(p.name.clone());
                 }
             }
+            MainView::Skills => {
+                crumbs.push(t(lang, "スキル", "Skills").into());
+            }
             MainView::Usage => {
                 crumbs.push(t(lang, "使用量", "Usage").into());
             }
@@ -7926,6 +8285,7 @@ impl Render for SameAppView {
         if std::mem::take(&mut self.reload_open_file_pending) {
             self.reload_open_file_from_disk(window, cx);
         }
+        self.apply_pending_skill_draft(window, cx);
         self.ensure_input_fields(window, cx);
         // Take keyboard answers on a new card, unless the user is typing.
         if std::mem::take(&mut self.focus_approval) && self.active_view == MainView::Chat {
@@ -7959,7 +8319,10 @@ impl Render for SameAppView {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &SaveFile, _, cx| {
-                if this.opened_file_path.is_some() && this.file_dirty {
+                if this.active_view == MainView::Skills && this.skills_ui.editor_dirty {
+                    this.save_selected_skill(cx);
+                    cx.notify();
+                } else if this.opened_file_path.is_some() && this.file_dirty {
                     this.save_open_file(cx);
                     cx.notify();
                 }
@@ -7993,7 +8356,11 @@ impl Render for SameAppView {
                         .read(cx)
                         .focus_handle(cx)
                         .is_focused(window);
-                    if this.renaming_session_id.take().is_some()
+                    if this.show_skill_picker {
+                        this.show_skill_picker = false;
+                        this.prompt_input.update(cx, |ta, cx| ta.focus(window, cx));
+                        cx.notify();
+                    } else if this.renaming_session_id.take().is_some()
                         || this.font_menu_open.take().is_some()
                     {
                         cx.notify();
@@ -8022,6 +8389,7 @@ impl Render for SameAppView {
                     .child(self.render_sidebar(cx))
                     .child(match self.active_view {
                         MainView::Chat => self.render_chat_view(cx).into_any_element(),
+                        MainView::Skills => self.render_skills_view(cx).into_any_element(),
                         MainView::Usage => self.render_usage_view(cx).into_any_element(),
                         MainView::Settings => self.render_settings_view(cx).into_any_element(),
                     })
