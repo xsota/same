@@ -1,4 +1,6 @@
 mod approvals;
+mod token_stats;
+mod usage;
 
 use crate::i18n::t;
 use crate::theme::{
@@ -46,6 +48,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use approvals::{split_plan, PendingInput, PLAN_MARKER};
+use token_stats::StatsEntry;
+use usage::QuotaEntry;
 
 /// Removes the `📎 \`name\`` line that [`SameAppView::send_current_prompt`]
 /// appends to a stored prompt with attachments.
@@ -141,6 +145,21 @@ enum UiAsyncMsg {
         version: String,
         result: Result<(), String>,
     },
+    QuotaFetched {
+        provider_id: String,
+        /// The exec label of the project the fetch was started for.
+        context: String,
+        /// Where the agent ran.
+        target: String,
+        result: Result<same_core::QuotaReport, String>,
+    },
+    StatsFetched {
+        provider_id: String,
+        days: u32,
+        context: String,
+        target: String,
+        result: Result<same_core::StatsReport, String>,
+    },
 }
 
 enum UpdateState {
@@ -160,6 +179,7 @@ const MODELS_CACHE_FILE: &str = "models_cache.json";
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum MainView {
     Chat,
+    Usage,
     Settings,
 }
 
@@ -259,6 +279,18 @@ pub struct SameAppView {
     models_discovered: HashSet<(String, String)>,
     /// Providers with a model discovery in flight.
     models_discovering: HashSet<String>,
+    /// The last usage-limit fetch of each provider, by provider id.
+    quotas: HashMap<String, QuotaEntry>,
+    /// Providers with a usage-limit fetch in flight.
+    quotas_fetching: HashSet<String>,
+    /// The last token-history read of each provider, by provider id.
+    stats: HashMap<String, StatsEntry>,
+    /// Providers with a token-history read in flight.
+    stats_fetching: HashSet<String>,
+    /// The period of the token statistics, in days (1 = today).
+    stats_days: u32,
+    /// Count prompt-cache tokens in the token statistics.
+    stats_include_cache: bool,
     /// Per provider: the model its agent uses when none is picked.
     agent_default_model: HashMap<String, String>,
     /// The model an agent says a session is using, by session id.
@@ -594,6 +626,12 @@ impl SameAppView {
             agent_models,
             models_discovered: HashSet::new(),
             models_discovering: HashSet::new(),
+            quotas: HashMap::new(),
+            quotas_fetching: HashSet::new(),
+            stats: HashMap::new(),
+            stats_fetching: HashSet::new(),
+            stats_days: token_stats::DEFAULT_STATS_DAYS,
+            stats_include_cache: true,
             agent_default_model: HashMap::new(),
             agent_current_model: HashMap::new(),
             provider_checks: HashMap::new(),
@@ -672,6 +710,19 @@ impl SameAppView {
         app.reload_project_state(window, cx);
         app.refresh_provider_checks();
         app.check_for_updates(false);
+        // Keeps the usage limits (title bar rings, dashboard) current.
+        app.refresh_quotas(Duration::ZERO, None);
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(usage::QUOTA_TICK).await;
+            let alive = this.update(cx, |view, cx| {
+                view.tick_quotas();
+                cx.notify();
+            });
+            if alive.is_err() {
+                break;
+            }
+        })
+        .detach();
         app.prompt_input.update(cx, |s, cx| s.focus(window, cx));
         Ok(app)
     }
@@ -1806,6 +1857,19 @@ impl SameAppView {
                     self.provider_checks.insert(res.provider_id.clone(), res);
                 }
             }
+            UiAsyncMsg::QuotaFetched {
+                provider_id,
+                context,
+                target,
+                result,
+            } => self.on_quota_fetched(provider_id, context, target, result),
+            UiAsyncMsg::StatsFetched {
+                provider_id,
+                days,
+                context,
+                target,
+                result,
+            } => self.on_stats_fetched(provider_id, days, context, target, result),
             UiAsyncMsg::ModelsDiscovered {
                 provider_id,
                 target,
@@ -2114,6 +2178,7 @@ impl SameAppView {
             }
             SameEvent::SessionCompleted { session_id, .. } => {
                 self.finalize_live_draft(&session_id, SessionStatus::Completed, None);
+                self.refresh_quota_after_turn(&session_id);
             }
             SameEvent::SessionCancelled { session_id } => {
                 self.finalize_live_draft(&session_id, SessionStatus::Cancelled, None);
@@ -2963,6 +3028,25 @@ impl SameAppView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let lang = self.config.language;
+        // The one way into the settings (and back out).
+        let settings_button = title_icon_button(
+            "sidebar-settings",
+            IconName::Settings,
+            self.active_view == MainView::Settings,
+            &theme,
+        )
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(t(lang, "設定", "Settings")).build(window, cx)
+        })
+        .on_click(cx.listener(|this, _, _, cx| {
+            if this.active_view == MainView::Settings {
+                this.active_view = MainView::Chat;
+            } else {
+                let section = this.settings_section;
+                this.open_settings(section);
+            }
+            cx.notify();
+        }));
 
         div()
             .v_flex()
@@ -2974,38 +3058,6 @@ impl SameAppView {
             .border_color(theme.border)
             .p_3()
             .gap_2()
-            // Primary navigation: Chat vs Providers Connection Screen
-            .child(
-                div()
-                    .h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("nav-chat")
-                            .small()
-                            .flex_1()
-                            .when(self.active_view == MainView::Chat, |b| b.primary())
-                            .when(self.active_view != MainView::Chat, |b| b.ghost())
-                            .label(t(lang, "ワークスペース", "Workspace"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_view = MainView::Chat;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("nav-settings")
-                            .small()
-                            .flex_1()
-                            .when(self.active_view == MainView::Settings, |b| b.primary())
-                            .when(self.active_view != MainView::Settings, |b| b.ghost())
-                            .label(t(lang, "設定", "Settings"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let section = this.settings_section;
-                                this.open_settings(section);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(div().h(px(1.0)).bg(theme.border))
             .child(self.render_projects_section(cx))
             .child(div().h(px(1.0)).bg(theme.border))
             .child(self.render_quests_section(cx))
@@ -3017,10 +3069,16 @@ impl SameAppView {
                     .h_flex()
                     .items_center()
                     .justify_between()
-                    .px_1()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(format!("SAME {}", updater::display_version()))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(settings_button)
+                            .child(format!("SAME {}", updater::display_version())),
+                    )
                     .when_some(
                         match &self.update_state {
                             UpdateState::Available(info) => Some(format!("↑ v{}", info.version)),
@@ -7416,6 +7474,9 @@ impl SameAppView {
                     crumbs.push(p.name.clone());
                 }
             }
+            MainView::Usage => {
+                crumbs.push(t(lang, "使用量", "Usage").into());
+            }
             MainView::Settings => {
                 crumbs.push(t(lang, "設定", "Settings").into());
                 crumbs.push(self.settings_section.title(lang).into());
@@ -7491,6 +7552,10 @@ impl SameAppView {
                     .gap_0p5()
                     .pr_2()
                     .flex_shrink_0()
+                    .when_some(self.render_quota_rings(cx), |el, rings| {
+                        el.child(rings)
+                            .child(div().w(px(1.0)).h(px(16.0)).mx_1().bg(theme.border))
+                    })
                     .child(
                         title_icon_button("tb-lang", IconName::Globe, false, &theme)
                             .tooltip(move |window, cx| {
@@ -7537,27 +7602,6 @@ impl SameAppView {
                             cx.notify();
                         })),
                     )
-                    .child(
-                        title_icon_button(
-                            "tb-settings",
-                            IconName::Settings,
-                            self.active_view == MainView::Settings,
-                            &theme,
-                        )
-                        .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(t(lang, "設定", "Settings"))
-                                .build(window, cx)
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.active_view == MainView::Settings {
-                                this.active_view = MainView::Chat;
-                            } else {
-                                let section = this.settings_section;
-                                this.open_settings(section);
-                            }
-                            cx.notify();
-                        })),
-                    )
                     .when(self.active_view == MainView::Chat, |el| {
                         el.child(
                             title_icon_button(
@@ -7579,6 +7623,10 @@ impl SameAppView {
                                 cx.notify();
                             })),
                         )
+                    })
+                    // Keep its place elsewhere so the icons left of it don't move.
+                    .when(self.active_view != MainView::Chat, |el| {
+                        el.child(div().size(px(28.0)))
                     }),
             )
     }
@@ -7685,6 +7733,7 @@ impl Render for SameAppView {
                     .child(self.render_sidebar(cx))
                     .child(match self.active_view {
                         MainView::Chat => self.render_chat_view(cx).into_any_element(),
+                        MainView::Usage => self.render_usage_view(cx).into_any_element(),
                         MainView::Settings => self.render_settings_view(cx).into_any_element(),
                     })
                     .when(

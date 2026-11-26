@@ -356,3 +356,100 @@ pub struct ModelInfo {
     #[serde(default)]
     pub default_effort: Option<String>,
 }
+
+/// Which limit a [`QuotaWindow`] reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuotaWindowKind {
+    /// A rolling limit over the given number of minutes (e.g. 300 = 5 hours,
+    /// 10080 = 7 days).
+    Rolling { minutes: u32 },
+    /// A rolling limit that applies to one model family only (e.g. "Opus").
+    Model { minutes: u32, model: String },
+}
+
+/// One usage limit of a provider's plan, as the provider reported it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaWindow {
+    pub kind: QuotaWindowKind,
+    /// Share of the limit already used, 0–100.
+    pub used_percent: f64,
+    /// When the window resets, if the provider said.
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+/// A provider's usage and limits at one point in time. Only what the
+/// provider reported; nothing is estimated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaSnapshot {
+    /// The plan of the logged-in account (e.g. "pro", "plus").
+    pub plan: Option<String>,
+    pub windows: Vec<QuotaWindow>,
+    pub fetched_at: DateTime<Utc>,
+}
+
+/// Outcome of asking a provider for its quota.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum QuotaReport {
+    Available(QuotaSnapshot),
+    /// The provider cannot report its quota here (e.g. an ACP agent, API-key
+    /// auth, or a CLI too old to answer). The text says why.
+    Unavailable(String),
+}
+
+/// Token counts, split as the providers bill them. `output` includes
+/// reasoning / thinking tokens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenCounts {
+    /// Input tokens not read from the prompt cache.
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl TokenCounts {
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+
+    pub fn add(&mut self, other: &TokenCounts) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+    }
+
+    pub fn saturating_sub(&self, other: &TokenCounts) -> TokenCounts {
+        TokenCounts {
+            input: self.input.saturating_sub(other.input),
+            output: self.output.saturating_sub(other.output),
+            cache_read: self.cache_read.saturating_sub(other.cache_read),
+            cache_write: self.cache_write.saturating_sub(other.cache_write),
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// Tokens a provider used over the last days, from its local history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokenStats {
+    /// Every day of the period (local dates), oldest first.
+    pub days: Vec<(chrono::NaiveDate, TokenCounts)>,
+    /// Per model, most used first.
+    pub models: Vec<(String, TokenCounts)>,
+    pub total: TokenCounts,
+    /// Cost in USD, when the provider itself reports one (never estimated).
+    pub cost_usd: Option<f64>,
+    pub fetched_at: DateTime<Utc>,
+}
+
+/// Outcome of reading a provider's token history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum StatsReport {
+    Available(TokenStats),
+    /// No usable history for this provider. The text says why.
+    Unavailable(String),
+}

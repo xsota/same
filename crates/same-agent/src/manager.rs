@@ -403,6 +403,33 @@ impl AgentManager {
         (target.label(), res)
     }
 
+    /// Asks the provider's agent for the usage limits of its login. Returns
+    /// where it ran (e.g. "WSL: Ubuntu") with the report.
+    pub async fn fetch_quota(
+        &self,
+        provider: &ProviderConfig,
+        exec: ExecPreference,
+        cwd: &Path,
+    ) -> (String, Result<same_core::QuotaReport>) {
+        let target = resolve_target(exec, cwd).await;
+        let res = crate::quota::fetch_quota(provider, &target, cwd).await;
+        (target.label(), res)
+    }
+
+    /// Reads how many tokens the provider used in the last `days` days from
+    /// its local history. Returns where it was read (e.g. "WSL: Ubuntu").
+    pub async fn fetch_stats(
+        &self,
+        provider: &ProviderConfig,
+        exec: ExecPreference,
+        cwd: &Path,
+        days: u32,
+    ) -> (String, Result<same_core::StatsReport>) {
+        let target = resolve_target(exec, cwd).await;
+        let res = crate::stats::fetch_stats(provider, &target, cwd, days).await;
+        (target.label(), res)
+    }
+
     /// Remembers a fresh ACP session's model and effort as the agent's
     /// defaults (a new session never inherits another session's choice).
     async fn record_acp_defaults(&self, provider_id: &str, state: &AcpModelState) {

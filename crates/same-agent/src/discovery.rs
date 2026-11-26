@@ -90,7 +90,7 @@ async fn discover_acp(
 /// Spawns `provider.command` with `args` (after the provider's own args),
 /// writes `requests` as JSON lines, and returns the first stdout line for
 /// which `pick` returns `Some`.
-async fn json_lines_exchange<T>(
+pub(crate) async fn json_lines_exchange<T>(
     provider: &ProviderConfig,
     target: &ExecTarget,
     cwd: &Path,
