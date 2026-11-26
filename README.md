@@ -17,6 +17,7 @@ A lightweight, local-first, multi-provider AI agent desktop workspace written in
   - Custom ACP agents (configurable command, args, env, cwd)
 - **Structured Workspace**: Organize work into `Workspace -> Project -> Quest -> Session` (with quick sessions supported without forcing hierarchy).
 - **Streaming & Tool Visibility**: Real-time streaming responses, collapsible thinking/reasoning blocks, tool call cards, approval cards with diffs and keyboard answers for every provider, question and plan cards, OS notifications while in the background, and file/image attachments.
+- **Usage Dashboard**: Plan limits of Claude Code and Codex (5-hour and weekly windows, share used and left, time until reset) in one place, read from the CLIs without spending tokens.
 - **Local-First Storage**: All configuration (TOML) and conversation history (SQLite) are stored locally. Zero telemetry, no mandatory account.
 - **Built-in Workspace Tools**: File browser, file viewer/editor, and optional Git status/diff viewer for software development projects.
 - **Customizable & Bilingual UI**: Dark/Light themes, 6 accent color presets, configurable UI/monospace fonts and font size, configurable submit key, and Japanese/English UI support.
@@ -39,6 +40,26 @@ On Windows, agents run where the project lives. A project folder inside WSL (`\\
 | `1`–`9` / `N` or `Esc` | On an approval card (when it has the focus ring): pick that option / deny |
 | `1`–`9` / `Enter` / `Esc` | On a question card: pick an option / answer / skip |
 
+## Usage Dashboard
+
+The title bar shows a ring per Claude Code / Codex provider, filled to the limit closest to running out (amber at 80%, red at 95%). Hover a ring for its limits and reset times; click it for the **Usage** screen (click again to go back), which shows a bar per limit (5-hour, weekly, and any per-model limit), the share used and left, and the time until it resets.
+
+- Claude Code: the `get_usage` control request of `claude -p --input-format stream-json`.
+- Codex: `account/rateLimits/read` on `codex app-server`.
+- ACP agents: shown as unavailable (ACP has no way to ask). Logins without plan limits (e.g. API keys) are shown as unavailable too; SAME never estimates a number.
+
+No turn is run, so no tokens are spent. Limits are fetched at launch, every 10 minutes (every 5 while the Usage screen is open), after a turn of that provider ends (if older than a minute), and with **Refresh**. They belong to the CLI's login where the current project's agents run (Windows or WSL). Each fetch starts the CLI once, so its startup hooks (e.g. Claude Code `SessionStart` hooks) run too.
+
+### Token usage
+
+Below the limits, **Token usage** totals the tokens each CLI used today, over 7 days or over 30 days: per provider (split into input, output, cache read and cache write), per day (stacked bars) and per model. **Include cache** switches between all tokens and input + output only. The numbers come from the history each CLI keeps on the machine where the project's agents run, so use outside SAME counts too:
+
+- Claude Code: `~/.claude/projects/**/*.jsonl` (or `$CLAUDE_CONFIG_DIR`), deduplicated by message and request id.
+- Codex: `~/.codex/sessions/**/*.jsonl` (or `$CODEX_HOME`), deduplicated by response id.
+- OpenCode: `opencode stats --json`, which also reports a cost (shown as is; SAME estimates no cost).
+
+Antigravity keeps no history SAME can read.
+
 ## Picking the Agent and Model
 
 The row under the prompt has an agent picker, a model picker, and a reasoning effort picker (when supported by the selected model). Models are discovered dynamically from each provider (ACP `session/new`, Claude Code `initialize`, and Codex `app-server`). You can also type `/model <name>` (or `/model default`) in the prompt; typing `/` lists the commands, and `/model ` lists the models.
@@ -58,7 +79,7 @@ In plan mode the agent's questions (Claude Code's AskUserQuestion, Codex `reques
 
 The Claude Code and Codex CLIs run as one process per session that lives across turns (so "Allow for this session" grants last), and stop after 10 minutes unused; the next turn resumes the conversation.
 
-Double-click a session (in the sidebar or its title) to rename it. Delete buttons ask for a second click to confirm.
+Settings open from the ⚙ next to the version at the bottom of the sidebar (click again, or pick a session, to go back). Double-click a session (in the sidebar or its title) to rename it. Delete buttons ask for a second click to confirm.
 
 ## Architecture
 
