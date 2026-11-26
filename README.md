@@ -20,7 +20,7 @@ A lightweight, local-first, multi-provider AI agent desktop workspace written in
 - **Usage Dashboard**: Plan limits of Claude Code and Codex (5-hour and weekly windows, share used and left, time until reset) in one place, read from the CLIs without spending tokens.
 - **Local-First Storage**: All configuration (TOML) and conversation history (SQLite) are stored locally. Zero telemetry, no mandatory account.
 - **Built-in Workspace Tools**: File browser, file viewer/editor, and optional Git status/diff viewer for software development projects.
-- **Customizable & Bilingual UI**: Dark/Light themes, 6 accent color presets, configurable UI/monospace fonts and font size, configurable submit key, and Japanese/English UI support.
+- **Customizable & Bilingual UI**: 4 color themes (Ocean, Classic, Twilight, Sakura), each with dark and light variants, configurable UI/monospace fonts and font size, configurable submit key, and Japanese/English UI support.
 - **In-App Updates**: Built-in updater that checks GitHub Releases and updates in place (`same --version` / `-V` to print the installed version).
 
 ## Windows + WSL
