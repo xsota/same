@@ -91,7 +91,17 @@ impl AcpClient {
         config: AcpClientConfig,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpEvent>)> {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(config.auto_approve));
-        Self::spawn_with_policy(config, flag).await
+        Self::spawn_inner(config, flag, false).await
+    }
+
+    /// Spawns an ACP client restricted to read-only operations: does not
+    /// advertise `writeTextFile` or `terminal`, refuses any write/terminal RPC,
+    /// and denies permission requests.
+    pub async fn spawn_read_only(
+        config: AcpClientConfig,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<AcpEvent>)> {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Self::spawn_inner(config, flag, true).await
     }
 
     /// Spawns an ACP client whose permission policy is read live from
@@ -99,6 +109,14 @@ impl AcpClient {
     pub async fn spawn_with_policy(
         config: AcpClientConfig,
         auto_approve_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<AcpEvent>)> {
+        Self::spawn_inner(config, auto_approve_flag, false).await
+    }
+
+    async fn spawn_inner(
+        config: AcpClientConfig,
+        auto_approve_flag: Arc<std::sync::atomic::AtomicBool>,
+        read_only: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpEvent>)> {
         let mut cmd = build_command(
             &config.target,
@@ -242,6 +260,7 @@ impl AcpClient {
                                 &base_cwd,
                                 &target,
                                 auto_approve,
+                                read_only,
                                 terminals,
                                 event_tx,
                             )
@@ -289,9 +308,9 @@ impl AcpClient {
                     "clientCapabilities": {
                         "fs": {
                             "readTextFile": true,
-                            "writeTextFile": true
+                            "writeTextFile": !read_only
                         },
-                        "terminal": true
+                        "terminal": !read_only
                     },
                     "clientInfo": {
                         "name": "same",
@@ -521,15 +540,35 @@ async fn handle_agent_request(
     base_cwd: &Path,
     target: &ExecTarget,
     auto_approve: bool,
+    read_only: bool,
     terminals: Arc<Mutex<HashMap<String, ManagedTerminal>>>,
     event_tx: mpsc::UnboundedSender<AcpEvent>,
 ) -> JsonRpcResponse {
     let result = match method {
+        "session/request_permission" if read_only => Ok(json!({
+            "outcome": { "outcome": "cancelled" }
+        })),
         "session/request_permission" => {
             handle_permission_request(params, auto_approve, event_tx).await
         }
         "fs/read_text_file" => handle_read_text_file(params, base_cwd, target).await,
+        "fs/write_text_file" if read_only => Err((
+            -32601,
+            "fs/write_text_file is disabled in read-only mode".to_string(),
+        )),
         "fs/write_text_file" => handle_write_text_file(params, base_cwd, target).await,
+        "terminal/create"
+        | "terminal/output"
+        | "terminal/wait_for_exit"
+        | "terminal/kill"
+        | "terminal/release"
+            if read_only =>
+        {
+            Err((
+                -32601,
+                format!("{method} is disabled in read-only mode"),
+            ))
+        }
         "terminal/create" => handle_terminal_create(params, base_cwd, target, terminals).await,
         "terminal/output" => handle_terminal_output(params, terminals).await,
         "terminal/wait_for_exit" => handle_terminal_wait(params, terminals).await,
