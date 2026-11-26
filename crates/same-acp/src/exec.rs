@@ -604,6 +604,7 @@ fn create_private_temp_dir() -> std::io::Result<PathBuf> {
     for _ in 0..64 {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let dir = base.join(format!("same-setup-{pid}-{nanos:x}-{id}"));
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {

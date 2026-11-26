@@ -26,6 +26,11 @@ fn main() {
         embed_resource::compile(&out, embed_resource::NONE)
             .manifest_optional()
             .unwrap();
+        // Match macOS/Linux's 8 MiB main-thread stack on Windows MSVC (default
+        // is only 1 MiB, which unoptimized GPUI debug views can overflow).
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            println!("cargo:rustc-link-arg=/STACK:8388608");
+        }
     }
 }
 
