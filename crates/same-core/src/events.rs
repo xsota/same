@@ -88,6 +88,47 @@ pub enum SameEvent {
         provider_id: String,
         capabilities: ProviderCapabilities,
     },
+    SkillCreated {
+        skill_id: String,
+    },
+    SkillUpdated {
+        skill_id: String,
+    },
+    SkillDeleted {
+        skill_id: String,
+    },
+    SkillImported {
+        skill_id: String,
+    },
+    SkillEnabled {
+        skill_id: String,
+    },
+    SkillDisabled {
+        skill_id: String,
+    },
+    SkillAssignmentChanged {
+        skill_id: String,
+        project_id: String,
+        enabled: Option<bool>,
+    },
+    SkillSyncStarted {
+        provider_id: String,
+        project_id: Option<String>,
+    },
+    SkillSyncCompleted {
+        provider_id: String,
+        project_id: Option<String>,
+        synced_count: usize,
+    },
+    SkillSyncFailed {
+        provider_id: String,
+        project_id: Option<String>,
+        error: String,
+    },
+    SkillConflictDetected {
+        skill_name: String,
+        detail: String,
+    },
 }
 
 #[derive(Clone)]

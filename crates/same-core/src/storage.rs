@@ -2,6 +2,10 @@ use crate::models::{
     ApprovalMode, Message, MessageRole, Project, Quest, QuestStatus, Session, SessionStatus,
     ToolCallRecord, Workspace,
 };
+use crate::skills::{
+    Skill, SkillAssignment, SkillDeployment, SkillDeploymentMethod, SkillDeploymentStatus,
+    SkillScope, SkillSourceType,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -105,6 +109,48 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_quests_project ON quests(project_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS skills (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                scope TEXT NOT NULL,
+                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'manual',
+                source_uri TEXT,
+                source_ref TEXT,
+                source_revision TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                content_hash TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS skill_assignments (
+                skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+                project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                enabled INTEGER NOT NULL,
+                PRIMARY KEY (skill_id, project_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS skill_deployments (
+                skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+                provider_id TEXT NOT NULL,
+                project_id TEXT NOT NULL DEFAULT '',
+                execution_target TEXT NOT NULL,
+                deployment_path TEXT NOT NULL DEFAULT '',
+                deployment_method TEXT NOT NULL,
+                deployed_hash TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                last_error TEXT,
+                last_synced_at TEXT,
+                PRIMARY KEY (skill_id, provider_id, project_id, execution_target)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_skills_scope_project ON skills(scope, project_id);
+            CREATE INDEX IF NOT EXISTS idx_skill_assignments_project ON skill_assignments(project_id);
+            CREATE INDEX IF NOT EXISTS idx_skill_deployments_provider ON skill_deployments(provider_id, project_id);
             ",
         )?;
         // Columns added after the first release.
@@ -567,6 +613,266 @@ impl Storage {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
+
+    // ---- Skills persistence ----
+
+    pub fn insert_skill(&self, skill: &Skill) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO skills (
+                id, name, description, scope, project_id, path,
+                source_type, source_uri, source_ref, source_revision,
+                enabled, content_hash, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                skill.id,
+                skill.name,
+                skill.description,
+                skill.scope.as_str(),
+                skill.project_id,
+                skill.path,
+                skill.source_type.as_str(),
+                skill.source_uri,
+                skill.source_ref,
+                skill.source_revision,
+                skill.enabled as i64,
+                skill.content_hash,
+                skill.created_at.to_rfc3339(),
+                skill.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_skill(&self, skill: &Skill) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE skills SET
+                name = ?2,
+                description = ?3,
+                scope = ?4,
+                project_id = ?5,
+                path = ?6,
+                source_type = ?7,
+                source_uri = ?8,
+                source_ref = ?9,
+                source_revision = ?10,
+                enabled = ?11,
+                content_hash = ?12,
+                updated_at = ?13
+             WHERE id = ?1",
+            params![
+                skill.id,
+                skill.name,
+                skill.description,
+                skill.scope.as_str(),
+                skill.project_id,
+                skill.path,
+                skill.source_type.as_str(),
+                skill.source_uri,
+                skill.source_ref,
+                skill.source_revision,
+                skill.enabled as i64,
+                skill.content_hash,
+                skill.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_skill(&self, skill_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM skills WHERE id = ?1", params![skill_id])?;
+        Ok(())
+    }
+
+    pub fn get_skill(&self, skill_id: &str) -> Result<Option<Skill>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, description, scope, project_id, path,
+                    source_type, source_uri, source_ref, source_revision,
+                    enabled, content_hash, created_at, updated_at
+             FROM skills WHERE id = ?1",
+            params![skill_id],
+            row_to_skill,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_skills(&self) -> Result<Vec<Skill>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, description, scope, project_id, path,
+                    source_type, source_uri, source_ref, source_revision,
+                    enabled, content_hash, created_at, updated_at
+             FROM skills
+             ORDER BY scope ASC, name ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_skill)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_skill_assignment(&self, assignment: &SkillAssignment) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO skill_assignments (skill_id, project_id, enabled)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(skill_id, project_id) DO UPDATE SET enabled = excluded.enabled",
+            params![
+                assignment.skill_id,
+                assignment.project_id,
+                assignment.enabled as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_skill_assignment(&self, skill_id: &str, project_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM skill_assignments WHERE skill_id = ?1 AND project_id = ?2",
+            params![skill_id, project_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_skill_assignments(&self, project_id: &str) -> Result<Vec<SkillAssignment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT skill_id, project_id, enabled
+             FROM skill_assignments WHERE project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok(SkillAssignment {
+                skill_id: r.get(0)?,
+                project_id: r.get(1)?,
+                enabled: r.get::<_, i64>(2)? != 0,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_all_skill_assignments(&self) -> Result<Vec<SkillAssignment>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT skill_id, project_id, enabled FROM skill_assignments")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SkillAssignment {
+                skill_id: r.get(0)?,
+                project_id: r.get(1)?,
+                enabled: r.get::<_, i64>(2)? != 0,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_skill_deployment(&self, dep: &SkillDeployment) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO skill_deployments (
+                skill_id, provider_id, project_id, execution_target,
+                deployment_path, deployment_method, deployed_hash,
+                status, last_error, last_synced_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(skill_id, provider_id, project_id, execution_target) DO UPDATE SET
+                deployment_path = excluded.deployment_path,
+                deployment_method = excluded.deployment_method,
+                deployed_hash = excluded.deployed_hash,
+                status = excluded.status,
+                last_error = excluded.last_error,
+                last_synced_at = excluded.last_synced_at",
+            params![
+                dep.skill_id,
+                dep.provider_id,
+                dep.project_id,
+                dep.execution_target,
+                dep.deployment_path,
+                dep.deployment_method.as_str(),
+                dep.deployed_hash,
+                dep.status.as_str(),
+                dep.last_error,
+                dep.last_synced_at.map(|d| d.to_rfc3339()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_skill_deployments(&self, skill_id: Option<&str>) -> Result<Vec<SkillDeployment>> {
+        let conn = self.conn.lock().unwrap();
+        let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<SkillDeployment> {
+            Ok(SkillDeployment {
+                skill_id: r.get(0)?,
+                provider_id: r.get(1)?,
+                project_id: r.get(2)?,
+                execution_target: r.get(3)?,
+                deployment_path: r.get(4)?,
+                deployment_method: SkillDeploymentMethod::from_str(&r.get::<_, String>(5)?),
+                deployed_hash: r.get(6)?,
+                status: SkillDeploymentStatus::from_str(&r.get::<_, String>(7)?),
+                last_error: r.get(8)?,
+                last_synced_at: r.get::<_, Option<String>>(9)?.map(parse_dt),
+            })
+        };
+        if let Some(sid) = skill_id {
+            let mut stmt = conn.prepare(
+                "SELECT skill_id, provider_id, project_id, execution_target,
+                        deployment_path, deployment_method, deployed_hash,
+                        status, last_error, last_synced_at
+                 FROM skill_deployments WHERE skill_id = ?1
+                 ORDER BY provider_id ASC, execution_target ASC",
+            )?;
+            let rows = stmt.query_map(params![sid], map_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT skill_id, provider_id, project_id, execution_target,
+                        deployment_path, deployment_method, deployed_hash,
+                        status, last_error, last_synced_at
+                 FROM skill_deployments
+                 ORDER BY provider_id ASC, execution_target ASC",
+            )?;
+            let rows = stmt.query_map([], map_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        }
+    }
+
+    pub fn delete_skill_deployments_for_provider(
+        &self,
+        provider_id: &str,
+        project_id: &str,
+        execution_target: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM skill_deployments WHERE provider_id = ?1 AND project_id = ?2 AND execution_target = ?3",
+            params![provider_id, project_id, execution_target],
+        )?;
+        Ok(())
+    }
+}
+
+fn row_to_skill(r: &rusqlite::Row<'_>) -> rusqlite::Result<Skill> {
+    Ok(Skill {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        description: r.get(2)?,
+        scope: SkillScope::from_str(&r.get::<_, String>(3)?),
+        project_id: r.get(4)?,
+        path: r.get(5)?,
+        source_type: SkillSourceType::from_str(&r.get::<_, String>(6)?),
+        source_uri: r.get(7)?,
+        source_ref: r.get(8)?,
+        source_revision: r.get(9)?,
+        enabled: r.get::<_, i64>(10)? != 0,
+        content_hash: r.get(11)?,
+        created_at: parse_dt(r.get::<_, String>(12)?),
+        updated_at: parse_dt(r.get::<_, String>(13)?),
+    })
 }
 
 fn parse_dt(s: String) -> DateTime<Utc> {
