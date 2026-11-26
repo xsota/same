@@ -31,8 +31,8 @@ use gpui_component::{
     TitleBar, WindowExt as _,
 };
 use same_agent::{
-    exec as agent_exec, AgentManager, ExecPreference, PromptRequest, ProviderCheckResult,
-    ProviderSetup, SetupOutcome,
+    exec as agent_exec, AgentManager, ExecPreference, InteractiveLoginEvent,
+    InteractiveLoginHandle, PromptRequest, ProviderCheckResult, ProviderSetup, SetupOutcome,
 };
 use same_core::paths::simplify_path;
 use same_core::{
@@ -129,6 +129,16 @@ enum UiAsyncMsg {
     SetupDone {
         provider_id: String,
         result: Result<SetupOutcome, String>,
+    },
+    LoginOutput {
+        attempt_id: u64,
+        provider_id: String,
+        chunk: String,
+    },
+    LoginDone {
+        attempt_id: u64,
+        provider_id: String,
+        result: Result<String, String>,
     },
     ModelsDiscovered {
         provider_id: String,
@@ -303,6 +313,11 @@ pub struct SameAppView {
     login_results: HashMap<String, String>,
     /// Providers with an install/sign-in terminal currently open.
     setup_running: HashSet<String>,
+    /// Active in-app interactive login session (one at a time so the inline
+    /// code input always routes to the right process).
+    active_login: Option<(u64, String, InteractiveLoginHandle)>,
+    next_login_attempt_id: u64,
+    login_code_input: Entity<InputState>,
     expanded_thinking: HashSet<String>,
     expanded_tools: HashSet<String>,
     logs: Vec<String>,
@@ -481,6 +496,7 @@ impl SameAppView {
         let edit_provider_cmd = cx.new(|cx| InputState::new(window, cx));
         let edit_provider_args = cx.new(|cx| InputState::new(window, cx));
         let edit_provider_model = cx.new(|cx| InputState::new(window, cx));
+        let login_code_input = cx.new(|cx| InputState::new(window, cx));
 
         let custom_id = cx.new(|cx| InputState::new(window, cx));
         let custom_name = cx.new(|cx| InputState::new(window, cx));
@@ -546,6 +562,16 @@ impl SameAppView {
                 |this, _, ev: &InputEvent, window, cx| {
                     if matches!(ev, InputEvent::PressEnter { .. }) {
                         this.create_quest_from_form(window, cx);
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &login_code_input,
+                window,
+                |this, _, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. }) {
+                        this.submit_in_app_login_code(window, cx);
                         cx.notify();
                     }
                 },
@@ -639,6 +665,9 @@ impl SameAppView {
             connect_results: HashMap::new(),
             login_results: HashMap::new(),
             setup_running: HashSet::new(),
+            active_login: None,
+            next_login_attempt_id: 0,
+            login_code_input,
             expanded_thinking: HashSet::new(),
             expanded_tools: HashSet::new(),
             logs: vec![],
@@ -793,6 +822,16 @@ impl SameAppView {
         set_input(
             &self.edit_provider_model,
             t(lang, "未指定", "None"),
+            window,
+            cx,
+        );
+        set_input(
+            &self.login_code_input,
+            t(
+                lang,
+                "認証コード または リダイレクト先 URL を貼り付け",
+                "Paste authorization code or redirect URL",
+            ),
             window,
             cx,
         );
@@ -1704,7 +1743,7 @@ impl SameAppView {
     fn run_provider_setup(&mut self, provider: ProviderConfig, action: ProviderSetup) {
         let lang = self.config.language;
         let preview = self.setup_command_preview(&provider, action);
-        let opening = if cfg!(windows) {
+        let opening = if same_agent::exec::supports_console_window() {
             match lang {
                 Language::Ja => format!(
                     "{} のターミナルを開きました。画面の指示に従ってください:\n$ {preview}",
@@ -1735,6 +1774,93 @@ impl SameAppView {
                 result,
             });
         });
+    }
+
+    fn start_in_app_login(
+        &mut self,
+        provider: ProviderConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, prev_pid, prev)) = self.active_login.take() {
+            prev.cancel();
+            self.setup_running.remove(&prev_pid);
+        }
+        self.next_login_attempt_id = self.next_login_attempt_id.wrapping_add(1);
+        let attempt_id = self.next_login_attempt_id;
+        let preview = self.setup_command_preview(&provider, ProviderSetup::Login);
+        self.login_results
+            .insert(provider.id.clone(), format!("$ {preview}\n"));
+        self.setup_running.insert(provider.id.clone());
+        self.login_code_input.update(cx, |i, cx| {
+            i.set_value(String::new(), window, cx);
+        });
+
+        let pid = provider.id.clone();
+        let pid_ev = pid.clone();
+        let tx = self.ui_tx.clone();
+        let cwd = self.exec_cwd();
+        let pref = self.exec_pref();
+        let handle = self
+            .agent_manager
+            .start_in_app_login(provider, pref, cwd, move |ev| match ev {
+                InteractiveLoginEvent::Output(chunk) => {
+                    let _ = tx.send(UiAsyncMsg::LoginOutput {
+                        attempt_id,
+                        provider_id: pid_ev.clone(),
+                        chunk,
+                    });
+                }
+                InteractiveLoginEvent::Done(result) => {
+                    let _ = tx.send(UiAsyncMsg::LoginDone {
+                        attempt_id,
+                        provider_id: pid_ev.clone(),
+                        result,
+                    });
+                }
+            });
+        self.active_login = Some((attempt_id, pid, handle));
+    }
+
+    fn submit_in_app_login_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let code = self.login_code_input.read(cx).value().trim().to_string();
+        if code.is_empty() {
+            return;
+        }
+        if let Some((_, pid, handle)) = &self.active_login {
+            let pid = pid.clone();
+            if handle.send_line(code) {
+                self.login_code_input.update(cx, |i, cx| {
+                    i.set_value(String::new(), window, cx);
+                });
+                let note = t(
+                    self.config.language,
+                    "\n認証コードを送信しました。確認中…\n",
+                    "\nAuthorization code submitted. Verifying…\n",
+                );
+                self.login_results.entry(pid).or_default().push_str(note);
+            } else {
+                let note = t(
+                    self.config.language,
+                    "\n認証コードの送信に失敗しました（プロセスが標準入力を閉じています）。\n",
+                    "\nFailed to send authorization code (login process closed stdin).\n",
+                );
+                self.login_results.entry(pid).or_default().push_str(note);
+            }
+        }
+    }
+
+    fn cancel_in_app_login(&mut self, provider_id: &str) {
+        let matches = self
+            .active_login
+            .as_ref()
+            .is_some_and(|(_, pid, _)| pid == provider_id);
+        if matches {
+            if let Some((_, pid, handle)) = self.active_login.take() {
+                handle.cancel();
+                self.setup_running.remove(&pid);
+            }
+        }
     }
 
     fn check_for_updates(&mut self, manual: bool) {
@@ -1969,6 +2095,55 @@ impl SameAppView {
                     }
                 }
                 // Whatever was installed or signed in to, show the new state.
+                self.refresh_provider_checks();
+            }
+            UiAsyncMsg::LoginOutput {
+                attempt_id,
+                provider_id,
+                chunk,
+            } => {
+                if self
+                    .active_login
+                    .as_ref()
+                    .is_some_and(|(id, pid, _)| *id == attempt_id && pid == &provider_id)
+                {
+                    self.login_results
+                        .entry(provider_id)
+                        .or_default()
+                        .push_str(&chunk);
+                }
+            }
+            UiAsyncMsg::LoginDone {
+                attempt_id,
+                provider_id,
+                result,
+            } => {
+                let is_current = self
+                    .active_login
+                    .as_ref()
+                    .is_some_and(|(id, pid, _)| *id == attempt_id && pid == &provider_id);
+                if !is_current {
+                    return;
+                }
+                self.active_login = None;
+                self.setup_running.remove(&provider_id);
+                let lang = self.config.language;
+                match result {
+                    Ok(_) => {
+                        let entry = self.login_results.entry(provider_id).or_default();
+                        if !entry.ends_with('\n') && !entry.is_empty() {
+                            entry.push('\n');
+                        }
+                        entry.push_str(t(lang, "ログインが完了しました。", "Signed in successfully."));
+                    }
+                    Err(e) => {
+                        let entry = self.login_results.entry(provider_id).or_default();
+                        if !entry.ends_with('\n') && !entry.is_empty() {
+                            entry.push('\n');
+                        }
+                        entry.push_str(&format!("[{e}]"));
+                    }
+                }
                 self.refresh_provider_checks();
             }
             UiAsyncMsg::Event(ev) => self.handle_same_event(ev),
@@ -3994,15 +4169,76 @@ impl SameAppView {
             )
             // Login output if any
             .when_some(login_res.cloned(), |el, msg| {
+                let in_app_active = self
+                    .active_login
+                    .as_ref()
+                    .is_some_and(|(_, pid, _)| pid == &p.id);
+                let auth_url = in_app_active.then(|| extract_first_url(&msg)).flatten();
+                let pid_cancel = p.id.clone();
                 el.child(
                     div()
+                        .v_flex()
+                        .gap_2()
                         .text_xs()
                         .p_2()
                         .rounded(px(4.0))
                         .bg(theme.background)
                         .border_1()
                         .border_color(gpui::Hsla::from(accent()))
-                        .child(msg),
+                        .child(msg)
+                        .when_some(auth_url, |box_el, url| {
+                            box_el.child(
+                                div().h_flex().gap_2().child(
+                                    Button::new(SharedString::from(format!(
+                                        "open-login-url-{}",
+                                        p.id
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .label(t(lang, "ブラウザで開く", "Open in browser"))
+                                    .on_click(move |_, _, cx| cx.open_url(&url)),
+                                ),
+                            )
+                        })
+                        .when(in_app_active, |box_el| {
+                            box_el.child(
+                                div()
+                                    .h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .child(Input::new(&self.login_code_input).small()),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "submit-login-code-{}",
+                                            p.id
+                                        )))
+                                        .small()
+                                        .primary()
+                                        .label(t(lang, "送信", "Submit"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.submit_in_app_login_code(window, cx);
+                                            cx.notify();
+                                        })),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "cancel-login-code-{}",
+                                            p.id
+                                        )))
+                                        .small()
+                                        .ghost()
+                                        .label(t(lang, "キャンセル", "Cancel"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.cancel_in_app_login(&pid_cancel);
+                                            cx.notify();
+                                        })),
+                                    ),
+                            )
+                        }),
                 )
             })
             // Inline edit form when editing
@@ -4162,22 +4398,33 @@ impl SameAppView {
                                 })),
                         )
                     })
-                    .child(
+                    .child({
+                        let in_app_login = AgentManager::supports_in_app_login(p);
                         Button::new(SharedString::from(format!("login-{}", p.id)))
                             .small()
                             .ghost()
                             .disabled(setup_running)
                             .tooltip(login_preview)
                             .label(if setup_running {
-                                t(lang, "ターミナルで操作中…", "Waiting for terminal…")
+                                if in_app_login {
+                                    t(lang, "ログイン中…", "Signing in…")
+                                } else {
+                                    t(lang, "ターミナルで操作中…", "Waiting for terminal…")
+                                }
+                            } else if in_app_login {
+                                t(lang, "ログイン", "Sign in")
                             } else {
                                 t(lang, "ログイン (ターミナル)", "Sign in (terminal)")
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.run_provider_setup(p_login.clone(), ProviderSetup::Login);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if in_app_login {
+                                    this.start_in_app_login(p_login.clone(), window, cx);
+                                } else {
+                                    this.run_provider_setup(p_login.clone(), ProviderSetup::Login);
+                                }
                                 cx.notify();
-                            })),
-                    )
+                            }))
+                    })
                     .child(
                         Button::new(SharedString::from(format!("edit-{}", p.id)))
                             .small()
@@ -7807,9 +8054,30 @@ fn user_markdown(text: &str) -> String {
     out
 }
 
+/// Extracts the first `https://` or `http://` URL from CLI login output.
+fn extract_first_url(text: &str) -> Option<String> {
+    for token in text.split_whitespace() {
+        let cleaned = token.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | '"' | '\'' | ',' | ';'));
+        if cleaned.starts_with("https://") || cleaned.starts_with("http://") {
+            return Some(cleaned.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_first_url_finds_oauth_link() {
+        let out = "Open this link:\n\n  https://accounts.google.com/o/oauth2/auth?client_id=1&state=abc\n\nThen paste:";
+        assert_eq!(
+            extract_first_url(out).as_deref(),
+            Some("https://accounts.google.com/o/oauth2/auth?client_id=1&state=abc")
+        );
+        assert_eq!(extract_first_url("no link here"), None);
+    }
 
     #[test]
     fn strip_attachment_note_keeps_only_the_typed_text() {

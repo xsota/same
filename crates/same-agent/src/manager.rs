@@ -61,6 +61,69 @@ pub struct SetupOutcome {
     pub installed_command: Option<String>,
 }
 
+/// Live events from an in-app interactive login process (e.g. `agy acp --login`).
+#[derive(Debug, Clone)]
+pub enum InteractiveLoginEvent {
+    Output(String),
+    Done(Result<String, String>),
+}
+
+/// Controls a running in-app interactive login process.
+pub struct InteractiveLoginHandle {
+    stdin_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    cancel_tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl InteractiveLoginHandle {
+    /// Sends one line (e.g. an authorization code or redirect URL) to the
+    /// child process's standard input.
+    pub fn send_line(&self, line: String) -> bool {
+        self.stdin_tx.send(line).is_ok()
+    }
+
+    /// Terminates the running login process.
+    pub fn cancel(&self) {
+        if let Some(tx) = self.cancel_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Drains all complete UTF-8 sequences (and any invalid bytes) from `pending`,
+/// leaving only an incomplete trailing multi-byte UTF-8 sequence for the next
+/// read.
+fn drain_utf8_chunks(pending: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    let mut pos = 0;
+    while pos < pending.len() {
+        match std::str::from_utf8(&pending[pos..]) {
+            Ok(valid) => {
+                out.push_str(valid);
+                pos = pending.len();
+                break;
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                if valid_len > 0 {
+                    out.push_str(
+                        std::str::from_utf8(&pending[pos..pos + valid_len]).unwrap_or_default(),
+                    );
+                    pos += valid_len;
+                }
+                match err.error_len() {
+                    Some(invalid_len) => {
+                        out.push('\u{FFFD}');
+                        pos += invalid_len;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    pending.drain(..pos);
+    out
+}
+
 /// `C:\x\agy.exe` or `/usr/bin/agy` -> `agy`.
 fn command_name(command: &str) -> String {
     let base = command.rsplit(['/', '\\']).next().unwrap_or(command);
@@ -517,6 +580,153 @@ impl AgentManager {
         ConsoleScript::program(&provider.command, args)
     }
 
+    /// Whether this provider's sign-in can run inside SAME (piped stdin/stdout)
+    /// without opening an external terminal window.
+    pub fn supports_in_app_login(provider: &ProviderConfig) -> bool {
+        provider.id == "antigravity" || command_name(&provider.command) == "agy"
+    }
+
+    /// Runs a provider's interactive sign-in command inside SAME with piped
+    /// stdin/stdout/stderr, streaming output chunks and accepting lines (such
+    /// as an OAuth authorization code or redirect URL) via the returned handle.
+    pub fn start_in_app_login(
+        &self,
+        provider: ProviderConfig,
+        exec: ExecPreference,
+        cwd: PathBuf,
+        on_event: impl Fn(InteractiveLoginEvent) + Send + Sync + 'static,
+    ) -> InteractiveLoginHandle {
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+        let on_event = Arc::new(on_event);
+
+        self.runtime.spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let args: Vec<String> = match command_name(&provider.command).as_str() {
+                "claude" => vec!["auth".into(), "login".into()],
+                "codex" => vec!["login".into()],
+                "opencode" => vec!["auth".into(), "login".into()],
+                "agy" => vec!["acp".into(), "--login".into()],
+                _ => vec!["login".into()],
+            };
+
+            let target = resolve_target(exec, &cwd).await;
+            let mut cmd =
+                build_command(&target, &provider.command, &args, &cwd, &provider.env).await;
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    on_event(InteractiveLoginEvent::Done(Err(format!(
+                        "Failed to start {}: {e}",
+                        provider.command
+                    ))));
+                    return;
+                }
+            };
+
+            let mut stdin = child.stdin.take();
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            let writer = tokio::spawn(async move {
+                if let Some(mut stdin) = stdin.take() {
+                    while let Some(line) = stdin_rx.recv().await {
+                        let payload = format!("{}\n", line.trim());
+                        if stdin.write_all(payload.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        if stdin.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let out_cb = on_event.clone();
+            let mut out_reader = tokio::spawn(async move {
+                if let Some(mut r) = stdout {
+                    let mut buf = [0u8; 1024];
+                    let mut pending = Vec::new();
+                    while let Ok(n) = r.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        pending.extend_from_slice(&buf[..n]);
+                        let chunk = drain_utf8_chunks(&mut pending);
+                        if !chunk.is_empty() {
+                            out_cb(InteractiveLoginEvent::Output(chunk));
+                        }
+                    }
+                    if !pending.is_empty() {
+                        out_cb(InteractiveLoginEvent::Output(
+                            String::from_utf8_lossy(&pending).into_owned(),
+                        ));
+                    }
+                }
+            });
+
+            let err_cb = on_event.clone();
+            let mut err_reader = tokio::spawn(async move {
+                if let Some(mut r) = stderr {
+                    let mut buf = [0u8; 1024];
+                    let mut pending = Vec::new();
+                    while let Ok(n) = r.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        pending.extend_from_slice(&buf[..n]);
+                        let chunk = drain_utf8_chunks(&mut pending);
+                        if !chunk.is_empty() {
+                            err_cb(InteractiveLoginEvent::Output(chunk));
+                        }
+                    }
+                    if !pending.is_empty() {
+                        err_cb(InteractiveLoginEvent::Output(
+                            String::from_utf8_lossy(&pending).into_owned(),
+                        ));
+                    }
+                }
+            });
+
+            let outcome = tokio::select! {
+                res = child.wait() => {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        async {
+                            let _ = (&mut out_reader).await;
+                            let _ = (&mut err_reader).await;
+                        },
+                    ).await;
+                    match res {
+                        Ok(status) if status.success() => Ok("exit 0".to_string()),
+                        Ok(status) => Err(format!("exit {}", status.code().unwrap_or(-1))),
+                        Err(e) => Err(format!("Process error: {e}")),
+                    }
+                }
+                _ = &mut cancel_rx => {
+                    let _ = child.kill().await;
+                    Err("Cancelled".to_string())
+                }
+            };
+
+            writer.abort();
+            out_reader.abort();
+            err_reader.abort();
+            on_event(InteractiveLoginEvent::Done(outcome));
+        });
+
+        InteractiveLoginHandle {
+            stdin_tx,
+            cancel_tx: std::sync::Mutex::new(Some(cancel_tx)),
+        }
+    }
+
     /// Installs a provider's CLI or signs in to it, in a terminal window in
     /// the environment where the project's agents run (WSL or the host), so
     /// the user can follow along and answer prompts. Resolves when the
@@ -534,18 +744,26 @@ impl AgentManager {
             ProviderSetup::Login => Self::login_script(provider),
         };
         let target = resolve_target(exec, cwd).await;
-        let mut cmd = build_console_command(&target, cwd, &script, cfg!(windows)).await;
-        for (k, v) in &provider.env {
-            cmd.env(k, v);
-        }
-
         let message = if cfg!(windows) {
+            let mut cmd = build_console_command(&target, cwd, &script, true).await;
+            for (k, v) in &provider.env {
+                cmd.env(k, v);
+            }
             let status = cmd
                 .status()
                 .await
                 .with_context(|| format!("Failed to open a terminal for {}", target.label()))?;
             format!("Terminal closed (exit {})", status.code().unwrap_or(-1))
+        } else if cfg!(target_os = "macos") {
+            let code = exec::run_macos_console(cwd, &script, &provider.env, true)
+                .await
+                .with_context(|| format!("Failed to open a terminal for {}", target.label()))?;
+            format!("Terminal closed (exit {code})")
         } else {
+            let mut cmd = build_console_command(&target, cwd, &script, false).await;
+            for (k, v) in &provider.env {
+                cmd.env(k, v);
+            }
             // No terminal to open: run it and report what it printed.
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -1621,6 +1839,17 @@ mod tests {
         );
         assert!(AgentManager::install_script(&get("antigravity")).is_some());
         assert!(AgentManager::install_script(&get("claude")).is_none());
+        assert!(AgentManager::supports_in_app_login(&get("antigravity")));
+        assert!(!AgentManager::supports_in_app_login(&get("claude")));
+
+        // Multi-byte UTF-8 character split across two reads is preserved.
+        let bytes = "認証OK".as_bytes();
+        let mut pending = bytes[..4].to_vec(); // "認" (3 bytes) + 1st byte of "証"
+        assert_eq!(drain_utf8_chunks(&mut pending), "認");
+        assert_eq!(pending.len(), 1);
+        pending.extend_from_slice(&bytes[4..]);
+        assert_eq!(drain_utf8_chunks(&mut pending), "証OK");
+        assert!(pending.is_empty());
 
         let mut windows_agy = get("antigravity");
         windows_agy.id = "agy-win".into();
