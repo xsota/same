@@ -5655,7 +5655,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "same-acp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -5667,7 +5667,7 @@ dependencies = [
 
 [[package]]
 name = "same-agent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "same-acp",
@@ -5680,7 +5680,7 @@ dependencies = [
 
 [[package]]
 name = "same-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5708,7 +5708,7 @@ dependencies = [
 
 [[package]]
 name = "same-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
