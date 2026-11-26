@@ -10,10 +10,10 @@ use crate::workspace_fs::{load_git_info, scan_directory, FileEntry, GitInfo};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
     actions, div, list, prelude::FluentBuilder as _, px, AnyElement, App, AppContext, ClickEvent,
-    ClipboardItem, Context, Div, ElementId, Entity, ExternalPaths, FocusHandle, Focusable,
-    FollowMode, FontWeight, Hsla, InteractiveElement, IntoElement, KeyBinding, ListAlignment,
-    ListState, ParentElement, PathPromptOptions, Render, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Subscription, Window,
+    ClipboardEntry, ClipboardItem, Context, Div, ElementId, Entity, ExternalPaths, FocusHandle,
+    Focusable, FollowMode, FontWeight, Hsla, InteractiveElement, IntoElement, KeyBinding,
+    ListAlignment, ListState, ObjectFit, ParentElement, PathPromptOptions, Render, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonRounded, ButtonVariants as _};
 use gpui_component::input::{
@@ -285,6 +285,9 @@ pub struct SameAppView {
     prompt_empty: bool,
     /// Files attached to the next prompt (host paths).
     attachments: Vec<PathBuf>,
+    /// Temp image files created by pasting into the current draft; deleted if
+    /// removed or cleared before sending.
+    pasted_attachments: HashSet<PathBuf>,
     /// The earlier prompt recalled with Up: (index from the newest, its
     /// text). Browsing continues only while the input still shows it.
     history_recall: Option<(usize, String)>,
@@ -346,6 +349,12 @@ pub struct SameAppView {
     font_rows: Vec<Option<usize>>,
     /// Search box at the top of the font dropdown.
     font_search: Entity<InputState>,
+}
+
+impl Drop for SameAppView {
+    fn drop(&mut self) {
+        self.clear_attachments();
+    }
 }
 
 impl SameAppView {
@@ -601,6 +610,7 @@ impl SameAppView {
             prompt_input,
             prompt_empty: true,
             attachments: Vec::new(),
+            pasted_attachments: HashSet::new(),
             history_recall: None,
             prompt_is_command: false,
             feed: {
@@ -819,7 +829,7 @@ impl SameAppView {
     fn select_session(&mut self, session_id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
             self.commit_rename(cx);
-            self.attachments.clear();
+            self.clear_attachments();
         }
         self.selected_session_id = Some(session_id);
         self.active_view = MainView::Chat;
@@ -888,7 +898,7 @@ impl SameAppView {
             self.quests.clear();
             self.sessions.clear();
             self.selected_session_id = None;
-            self.attachments.clear();
+            self.clear_attachments();
             self.messages.clear();
             self.file_entries.clear();
             self.git_info = GitInfo::default();
@@ -921,7 +931,7 @@ impl SameAppView {
             .is_some_and(|id| self.sessions.iter().any(|s| s.id == id));
         if !keep_selected {
             self.selected_session_id = self.sessions.first().map(|s| s.id.clone());
-            self.attachments.clear();
+            self.clear_attachments();
         }
 
         self.expanded_dirs.clear();
@@ -1194,7 +1204,7 @@ impl SameAppView {
         self.sessions.retain(|x| x.id != sid);
         if self.selected_session_id.as_deref() == Some(sid.as_str()) {
             self.selected_session_id = self.sessions.first().map(|x| x.id.clone());
-            self.attachments.clear();
+            self.clear_attachments();
             if self.selected_session_id.is_none() {
                 // Always keep a session to type into.
                 self.reload_project_state(window, cx);
@@ -1208,7 +1218,7 @@ impl SameAppView {
         self.selected_project_id = Some(pid);
         self.selected_quest_filter = None;
         self.selected_session_id = None;
-        self.attachments.clear();
+        self.clear_attachments();
         self.opened_file_path = None;
         self.file_dirty = false;
         self.active_view = MainView::Chat;
@@ -2309,6 +2319,7 @@ impl SameAppView {
         self.prompt_empty = true;
         self.prompt_is_command = false;
         let attachments = std::mem::take(&mut self.attachments);
+        self.pasted_attachments.clear();
         let attachment_names: Vec<String> =
             attachments.iter().map(|p| attachment_name(p)).collect();
 
@@ -2529,6 +2540,104 @@ impl SameAppView {
                 self.attachments.push(p);
             }
         }
+    }
+
+    /// Drops all pending attachments and deletes any unsent pasted-image
+    /// copies created by SAME.
+    fn clear_attachments(&mut self) {
+        for path in std::mem::take(&mut self.attachments) {
+            self.cleanup_pasted_attachment(&path);
+        }
+    }
+
+    /// Removes a pasted image file created for the current draft. User-selected
+    /// files and previously sent files are never touched.
+    fn cleanup_pasted_attachment(&mut self, path: &Path) {
+        if self.pasted_attachments.remove(path) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Handles a paste into the composer: images (screenshots, copied image
+    /// data) and files copied in a file manager become attachments instead of
+    /// text. A paste that also carries unrelated text still inserts that text.
+    /// Returns whether the paste was fully consumed.
+    fn handle_paste(&mut self, item: &ClipboardItem) -> bool {
+        let mut paths = Vec::new();
+        let mut copied_files = Vec::new();
+        let mut texts = Vec::new();
+        let mut failed_image = false;
+        for entry in &item.entries {
+            match entry {
+                ClipboardEntry::Image(image) => match self.save_pasted_image(image) {
+                    Some(path) => {
+                        self.pasted_attachments.insert(path.clone());
+                        paths.push(path);
+                    }
+                    None => failed_image = true,
+                },
+                ClipboardEntry::ExternalPaths(external) => {
+                    for p in external.paths() {
+                        if p.is_file() {
+                            copied_files.push(p.clone());
+                            paths.push(p.clone());
+                        }
+                    }
+                }
+                ClipboardEntry::String(text) if !text.text.is_empty() => {
+                    texts.push(text.text.as_str());
+                }
+                ClipboardEntry::String(_) => {}
+            }
+        }
+        if failed_image {
+            let lang = self.config.language;
+            self.note(
+                NoteKind::Warning,
+                t(
+                    lang,
+                    "貼り付けた画像を保存できませんでした",
+                    "Could not save the pasted image",
+                ),
+            );
+        }
+        if paths.is_empty() {
+            return false;
+        }
+        self.add_attachments(paths);
+        // Copied files also carry their names/paths as text (e.g. Finder);
+        // suppress only that companion text, keeping unrelated clipboard text.
+        if texts.is_empty() {
+            return true;
+        }
+        !copied_files.is_empty()
+            && texts.iter().all(|text| {
+                text.lines().all(|line| {
+                    let trimmed = line.trim();
+                    trimmed.is_empty()
+                        || copied_files.iter().any(|p| {
+                            p.to_str() == Some(trimmed)
+                                || p.file_name().and_then(|n| n.to_str()) == Some(trimmed)
+                        })
+                })
+            })
+    }
+
+    /// Writes a clipboard image into the app's data directory so the agent
+    /// can read it as a normal file attachment.
+    fn save_pasted_image(&self, image: &gpui::Image) -> Option<PathBuf> {
+        let ext = image.format.extension();
+        if !same_agent::adapters::is_image_path(&format!("image.{ext}")) {
+            return None;
+        }
+        let dir = self.paths.data_dir.join("attachments");
+        std::fs::create_dir_all(&dir).ok()?;
+        let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+        let unique = Uuid::new_v4().simple().to_string();
+        let name = format!("pasted-{stamp}-{}.{ext}", &unique[..8]);
+        let path = dir.join(name);
+        std::fs::write(&path, &image.bytes).ok()?;
+        Some(path)
     }
 
     fn cancel_current(&mut self) {
@@ -5745,14 +5854,40 @@ impl SameAppView {
                 .children(self.attachments.iter().enumerate().map(|(i, path)| {
                     let name = attachment_name(path);
                     let image = same_agent::adapters::is_image_path(&name);
+                    let label = if image && self.pasted_attachments.contains(path) {
+                        t(lang, "貼り付けた画像", "Pasted image").to_string()
+                    } else {
+                        name.clone()
+                    };
                     let full = path.to_string_lossy().to_string();
+                    let tip_path = path.clone();
+                    let leading = if image {
+                        // A thumbnail, so an attached image is recognizable
+                        // without opening its (possibly generated) name.
+                        div()
+                            .size(px(30.0))
+                            .flex_shrink_0()
+                            .rounded_md()
+                            .overflow_hidden()
+                            .child(
+                                gpui::img(path.clone())
+                                    .size_full()
+                                    .object_fit(ObjectFit::Cover),
+                            )
+                            .into_any_element()
+                    } else {
+                        Icon::new(IconName::File)
+                            .xsmall()
+                            .text_color(theme.muted_foreground)
+                            .into_any_element()
+                    };
                     div()
                         .id(SharedString::from(format!("attachment-{i}")))
                         .h_flex()
                         .items_center()
                         .gap_1p5()
                         .max_w(px(240.0))
-                        .pl_2()
+                        .pl_1()
                         .pr_0p5()
                         .py_0p5()
                         .rounded_lg()
@@ -5761,18 +5896,30 @@ impl SameAppView {
                         .bg(theme.muted)
                         .text_xs()
                         .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(full.clone()).build(window, cx)
-                        })
-                        .child(
-                            Icon::new(if image {
-                                IconName::GalleryVerticalEnd
+                            if image {
+                                let p = tip_path.clone();
+                                let full = full.clone();
+                                gpui_component::tooltip::Tooltip::element(move |_, _| {
+                                    div()
+                                        .v_flex()
+                                        .gap_1()
+                                        .max_w(px(360.0))
+                                        .child(
+                                            gpui::img(p.clone())
+                                                .max_w(px(360.0))
+                                                .max_h(px(260.0))
+                                                .object_fit(ObjectFit::Contain),
+                                        )
+                                        .child(div().text_xs().child(full.clone()))
+                                })
+                                .build(window, cx)
                             } else {
-                                IconName::File
-                            })
-                            .xsmall()
-                            .text_color(theme.muted_foreground),
-                        )
-                        .child(div().min_w_0().truncate().child(name))
+                                gpui_component::tooltip::Tooltip::new(full.clone())
+                                    .build(window, cx)
+                            }
+                        })
+                        .child(leading)
+                        .child(div().min_w_0().truncate().child(label))
                         .child(
                             Button::new(SharedString::from(format!("attachment-remove-{i}")))
                                 .xsmall()
@@ -5782,7 +5929,8 @@ impl SameAppView {
                                 .tooltip(t(lang, "添付を外す", "Remove"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if i < this.attachments.len() {
-                                        this.attachments.remove(i);
+                                        let removed = this.attachments.remove(i);
+                                        this.cleanup_pasted_attachment(&removed);
                                     }
                                     cx.notify();
                                 })),
@@ -6015,6 +6163,7 @@ impl SameAppView {
         let suggestions = self.render_command_suggestions(&session, &slash_cmds, cx);
         let composer_bar = self.render_composer_bar(&session, running, cx);
         let attachment_chips = self.render_attachment_chips(cx);
+        let paste_view = cx.entity();
 
         div()
             .v_flex()
@@ -6174,7 +6323,17 @@ impl SameAppView {
                                                 }
                                             },
                                         ))
-                                        .child(Textarea::new(&self.prompt_input).appearance(false)),
+                                        .child(
+                                            Textarea::new(&self.prompt_input)
+                                                .appearance(false)
+                                                .on_paste(move |item, _window, cx| {
+                                                    paste_view.update(cx, |this, cx| {
+                                                        let consumed = this.handle_paste(item);
+                                                        cx.notify();
+                                                        consumed
+                                                    })
+                                                }),
+                                        ),
                                 )
                                 .child(composer_bar),
                         ),
