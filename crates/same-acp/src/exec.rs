@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tokio::process::Command;
 
@@ -312,6 +313,13 @@ pub async fn build_command(
         ExecTarget::Host => {
             let mut cmd = Command::new(program);
             cmd.args(args).current_dir(cwd);
+            if cfg!(unix) && !env.contains_key("PATH") {
+                if let Some(login_path) = host_login_path().await {
+                    let inherited = std::env::var("PATH").unwrap_or_default();
+                    let merged = merge_unix_paths(&inherited, &login_path);
+                    cmd.env("PATH", merged);
+                }
+            }
             for (k, v) in env {
                 cmd.env(k, v);
             }
@@ -492,10 +500,302 @@ fn new_console(cmd: &mut Command) {
     let _ = cmd;
 }
 
+/// Whether this platform can open a visible interactive terminal window for
+/// provider setup (install / sign-in).
+pub const fn supports_console_window() -> bool {
+    cfg!(any(windows, target_os = "macos"))
+}
+
+/// Builds the contents of a macOS `.command` shell script that runs `script`
+/// inside an interactive login shell, publishes its exit code to `done_path`
+/// as soon as the command finishes (before any keep-open prompt), and removes
+/// `script_path` on exit.
+fn macos_command_script(
+    cwd: &Path,
+    script: &ConsoleScript,
+    env: &BTreeMap<String, String>,
+    script_path: &Path,
+    done_path: &Path,
+    pid_path: &Path,
+    keep_open: bool,
+) -> String {
+    let mut done_tmp = done_path.as_os_str().to_os_string();
+    done_tmp.push(".tmp");
+    let done_tmp_q = sh_quote(&done_tmp.to_string_lossy());
+    let done_q = sh_quote(&done_path.to_string_lossy());
+    let pid_q = sh_quote(&pid_path.to_string_lossy());
+    let script_q = sh_quote(&script_path.to_string_lossy());
+    let cwd_q = sh_quote(&cwd.to_string_lossy());
+    let cmd_q = sh_quote(&script.unix);
+
+    let mut out = String::new();
+    out.push_str("#!/bin/sh\n");
+    out.push_str("status=1\n");
+    out.push_str("done_written=0\n");
+    out.push_str(&format!("printf '%s\\n' \"$$\" > {pid_q} 2>/dev/null || true\n"));
+    out.push_str("write_done() {\n");
+    out.push_str("  if [ \"$done_written\" -eq 0 ]; then\n");
+    out.push_str("    done_written=1\n");
+    out.push_str(&format!(
+        "    printf '%s\\n' \"$status\" > {done_tmp_q} 2>/dev/null && mv -f {done_tmp_q} {done_q} 2>/dev/null || true\n"
+    ));
+    out.push_str("  fi\n");
+    out.push_str("}\n");
+    out.push_str("cleanup() {\n");
+    out.push_str("  write_done\n");
+    out.push_str(&format!("  rm -f {script_q}\n"));
+    out.push_str("}\n");
+    out.push_str("trap cleanup EXIT\n");
+    out.push_str("trap 'status=130; exit 130' INT\n");
+    out.push_str("trap 'status=129; exit 129' HUP\n");
+    out.push_str("trap 'status=143; exit 143' TERM\n");
+    out.push_str(&format!(
+        "cd {cwd_q}\nstatus=$?\nif [ \"$status\" -ne 0 ]; then\n  write_done\n"
+    ));
+    if keep_open {
+        out.push_str("  echo\n");
+        out.push_str("  printf '[exit %s] Press Enter to close... ' \"$status\"\n");
+        out.push_str("  read -r _\n");
+    }
+    out.push_str("  exit \"$status\"\n");
+    out.push_str("fi\n");
+    out.push_str("status=1\n");
+    for (k, v) in env {
+        if !k.is_empty()
+            && !k.as_bytes()[0].is_ascii_digit()
+            && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            out.push_str(&format!("export {k}={}\n", sh_quote(v)));
+        }
+    }
+    out.push_str("case \"${SHELL:-}\" in\n");
+    out.push_str("  */zsh|*/bash) _same_shell=\"$SHELL\" ;;\n");
+    out.push_str("  *)\n");
+    out.push_str("    if [ -x /bin/zsh ]; then\n");
+    out.push_str("      _same_shell=\"/bin/zsh\"\n");
+    out.push_str("    else\n");
+    out.push_str("      _same_shell=\"/bin/sh\"\n");
+    out.push_str("    fi\n");
+    out.push_str("    ;;\n");
+    out.push_str("esac\n");
+    out.push_str(&format!("\"$_same_shell\" -lic {cmd_q}\n"));
+    out.push_str("status=$?\n");
+    out.push_str("write_done\n");
+    if keep_open {
+        out.push_str("echo\n");
+        out.push_str("printf '[exit %s] Press Enter to close... ' \"$status\"\n");
+        out.push_str("read -r _\n");
+    }
+    out
+}
+
+/// Creates a fresh private temporary directory (`0700` on Unix) so setup
+/// scripts and status files cannot collide with or follow symlinks in a shared
+/// `TMPDIR`.
+fn create_private_temp_dir() -> std::io::Result<PathBuf> {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let base = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    for _ in 0..64 {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(format!("same-setup-{pid}-{nanos:x}-{id}"));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "Failed to allocate private temp directory",
+    ))
+}
+
+/// Opens macOS Terminal.app with an executable `.command` script so the user
+/// can interact with login/install prompts, and waits until the command exits
+/// (or the window is closed).
+pub async fn run_macos_console(
+    cwd: &Path,
+    script: &ConsoleScript,
+    env: &BTreeMap<String, String>,
+    keep_open: bool,
+) -> std::io::Result<i32> {
+    let dir = create_private_temp_dir()?;
+    let script_path = dir.join("setup.command");
+    let done_path = dir.join("setup.done");
+    let pid_path = dir.join("setup.pid");
+
+    let contents = macos_command_script(
+        cwd,
+        script,
+        env,
+        &script_path,
+        &done_path,
+        &pid_path,
+        keep_open,
+    );
+    if let Err(e) = write_executable_script(&script_path, &contents) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
+
+    let open_out = Command::new("open")
+        .args(["-a", "Terminal"])
+        .arg(&script_path)
+        .stdin(Stdio::null())
+        .output()
+        .await;
+    match open_out {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(std::io::Error::other(if stderr.is_empty() {
+                format!("open -a Terminal exited with {}", out.status)
+            } else {
+                stderr
+            }));
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&done_path) {
+            let _ = std::fs::remove_dir_all(&dir);
+            let code = text.trim().parse::<i32>().unwrap_or(-1);
+            return Ok(code);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if let Ok(pid_text) = std::fs::read_to_string(&pid_path) {
+                if let Ok(pid) = pid_text.trim().parse::<u32>() {
+                    // Signal both direct children (which may have their own
+                    // job-control process group) and the wrapper's process group.
+                    let pid_str = pid.to_string();
+                    let _ = Command::new("pkill")
+                        .args(["-TERM", "-P", &pid_str])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .await;
+                    let _ = Command::new("kill")
+                        .args(["-TERM", "--", &format!("-{pid}")])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .await;
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Timed out waiting for Terminal",
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+fn write_executable_script(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o700);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+/// Appends directories from `extra` to `inherited` without duplicating entries
+/// or overriding the precedence of `inherited`.
+fn merge_unix_paths(inherited: &str, extra: &str) -> String {
+    let mut parts: Vec<&str> = inherited.split(':').filter(|p| !p.is_empty()).collect();
+    for dir in extra.split(':').filter(|p| !p.is_empty()) {
+        if !parts.contains(&dir) {
+            parts.push(dir);
+        }
+    }
+    parts.join(":")
+}
+
+fn host_path_cache() -> &'static Mutex<Option<Option<String>>> {
+    static CACHE: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn host_path_probe_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Resolves `PATH` from the user's login + interactive shell on a Unix host
+/// (so tools added in `~/.zshrc`, `~/.bashrc`, or fish config are found even
+/// when the GUI app did not inherit that `PATH`). Single-flight and cached
+/// until [`clear_path_cache`].
+pub async fn host_login_path() -> Option<String> {
+    if !cfg!(unix) {
+        return None;
+    }
+    if let Some(cached) = host_path_cache().lock().unwrap().as_ref() {
+        return cached.clone();
+    }
+    let _guard = host_path_probe_lock().lock().await;
+    if let Some(cached) = host_path_cache().lock().unwrap().as_ref() {
+        return cached.clone();
+    }
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty() && Path::new(s).is_absolute())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    // `printenv PATH` prints the colon-separated PATH in POSIX shells and fish alike.
+    let probe = format!("printf '\\n{ENV_MARKER}\\n'; printenv PATH");
+    let fut = Command::new(&shell)
+        .args(["-lic", &probe])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let path = match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+        Ok(Ok(out)) => {
+            let marker = format!("\n{ENV_MARKER}\n");
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.find(&marker).and_then(|pos| {
+                let rest = &text[pos + marker.len()..];
+                let line = rest.lines().next()?.trim();
+                (!line.is_empty()).then(|| line.to_string())
+            })
+        }
+        _ => None,
+    };
+    *host_path_cache().lock().unwrap() = Some(path.clone());
+    path
+}
+
 /// Forgets cached login-shell environments, e.g. after installing a CLI whose
 /// installer added a directory to the shell profile.
 pub fn clear_path_cache() {
     path_cache().lock().unwrap().clear();
+    *host_path_cache().lock().unwrap() = None;
 }
 
 #[cfg(test)]
@@ -528,6 +828,66 @@ mod tests {
         assert_eq!(s.windows, r"& 'C:\Users\a b\agy.exe' 'it''s'");
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
         assert_eq!(sh_quote(""), "''");
+    }
+
+    #[test]
+    fn builds_macos_command_script() {
+        let script = ConsoleScript::program("agy", &["acp", "--login"]);
+        let mut env = BTreeMap::new();
+        env.insert("VALID_KEY".to_string(), "a'b c".to_string());
+        env.insert("BAD-KEY".to_string(), "ignored".to_string());
+        let text = macos_command_script(
+            Path::new("/tmp/my proj"),
+            &script,
+            &env,
+            Path::new("/tmp/run.command"),
+            Path::new("/tmp/run.done"),
+            Path::new("/tmp/run.pid"),
+            true,
+        );
+        assert!(text.starts_with("#!/bin/sh\n"));
+        assert!(text.contains("cd '/tmp/my proj'\nstatus=$?\nif [ \"$status\" -ne 0 ]; then\n"));
+        assert!(text.contains("export VALID_KEY='a'\\''b c'\n"));
+        assert!(!text.contains("BAD-KEY"));
+        assert!(text.contains("\"$_same_shell\" -lic 'agy acp --login'\n"));
+        assert!(text.contains("Press Enter to close..."));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn macos_command_script_writes_exit_code_and_cleans_up() {
+        let dir = create_private_temp_dir().unwrap();
+        let script_path = dir.join("test.command");
+        let done_path = dir.join("test.done");
+        let pid_path = dir.join("test.pid");
+        let out_path = dir.join("out.txt");
+
+        let script = ConsoleScript {
+            unix: format!(
+                "printf '%s' \"$SAME_TEST_ENV\" > {}; exit 42",
+                sh_quote(&out_path.to_string_lossy())
+            ),
+            windows: String::new(),
+        };
+        let mut env = BTreeMap::new();
+        env.insert("SAME_TEST_ENV".to_string(), "hello macos".to_string());
+
+        let contents =
+            macos_command_script(&dir, &script, &env, &script_path, &done_path, &pid_path, false);
+        write_executable_script(&script_path, &contents).unwrap();
+
+        let status = Command::new(&script_path)
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&done_path).unwrap().trim(), "42");
+        assert_eq!(std::fs::read_to_string(&out_path).unwrap(), "hello macos");
+        assert!(!script_path.exists(), "script should self-delete on exit");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
