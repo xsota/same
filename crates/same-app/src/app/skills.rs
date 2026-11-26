@@ -1104,7 +1104,7 @@ impl SameAppView {
             .filter(|e| match self.skills_ui.filter_tab {
                 SkillFilterTab::All => true,
                 SkillFilterTab::Global => e.skill.scope == SkillScope::Global,
-                SkillFilterTab::Project => true, // Project tab shows Project + inherited Global
+                SkillFilterTab::Project => e.skill.scope == SkillScope::Project,
                 SkillFilterTab::External => false,
             })
             .filter(|e| {
@@ -1119,11 +1119,14 @@ impl SameAppView {
             .skills_ui
             .external_skills
             .iter()
-            .filter(|_| {
-                matches!(
-                    self.skills_ui.filter_tab,
-                    SkillFilterTab::All | SkillFilterTab::Project | SkillFilterTab::External
-                )
+            .filter(|e| match self.skills_ui.filter_tab {
+                SkillFilterTab::All | SkillFilterTab::External => true,
+                SkillFilterTab::Global => false,
+                // Project tab includes only repo-local external skills (e.g. `.agents/skills`),
+                // excluding machine-wide `~/.claude/skills` and built-in skills.
+                SkillFilterTab::Project => {
+                    e.origin != SkillOrigin::BuiltIn && !e.source_label.starts_with('~')
+                }
             })
             .filter(|e| {
                 query.is_empty()
@@ -1948,7 +1951,8 @@ impl SameAppView {
                         let pid_for_override = current_pid.clone();
                         let is_selected = self.skills_ui.selected.as_ref()
                             == Some(&SelectedSkillItem::Managed(skill.id.clone()));
-                        let is_project_tab = self.skills_ui.filter_tab == SkillFilterTab::Project;
+                        let is_project_context =
+                            self.skills_ui.filter_tab == SkillFilterTab::All && current_pid.is_some();
                         let is_global = skill.scope == SkillScope::Global;
 
                         let (status_label, status_color): (&str, Hsla) = match entry.state {
@@ -2060,7 +2064,7 @@ impl SameAppView {
                                                         .child(t(lang, "上書き", "Override")),
                                                 )
                                             })
-                                            .when(is_global && entry.project_override.is_none() && is_project_tab, |el| {
+                                            .when(is_global && entry.project_override.is_none() && is_project_context, |el| {
                                                 el.child(
                                                     div()
                                                         .text_xs()
@@ -2085,7 +2089,7 @@ impl SameAppView {
                                             .h_flex()
                                             .items_center()
                                             .gap_1()
-                                            .when(is_project_tab && is_global && entry.project_override.is_some(), |el| {
+                                            .when(is_project_context && is_global && entry.project_override.is_some(), |el| {
                                                 let pid_reset = pid_for_override.clone();
                                                 el.child(
                                                     Button::new(SharedString::from(format!("skill-reset-{sid_reset}")))
@@ -2116,7 +2120,7 @@ impl SameAppView {
                                                     })
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         cx.stop_propagation();
-                                                        if is_project_tab && is_global {
+                                                        if is_project_context && is_global {
                                                             if let Some(pid) = &pid_t {
                                                                 let _ = this.skills_ui.manager.set_project_assignment(&sid_toggle, pid, !effective_on);
                                                             }
