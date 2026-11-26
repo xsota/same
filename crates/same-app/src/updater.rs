@@ -38,7 +38,12 @@ pub struct ReleaseInfo {
     pub notes: String,
     pub download_url: Option<String>,
     pub asset_name: Option<String>,
+    /// URL of the release's `SHA256SUMS.txt` asset.
+    pub checksums_url: Option<String>,
 }
+
+/// Name of the checksum manifest the release workflow publishes.
+const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -202,6 +207,10 @@ pub async fn check_for_updates() -> Result<UpdateCheckOutcome> {
             .iter()
             .find(|a| a.name.ends_with(suf))
     });
+    let checksums_asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == CHECKSUMS_ASSET_NAME);
 
     Ok(UpdateCheckOutcome::Available(ReleaseInfo {
         version: latest_version,
@@ -210,6 +219,7 @@ pub async fn check_for_updates() -> Result<UpdateCheckOutcome> {
         notes: release.body.unwrap_or_default(),
         download_url: matched_asset.map(|a| a.browser_download_url.clone()),
         asset_name: matched_asset.map(|a| a.name.clone()),
+        checksums_url: checksums_asset.map(|a| a.browser_download_url.clone()),
     }))
 }
 
@@ -221,13 +231,33 @@ pub async fn download_and_install(release: &ReleaseInfo) -> Result<()> {
     let asset_name = release
         .asset_name
         .as_deref()
-        .unwrap_or("archive");
+        .ok_or_else(|| anyhow!("No release archive found for this platform"))?;
+    // Refuse to install anything we cannot verify.
+    let checksums_url = release
+        .checksums_url
+        .as_deref()
+        .ok_or_else(|| anyhow!("Release has no {CHECKSUMS_ASSET_NAME}; refusing to install unverified update"))?;
 
     let client = reqwest::Client::builder()
         .user_agent(format!("same/{CURRENT_VERSION}"))
         .timeout(Duration::from_secs(300))
         .build()
         .context("Failed to create HTTP client")?;
+
+    let sums_resp = client
+        .get(checksums_url)
+        .send()
+        .await
+        .context("Failed to download checksum manifest")?;
+    if !sums_resp.status().is_success() {
+        bail!("Checksum manifest download failed with HTTP {}", sums_resp.status());
+    }
+    let sums_text = sums_resp
+        .text()
+        .await
+        .context("Failed to read checksum manifest")?;
+    let expected_sha256 = find_checksum(&sums_text, asset_name)
+        .ok_or_else(|| anyhow!("{asset_name} is not listed in {CHECKSUMS_ASSET_NAME}"))?;
 
     let resp = client
         .get(download_url)
@@ -245,12 +275,38 @@ pub async fn download_and_install(release: &ReleaseInfo) -> Result<()> {
         .context("Failed to read update archive body")?
         .to_vec();
 
+    let actual_sha256 = sha256_hex(&bytes);
+    if !actual_sha256.eq_ignore_ascii_case(&expected_sha256) {
+        bail!(
+            "Checksum mismatch for {asset_name}: expected {expected_sha256}, got {actual_sha256}"
+        );
+    }
+
     let asset_name = asset_name.to_string();
     tokio::task::spawn_blocking(move || extract_and_replace(&bytes, &asset_name))
         .await
         .context("Update task panicked")??;
 
     Ok(())
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Looks up `asset_name` in `sha256sum` output (`<hex>  <name>`, or
+/// `<hex> *<name>` in binary mode) and returns its hex digest.
+fn find_checksum(manifest: &str, asset_name: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let (hash, name) = line.trim().split_once(char::is_whitespace)?;
+        let name = name.trim_start().trim_start_matches('*');
+        let valid_hash = hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit());
+        (valid_hash && name == asset_name).then(|| hash.to_ascii_lowercase())
+    })
 }
 
 fn expected_binary_name() -> &'static str {
@@ -400,5 +456,35 @@ mod tests {
         assert!(!is_newer_version("0.2.0-rc.1", "0.2.0"));
         assert!(is_newer_version("0.2.0-rc.2", "0.2.0-rc.1"));
         assert!(is_newer_version("0.2.0-rc.10", "0.2.0-rc.2"));
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn finds_checksum_in_sha256sum_output() {
+        let a = "a".repeat(64);
+        let b = "B".repeat(64);
+        let manifest = format!(
+            "{a}  same-linux-x86_64.tar.gz\n{b} *same-windows-x86_64.zip\n"
+        );
+        assert_eq!(
+            find_checksum(&manifest, "same-linux-x86_64.tar.gz"),
+            Some(a.clone())
+        );
+        assert_eq!(
+            find_checksum(&manifest, "same-windows-x86_64.zip"),
+            Some(b.to_ascii_lowercase())
+        );
+        assert_eq!(find_checksum(&manifest, "same-macos-aarch64.tar.gz"), None);
+        // A suffix of a listed name must not match.
+        assert_eq!(find_checksum(&manifest, "x86_64.tar.gz"), None);
+        // Malformed hashes are ignored.
+        assert_eq!(find_checksum("deadbeef  same-linux-x86_64.tar.gz", "same-linux-x86_64.tar.gz"), None);
     }
 }

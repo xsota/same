@@ -4779,7 +4779,8 @@ impl SameAppView {
                     ),
                     UpdateState::Available(info) => {
                         let info_clone = info.clone();
-                        let has_asset = info.download_url.is_some();
+                        let has_asset =
+                            info.download_url.is_some() && info.checksums_url.is_some();
                         let desc = match lang {
                             Language::Ja => format!(
                                 "現在: v{CURRENT_VERSION} → 最新: v{}",
