@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use same_acp::exec::ExecTarget;
 use same_core::skills::manager::copy_dir_safe;
-use same_core::skills::validator::{compute_dir_hash, Sha256};
+use same_core::skills::validator::{compute_dir_hash, compute_legacy_dir_hash, Sha256};
 use same_core::{
     EventBus, ProviderConfig, ProviderKind, SameEvent, SkillDeployment, SkillDeploymentMethod,
     SkillDeploymentStatus, SkillResolution, Storage,
@@ -25,6 +25,16 @@ fn staging_lock(staging_root: &Path) -> Arc<Mutex<()>> {
 }
 
 const MANIFEST_FILE: &str = ".same-managed.json";
+
+/// Checks whether `dir` matches a previously recorded manifest hash, accepting both
+/// the current hash format and the legacy (pre-executable-bit) format so upgrading
+/// SAME does not falsely flag unmodified staged skills as external conflicts.
+fn matches_recorded_hash(dir: &Path, existing_hash: &str, recorded_hash: &str) -> bool {
+    existing_hash == recorded_hash
+        || compute_legacy_dir_hash(dir)
+            .map(|legacy| legacy == recorded_hash)
+            .unwrap_or(false)
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StagingManifest {
@@ -271,7 +281,7 @@ impl SkillSynchronizer {
             }
             if dir.is_dir() {
                 let existing_hash = compute_dir_hash(&dir).unwrap_or_default();
-                if existing_hash != prev_hash {
+                if !matches_recorded_hash(&dir, &existing_hash, &prev_hash) {
                     has_conflict = true;
                     let detail = format!(
                         "Staged skill '{}' for {} was modified externally; refusing to delete",
@@ -307,7 +317,8 @@ impl SkillSynchronizer {
             if dst_dir.is_dir() {
                 let existing_hash = compute_dir_hash(&dst_dir).unwrap_or_default();
                 if let Some(prev) = &prev_deployed {
-                    if existing_hash != *prev && existing_hash != current_src_hash {
+                    let matches_prev = matches_recorded_hash(&dst_dir, &existing_hash, prev);
+                    if !matches_prev && existing_hash != current_src_hash {
                         // External edit detected inside staging dir: flag conflict, do not overwrite.
                         status = SkillDeploymentStatus::Conflict;
                         has_conflict = true;
@@ -323,6 +334,13 @@ impl SkillSynchronizer {
                     } else if existing_hash != current_src_hash {
                         fs::remove_dir_all(&dst_dir)?;
                         copy_dir_safe(src_dir, &dst_dir)?;
+                        manifest
+                            .skills
+                            .insert(skill.name.clone(), current_src_hash.clone());
+                        let _ = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
+                    } else if existing_hash != *prev {
+                        // Unchanged staged content whose manifest entry used the legacy hash format:
+                        // migrate the manifest entry to the current hash format.
                         manifest
                             .skills
                             .insert(skill.name.clone(), current_src_hash.clone());

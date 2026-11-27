@@ -694,6 +694,17 @@ pub fn is_executable_file(path: &Path, meta: &fs::Metadata) -> bool {
 /// Computes a deterministic SHA-256 hex digest over all files (relative paths + contents)
 /// inside a skill directory. Skips `.same-managed.json` metadata files.
 pub fn compute_dir_hash(dir: &Path) -> Result<String> {
+    compute_dir_hash_inner(dir, true)
+}
+
+/// Computes the legacy (pre-executable-bit) SHA-256 hex digest for a skill directory.
+/// Used for backwards-compatible conflict checks against manifests written before
+/// executable bits were included in the hash.
+pub fn compute_legacy_dir_hash(dir: &Path) -> Result<String> {
+    compute_dir_hash_inner(dir, false)
+}
+
+fn compute_dir_hash_inner(dir: &Path, include_executable: bool) -> Result<String> {
     let canonical_root = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     gather_files_for_hash(&canonical_root, &canonical_root, &mut files)?;
@@ -703,9 +714,11 @@ pub fn compute_dir_hash(dir: &Path) -> Result<String> {
     for (rel, path) in files {
         hasher.update(rel.as_bytes());
         hasher.update(&[0u8]);
-        let meta = fs::metadata(&path)
-            .with_context(|| format!("Failed to stat {} for hashing", path.display()))?;
-        hasher.update(&[is_executable_file(&path, &meta) as u8]);
+        if include_executable {
+            let meta = fs::metadata(&path)
+                .with_context(|| format!("Failed to stat {} for hashing", path.display()))?;
+            hasher.update(&[is_executable_file(&path, &meta) as u8]);
+        }
         let bytes = fs::read(&path)
             .with_context(|| format!("Failed to read {} for hashing", path.display()))?;
         hasher.update(&(bytes.len() as u64).to_le_bytes());

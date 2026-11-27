@@ -191,6 +191,75 @@ fn detects_external_edit_conflict_and_preserves_unmanaged_files() -> Result<()> 
 }
 
 #[test]
+fn migrates_legacy_manifest_hashes_without_false_conflict() -> Result<()> {
+    let tmp = TempDir::new("legacy-hash");
+    let storage = Arc::new(Storage::open_in_memory()?);
+    let events = EventBus::default();
+    let mgr = SkillManager::new(tmp.0.clone(), storage.clone(), events.clone());
+    let sync = SkillSynchronizer::new(tmp.0.clone(), storage.clone(), events);
+
+    let skill_a = mgr.create_skill("skill-a", "Skill A", SkillScope::Global, None, "# V1\n")?;
+    let skill_b = mgr.create_skill(
+        "skill-b",
+        "Skill B",
+        SkillScope::Global,
+        None,
+        "# Keep or Remove\n",
+    )?;
+    let all = mgr.list_skills()?;
+    let res = resolve_skills(None, &all, &[], &[]);
+    let claude = default_providers()
+        .into_iter()
+        .find(|p| p.id == "claude")
+        .unwrap();
+
+    let plan1 = sync.sync_for_provider(&claude, None, &ExecTarget::Host, &res)?;
+    assert_eq!(plan1.status, SkillDeploymentStatus::Synced);
+    let stage = plan1.staging_dir.as_ref().unwrap();
+    let manifest_path = stage.join(".same-managed.json");
+
+    // Rewrite manifest with legacy (pre-executable-bit) hashes to simulate an older SAME version.
+    let legacy_a = same_core::skills::compute_legacy_dir_hash(&stage.join("skills/skill-a"))?;
+    let legacy_b = same_core::skills::compute_legacy_dir_hash(&stage.join("skills/skill-b"))?;
+    let modern_a = same_core::skills::compute_dir_hash(&stage.join("skills/skill-a"))?;
+    assert_ne!(legacy_a, modern_a);
+    fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "skills": {
+                "skill-a": legacy_a,
+                "skill-b": legacy_b,
+            }
+        }))?,
+    )?;
+
+    // Edit skill-a and disable skill-b; re-sync must succeed without Conflict.
+    mgr.update_skill_md(
+        &skill_a.id,
+        "---\nname: skill-a\ndescription: Skill A\n---\n\n# V2\n",
+    )?;
+    mgr.set_skill_enabled(&skill_b.id, false)?;
+
+    let all2 = mgr.list_skills()?;
+    let res2 = resolve_skills(None, &all2, &[], &[]);
+    let plan2 = sync.sync_for_provider(&claude, None, &ExecTarget::Host, &res2)?;
+    assert_eq!(plan2.status, SkillDeploymentStatus::Synced);
+    assert!(fs::read_to_string(stage.join("skills/skill-a/SKILL.md"))?.contains("# V2"));
+    assert!(!stage.join("skills/skill-b").exists());
+
+    // Manifest should now store the modern hash for skill-a.
+    let updated_manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let expected_modern_a = same_core::skills::compute_dir_hash(&stage.join("skills/skill-a"))?;
+    assert_eq!(
+        updated_manifest["skills"]["skill-a"].as_str(),
+        Some(expected_modern_a.as_str())
+    );
+
+    Ok(())
+}
+
+#[test]
 fn wsl_target_translates_windows_staging_paths() {
     let target = ExecTarget::Wsl {
         distro: "Ubuntu".to_string(),

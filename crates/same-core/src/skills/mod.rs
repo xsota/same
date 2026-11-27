@@ -10,8 +10,8 @@ pub use resolver::{
     SkillResolution,
 };
 pub use validator::{
-    compute_dir_hash, parse_skill_md, render_skill_md, validate_skill_dir, validate_skill_md,
-    validate_skill_name, ParsedSkillMd, RelatedFileInfo, SkillValidationIssue,
+    compute_dir_hash, compute_legacy_dir_hash, parse_skill_md, render_skill_md, validate_skill_dir,
+    validate_skill_md, validate_skill_name, ParsedSkillMd, RelatedFileInfo, SkillValidationIssue,
     SkillValidationReport, ValidationSeverity,
 };
 
