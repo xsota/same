@@ -234,10 +234,39 @@ fn command_name(command: &str) -> String {
         .to_ascii_lowercase()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAuthStatus {
+    LoggedIn,
+    NotLoggedIn,
+    NoSubscription,
+    Unknown,
+}
+
+impl ProviderAuthStatus {
+    /// Whether this auth status allows the provider to be used in workspaces.
+    pub fn is_usable(self) -> bool {
+        !matches!(self, Self::NotLoggedIn | Self::NoSubscription)
+    }
+}
+
+/// Returns `true` when an error message from Claude Code indicates that the
+/// logged-in Claude.ai account does not have an active subscription (e.g.
+/// expired/past-due Pro/Max plan or free-tier account).
+pub fn is_claude_subscription_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("oauth_not_allowed_for_organization")
+        || lower.contains("can't use your claude subscription")
+        || lower.contains("claude max or pro is required")
+        || lower.contains("claude pro or max is required")
+        || (lower.contains("requires a claude") && lower.contains("subscription"))
+        || (lower.contains("no active") && lower.contains("subscription"))
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderCheckResult {
     pub provider_id: String,
     pub available: bool,
+    pub auth_status: ProviderAuthStatus,
     pub detail: String,
     pub capabilities: ProviderCapabilities,
     /// Where the check ran, e.g. "Windows" or "WSL: Ubuntu".
@@ -506,7 +535,8 @@ impl AgentManager {
         .await;
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         let output = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output())
             .await
             .unwrap_or_else(|_| Err(std::io::Error::other("timed out")));
@@ -526,9 +556,15 @@ impl AgentManager {
                 // `env` exits 127 when the command is not installed in WSL.
                 let missing_in_wsl =
                     matches!(target, ExecTarget::Wsl { .. }) && out.status.code() == Some(127);
+                let auth_status = if available {
+                    Self::check_auth_status(provider, &target, cwd).await
+                } else {
+                    ProviderAuthStatus::Unknown
+                };
                 ProviderCheckResult {
                     provider_id: provider.id.clone(),
                     available,
+                    auth_status,
                     detail: if available {
                         detail
                     } else if missing_in_wsl {
@@ -547,10 +583,167 @@ impl AgentManager {
             Err(e) => ProviderCheckResult {
                 provider_id: provider.id.clone(),
                 available: false,
+                auth_status: ProviderAuthStatus::Unknown,
                 detail: format!("Not found ({}): {e}", provider.command),
                 capabilities: caps,
                 target: target.label(),
             },
+        }
+    }
+
+    async fn check_auth_status(
+        provider: &ProviderConfig,
+        target: &ExecTarget,
+        cwd: &Path,
+    ) -> ProviderAuthStatus {
+        let base = command_name(&provider.command);
+        if base == "claude" && has_claude_credential_arg_override(&provider.args) {
+            // `claude auth status` does not accept prompt-time credential flags
+            // such as `--settings` (e.g. `apiKeyHelper`) or `--bare`, so probing
+            // default auth could falsely hide a working provider.
+            return ProviderAuthStatus::Unknown;
+        }
+        let args: &[&str] = match base.as_str() {
+            "claude" => &["auth", "status"],
+            "codex" => &["login", "status"],
+            "opencode" => &["auth", "list"],
+            _ => return ProviderAuthStatus::Unknown,
+        };
+        let owned_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut cmd =
+            build_command(target, &provider.command, &owned_args, cwd, &provider.env).await;
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+            .await
+            .unwrap_or_else(|_| Err(std::io::Error::other("timed out")));
+        let Ok(out) = output else {
+            return ProviderAuthStatus::Unknown;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        match base.as_str() {
+            "claude" => {
+                let status = parse_claude_auth_status(out.status.success(), &stdout);
+                if matches!(
+                    status,
+                    ProviderAuthStatus::LoggedIn | ProviderAuthStatus::NoSubscription
+                ) {
+                    Self::check_claude_subscription_state(&stdout, status, target, cwd).await
+                } else {
+                    status
+                }
+            }
+            "codex" => {
+                let status = parse_codex_auth_status(out.status.success(), &stdout, &stderr);
+                if status == ProviderAuthStatus::NotLoggedIn
+                    && Self::codex_may_use_runtime_credentials(provider, target, cwd).await
+                {
+                    ProviderAuthStatus::Unknown
+                } else {
+                    status
+                }
+            }
+            "opencode" => parse_opencode_auth_status(out.status.success(), &stdout, &stderr),
+            _ => ProviderAuthStatus::Unknown,
+        }
+    }
+
+    /// Returns `true` when Codex may authenticate at runtime via environment
+    /// API keys (`OPENAI_API_KEY` / `CODEX_API_KEY`) or CLI config/profile
+    /// overrides (`-c`/`--config`, `-p`/`--profile`), which `codex login status`
+    /// does not treat as a stored login.
+    async fn codex_may_use_runtime_credentials(
+        provider: &ProviderConfig,
+        target: &ExecTarget,
+        cwd: &Path,
+    ) -> bool {
+        if has_codex_runtime_auth_override(provider) {
+            return true;
+        }
+        match target {
+            ExecTarget::Host => ["OPENAI_API_KEY", "CODEX_API_KEY"].iter().any(|k| {
+                std::env::var(k)
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty())
+            }),
+            ExecTarget::Wsl { .. } => {
+                let mut cmd = build_command(
+                    target,
+                    "sh",
+                    &[
+                        "-c".to_string(),
+                        r#"test -n "${OPENAI_API_KEY:-}${CODEX_API_KEY:-}""#.to_string(),
+                    ],
+                    cwd,
+                    &provider.env,
+                )
+                .await;
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                tokio::time::timeout(std::time::Duration::from_secs(5), cmd.status())
+                    .await
+                    .ok()
+                    .and_then(|res| res.ok())
+                    .is_some_and(|s| s.success())
+            }
+        }
+    }
+
+    /// Refines a first-party `claude.ai` auth status using Claude's local state
+    /// file (`.claude.json`).
+    ///
+    /// - When `claude auth status` reports a stale cached paid plan (e.g.
+    ///   `"pro"`), `.claude.json`'s `oauthAccount` can show `billingType: "none"`
+    ///   after the subscription lapses (`LoggedIn` -> `NoSubscription`).
+    /// - When `claude auth status` reports no paid plan (`subscriptionType: null`),
+    ///   `.claude.json` can confirm active extra usage or an active trial
+    ///   (`NoSubscription` -> `LoggedIn`).
+    async fn check_claude_subscription_state(
+        auth_stdout: &str,
+        base_status: ProviderAuthStatus,
+        target: &ExecTarget,
+        cwd: &Path,
+    ) -> ProviderAuthStatus {
+        let Ok(status_val) = serde_json::from_str::<Value>(auth_stdout.trim()) else {
+            return base_status;
+        };
+        if !requires_claude_subscription(&status_val) {
+            return base_status;
+        }
+        let Some(config_dir) = status_val
+            .get("configDirectory")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return base_status;
+        };
+        let host_paths: Vec<PathBuf> = claude_state_file_candidates(config_dir)
+            .into_iter()
+            .map(|p| target.to_host_path(cwd, &p))
+            .collect();
+        let state_val = tokio::task::spawn_blocking(move || {
+            for path in host_paths {
+                if let Ok(raw) = std::fs::read_to_string(&path) {
+                    if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                        return Some(val);
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        match state_val {
+            Some(val) => {
+                refine_claude_auth_with_state(&status_val, &val, base_status, chrono::Utc::now())
+            }
+            None => base_status,
         }
     }
 
@@ -1850,6 +2043,246 @@ fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
     Some(resolved)
 }
 
+/// Returns `true` if Codex has provider-configured API key env vars or CLI
+/// config/profile flags that can supply credentials independently of
+/// `codex login status`.
+fn has_codex_runtime_auth_override(provider: &ProviderConfig) -> bool {
+    let has_env_key = ["OPENAI_API_KEY", "CODEX_API_KEY"].iter().any(|k| {
+        provider
+            .env
+            .get(*k)
+            .is_some_and(|v| !v.trim().is_empty())
+    });
+    if has_env_key {
+        return true;
+    }
+    provider.args.iter().any(|arg| {
+        let a = arg.as_str();
+        a == "-c"
+            || a == "--config"
+            || a.starts_with("--config=")
+            || a == "-p"
+            || a == "--profile"
+            || a.starts_with("--profile=")
+    })
+}
+
+/// Returns `true` if `args` includes Claude CLI flags that alter credential or
+/// settings resolution at prompt time (`--settings`, `--setting-sources`,
+/// `--bare`) and cannot be evaluated by `claude auth status`.
+fn has_claude_credential_arg_override(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let a = arg.as_str();
+        a == "--settings"
+            || a.starts_with("--settings=")
+            || a == "--setting-sources"
+            || a.starts_with("--setting-sources=")
+            || a == "--bare"
+    })
+}
+
+/// Returns `true` when `claude auth status` indicates a first-party `claude.ai`
+/// OAuth login with no API key override (meaning an active Claude subscription
+/// or extra usage is required to run prompts).
+fn requires_claude_subscription(val: &Value) -> bool {
+    let is_claude_ai = val
+        .get("authMethod")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.eq_ignore_ascii_case("claude.ai"));
+    if !is_claude_ai {
+        return false;
+    }
+    let is_first_party = val
+        .get("apiProvider")
+        .and_then(Value::as_str)
+        .is_none_or(|p| p.eq_ignore_ascii_case("firstparty"));
+    if !is_first_party {
+        return false;
+    }
+    let has_api_key = val
+        .get("apiKeySource")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty() && !s.eq_ignore_ascii_case("none"));
+    !has_api_key
+}
+
+fn is_non_paid_plan_value(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => {
+            let t = s.trim();
+            t.is_empty() || t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("free")
+        }
+        _ => false,
+    }
+}
+
+fn parse_claude_auth_status(success: bool, stdout: &str) -> ProviderAuthStatus {
+    if let Ok(val) = serde_json::from_str::<Value>(stdout.trim()) {
+        if let Some(logged_in) = val.get("loggedIn").and_then(Value::as_bool) {
+            if !logged_in {
+                return ProviderAuthStatus::NotLoggedIn;
+            }
+            if requires_claude_subscription(&val) {
+                let sub = val.get("subscriptionType");
+                let tier = val.get("planTier");
+                let sub_explicitly_unpaid = sub.is_some_and(is_non_paid_plan_value);
+                let tier_explicitly_unpaid = tier.is_some_and(is_non_paid_plan_value);
+                let sub_paid = sub.is_some_and(|v| !is_non_paid_plan_value(v));
+                let tier_paid = tier.is_some_and(|v| !is_non_paid_plan_value(v));
+                if (sub_explicitly_unpaid && !tier_paid) || (tier_explicitly_unpaid && !sub_paid) {
+                    return ProviderAuthStatus::NoSubscription;
+                }
+            }
+            return ProviderAuthStatus::LoggedIn;
+        }
+    }
+    if success {
+        ProviderAuthStatus::LoggedIn
+    } else {
+        ProviderAuthStatus::Unknown
+    }
+}
+
+/// Returns candidate `.claude.json` paths (in the target's path format) for a
+/// Claude `configDirectory`.
+///
+/// When `CLAUDE_CONFIG_DIR` is set, Claude stores `.claude.json` inside that
+/// directory; otherwise `configDirectory` is `~/.claude` and the state file is
+/// the sibling `~/.claude.json`.
+fn claude_state_file_candidates(config_dir: &str) -> Vec<String> {
+    let trimmed = config_dir.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let sep = if trimmed.contains('\\') && !trimmed.starts_with('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    let mut out = vec![format!("{trimmed}{sep}.claude.json")];
+    if let Some(pos) = trimmed.rfind(['/', '\\']) {
+        let last = &trimmed[pos + 1..];
+        if last.eq_ignore_ascii_case(".claude") {
+            let parent = &trimmed[..pos];
+            if parent.is_empty() {
+                out.push(format!("{sep}.claude.json"));
+            } else {
+                out.push(format!("{parent}{sep}.claude.json"));
+            }
+        }
+    }
+    out
+}
+
+fn refine_claude_auth_with_state(
+    status_val: &Value,
+    state_val: &Value,
+    base_status: ProviderAuthStatus,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ProviderAuthStatus {
+    let Some(account) = state_val.get("oauthAccount").filter(|v| v.is_object()) else {
+        return base_status;
+    };
+    // Guard against mismatched cached account state.
+    if let (Some(status_org), Some(state_org)) = (
+        status_val
+            .get("orgId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+        account
+            .get("organizationUuid")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+    ) {
+        if status_org != state_org {
+            return base_status;
+        }
+    }
+    if let (Some(status_email), Some(state_email)) = (
+        status_val
+            .get("email")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+        account
+            .get("emailAddress")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+    ) {
+        if !status_email.eq_ignore_ascii_case(state_email) {
+            return base_status;
+        }
+    }
+    // Extra usage (pay-as-you-go credits) or an active trial keeps the account usable.
+    if account
+        .get("hasExtraUsageEnabled")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return ProviderAuthStatus::LoggedIn;
+    }
+    if let Some(trial_end) = account
+        .get("claudeCodeTrialEndsAt")
+        .and_then(Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    {
+        if trial_end.with_timezone(&chrono::Utc) > now {
+            return ProviderAuthStatus::LoggedIn;
+        }
+    }
+    let billing_none = account
+        .get("billingType")
+        .and_then(Value::as_str)
+        .is_some_and(|b| b.trim().is_empty() || b.eq_ignore_ascii_case("none"));
+    let no_available_sub = account
+        .get("hasAvailableSubscription")
+        .and_then(Value::as_bool)
+        == Some(false);
+    if billing_none || no_available_sub {
+        return ProviderAuthStatus::NoSubscription;
+    }
+    base_status
+}
+
+fn parse_codex_auth_status(success: bool, stdout: &str, stderr: &str) -> ProviderAuthStatus {
+    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    if combined.contains("not logged in") {
+        return ProviderAuthStatus::NotLoggedIn;
+    }
+    if success && combined.contains("logged in") {
+        return ProviderAuthStatus::LoggedIn;
+    }
+    ProviderAuthStatus::Unknown
+}
+
+fn parse_opencode_auth_status(success: bool, stdout: &str, stderr: &str) -> ProviderAuthStatus {
+    if !success {
+        return ProviderAuthStatus::Unknown;
+    }
+    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    if combined.contains("no credentials") || combined.contains("0 credentials") {
+        // OpenCode can still run free or local models without stored credentials.
+        return ProviderAuthStatus::Unknown;
+    }
+    // Check if there is at least one non-empty credential line (skipping box/header chrome).
+    let has_cred = stdout.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty()
+            && !trimmed.starts_with('┌')
+            && !trimmed.starts_with('│')
+            && !trimmed.starts_with('└')
+            && !trimmed.starts_with('─')
+            && !trimmed.starts_with('◆')
+            && !trimmed.starts_with('◇')
+            && !trimmed.starts_with("Credentials")
+    });
+    if has_cred {
+        ProviderAuthStatus::LoggedIn
+    } else {
+        ProviderAuthStatus::Unknown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2121,6 +2554,221 @@ mod tests {
         assert_eq!(
             acp_mode_id(&serde_json::json!({}), ApprovalMode::Plan),
             None
+        );
+    }
+
+    #[test]
+    fn parse_auth_status_helpers() {
+        assert_eq!(
+            parse_claude_auth_status(true, r#"{"loggedIn": true, "authMethod": "claude.ai"}"#),
+            ProviderAuthStatus::LoggedIn
+        );
+        assert_eq!(
+            parse_claude_auth_status(false, r#"{"loggedIn": false}"#),
+            ProviderAuthStatus::NotLoggedIn
+        );
+        // Logged into claude.ai firstParty with no subscription (null / free / none)
+        assert_eq!(
+            parse_claude_auth_status(
+                true,
+                r#"{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": null}"#
+            ),
+            ProviderAuthStatus::NoSubscription
+        );
+        assert_eq!(
+            parse_claude_auth_status(
+                true,
+                r#"{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "free", "planTier": "free"}"#
+            ),
+            ProviderAuthStatus::NoSubscription
+        );
+        // API key overrides claude.ai login: usable without a subscription
+        assert_eq!(
+            parse_claude_auth_status(
+                true,
+                r#"{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty", "apiKeySource": "ANTHROPIC_API_KEY", "subscriptionType": null}"#
+            ),
+            ProviderAuthStatus::LoggedIn
+        );
+        // Third-party provider (Bedrock/Vertex) does not need a claude.ai subscription
+        assert_eq!(
+            parse_claude_auth_status(
+                true,
+                r#"{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "bedrock", "subscriptionType": null}"#
+            ),
+            ProviderAuthStatus::LoggedIn
+        );
+        // Lapsed Pro subscription: auth status has stale "pro", .claude.json has billingType "none"
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-27T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let stale_status: Value = serde_json::from_str(
+            r#"{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty", "email": "u@example.com", "orgId": "org-1", "subscriptionType": "pro", "planTier": "pro"}"#,
+        )
+        .unwrap();
+        let lapsed_state: Value = serde_json::from_str(
+            r#"{"oauthAccount": {"emailAddress": "u@example.com", "organizationUuid": "org-1", "billingType": "none", "hasExtraUsageEnabled": false, "claudeCodeTrialEndsAt": null}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refine_claude_auth_with_state(
+                &stale_status,
+                &lapsed_state,
+                ProviderAuthStatus::LoggedIn,
+                now
+            ),
+            ProviderAuthStatus::NoSubscription
+        );
+        // Active Stripe subscription remains LoggedIn
+        let active_state: Value = serde_json::from_str(
+            r#"{"oauthAccount": {"emailAddress": "u@example.com", "organizationUuid": "org-1", "billingType": "stripe_subscription", "hasExtraUsageEnabled": false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refine_claude_auth_with_state(
+                &stale_status,
+                &active_state,
+                ProviderAuthStatus::LoggedIn,
+                now
+            ),
+            ProviderAuthStatus::LoggedIn
+        );
+        // Extra usage enabled or active trial keeps account usable even when base status is NoSubscription
+        let free_status: Value = serde_json::from_str(
+            r#"{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty", "email": "u@example.com", "orgId": "org-1", "subscriptionType": null}"#,
+        )
+        .unwrap();
+        let extra_usage_state: Value = serde_json::from_str(
+            r#"{"oauthAccount": {"emailAddress": "u@example.com", "organizationUuid": "org-1", "billingType": "none", "hasExtraUsageEnabled": true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refine_claude_auth_with_state(
+                &free_status,
+                &extra_usage_state,
+                ProviderAuthStatus::NoSubscription,
+                now
+            ),
+            ProviderAuthStatus::LoggedIn
+        );
+        let trial_state: Value = serde_json::from_str(
+            r#"{"oauthAccount": {"emailAddress": "u@example.com", "organizationUuid": "org-1", "billingType": "none", "hasExtraUsageEnabled": false, "claudeCodeTrialEndsAt": "2026-12-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refine_claude_auth_with_state(
+                &free_status,
+                &trial_state,
+                ProviderAuthStatus::NoSubscription,
+                now
+            ),
+            ProviderAuthStatus::LoggedIn
+        );
+        // Mismatched orgId in .claude.json preserves base status
+        let other_org_state: Value = serde_json::from_str(
+            r#"{"oauthAccount": {"emailAddress": "u@example.com", "organizationUuid": "org-other", "billingType": "none", "hasExtraUsageEnabled": false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            refine_claude_auth_with_state(
+                &stale_status,
+                &other_org_state,
+                ProviderAuthStatus::LoggedIn,
+                now
+            ),
+            ProviderAuthStatus::LoggedIn
+        );
+        assert_eq!(
+            refine_claude_auth_with_state(
+                &free_status,
+                &other_org_state,
+                ProviderAuthStatus::NoSubscription,
+                now
+            ),
+            ProviderAuthStatus::NoSubscription
+        );
+        // State file candidate path resolution (Linux default, custom CLAUDE_CONFIG_DIR, Windows)
+        assert_eq!(
+            claude_state_file_candidates("/home/sota/.claude"),
+            vec![
+                "/home/sota/.claude/.claude.json".to_string(),
+                "/home/sota/.claude.json".to_string(),
+            ]
+        );
+        assert_eq!(
+            claude_state_file_candidates("/tmp/custom-claude"),
+            vec!["/tmp/custom-claude/.claude.json".to_string()]
+        );
+        assert_eq!(
+            claude_state_file_candidates(r"C:\Users\kamur\.claude"),
+            vec![
+                r"C:\Users\kamur\.claude\.claude.json".to_string(),
+                r"C:\Users\kamur\.claude.json".to_string(),
+            ]
+        );
+        // Runtime subscription error detection
+        assert!(is_claude_subscription_error(
+            "Claude Code can't use your Claude subscription, usually because a payment is past due"
+        ));
+        assert!(is_claude_subscription_error(
+            "403 oauth_not_allowed_for_organization"
+        ));
+        assert!(!is_claude_subscription_error("network connection reset"));
+        // Credential-overriding Claude args skip auth-status rejection
+        assert!(has_claude_credential_arg_override(&[
+            "--settings".to_string(),
+            "/tmp/s.json".to_string()
+        ]));
+        assert!(has_claude_credential_arg_override(&[
+            "--settings=/tmp/s.json".to_string()
+        ]));
+        assert!(has_claude_credential_arg_override(&["--bare".to_string()]));
+        assert!(!has_claude_credential_arg_override(&[
+            "--model".to_string(),
+            "sonnet".to_string()
+        ]));
+        // Codex runtime env/config overrides prevent false NotLoggedIn hiding
+        let mut codex_cfg = default_providers()
+            .into_iter()
+            .find(|p| p.id == "codex")
+            .unwrap();
+        assert!(!has_codex_runtime_auth_override(&codex_cfg));
+        codex_cfg
+            .env
+            .insert("OPENAI_API_KEY".to_string(), "sk-test".to_string());
+        assert!(has_codex_runtime_auth_override(&codex_cfg));
+        codex_cfg.env.clear();
+        codex_cfg.args = vec!["--profile=work".to_string()];
+        assert!(has_codex_runtime_auth_override(&codex_cfg));
+        assert_eq!(
+            parse_codex_auth_status(true, "Logged in using ChatGPT\n", ""),
+            ProviderAuthStatus::LoggedIn
+        );
+        assert_eq!(
+            parse_codex_auth_status(false, "", "Not logged in\n"),
+            ProviderAuthStatus::NotLoggedIn
+        );
+        // Inconclusive Codex failure does not falsely mark NotLoggedIn
+        assert_eq!(
+            parse_codex_auth_status(false, "", "error: unrecognized subcommand 'status'\n"),
+            ProviderAuthStatus::Unknown
+        );
+        assert_eq!(
+            parse_opencode_auth_status(
+                true,
+                "Google  GOOGLE_API_KEY              environment\n",
+                ""
+            ),
+            ProviderAuthStatus::LoggedIn
+        );
+        // OpenCode can still run free/local models with no stored credentials
+        assert_eq!(
+            parse_opencode_auth_status(true, "No credentials found\n", ""),
+            ProviderAuthStatus::Unknown
+        );
+        assert_eq!(
+            parse_opencode_auth_status(true, "   \n", ""),
+            ProviderAuthStatus::Unknown
         );
     }
 }

@@ -11,8 +11,9 @@ pub mod skills;
 pub mod stats;
 
 pub use manager::{
-    AgentManager, InteractiveLoginEvent, InteractiveLoginHandle, PromptRequest, PromptSkillSync,
-    ProviderCheckResult, ProviderSetup, SetupOutcome,
+    is_claude_subscription_error, AgentManager, InteractiveLoginEvent, InteractiveLoginHandle,
+    PromptRequest, PromptSkillSync, ProviderAuthStatus, ProviderCheckResult, ProviderSetup,
+    SetupOutcome,
 };
 pub use same_acp::exec::{self, ExecPreference, ExecTarget};
 pub use skills::{
