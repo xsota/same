@@ -34,7 +34,8 @@ use gpui_component::{
 };
 use same_agent::{
     exec as agent_exec, AgentManager, ExecPreference, InteractiveLoginEvent,
-    InteractiveLoginHandle, PromptRequest, ProviderCheckResult, ProviderSetup, SetupOutcome,
+    InteractiveLoginHandle, PromptRequest, ProviderAuthStatus, ProviderCheckResult, ProviderSetup,
+    SetupOutcome,
 };
 use same_core::paths::simplify_path;
 use same_core::{
@@ -184,6 +185,9 @@ struct LiveDraft {
     tool_calls: Vec<ToolCallRecord>,
     /// The plan the agent proposed (plan mode).
     plan: Option<String>,
+    /// Execution context label (`exec_label()`) when this turn was started,
+    /// so turn failures never mutate another environment's provider check.
+    exec_context: String,
 }
 
 impl LiveDraft {
@@ -195,6 +199,7 @@ impl LiveDraft {
             thinking: String::new(),
             tool_calls: Vec::new(),
             plan: None,
+            exec_context: String::new(),
         }
     }
 
@@ -437,6 +442,7 @@ enum UiAsyncMsg {
     },
     QuotaFetched {
         provider_id: String,
+        generation: u64,
         /// The exec label of the project the fetch was started for.
         context: String,
         /// Where the agent ran.
@@ -594,6 +600,9 @@ pub struct SameAppView {
     quotas: HashMap<String, QuotaEntry>,
     /// Providers with a usage-limit fetch in flight.
     quotas_fetching: HashSet<String>,
+    /// Per-provider generation counter to discard in-flight quota fetches
+    /// started before a login or provider config change.
+    quota_generations: HashMap<String, u64>,
     /// The last token-history read of each provider, by provider id.
     stats: HashMap<String, StatsEntry>,
     /// Providers with a token-history read in flight.
@@ -1021,6 +1030,7 @@ impl SameAppView {
             models_discovering: HashSet::new(),
             quotas: HashMap::new(),
             quotas_fetching: HashSet::new(),
+            quota_generations: HashMap::new(),
             stats: HashMap::new(),
             stats_fetching: HashSet::new(),
             stats_days: token_stats::DEFAULT_STATS_DAYS,
@@ -2489,6 +2499,7 @@ impl SameAppView {
         let cwd = self.exec_cwd();
         let pref = self.exec_pref();
         let generation = self.check_generation;
+        let lang = self.config.language;
 
         self.rt.spawn(async move {
             let check = manager.check_provider(&provider, pref, &cwd).await;
@@ -2513,14 +2524,31 @@ impl SameAppView {
                     }
                 }
             } else {
+                let (ok, message) = if !check.available {
+                    (false, check.detail)
+                } else {
+                    match check.auth_status {
+                        ProviderAuthStatus::NotLoggedIn => (
+                            false,
+                            format!("{} · {}", t(lang, "未ログイン", "Not logged in"), check.detail),
+                        ),
+                        ProviderAuthStatus::NoSubscription => (
+                            false,
+                            format!(
+                                "{} · {}",
+                                t(lang, "サブスクリプションなし", "No active subscription"),
+                                check.detail
+                            ),
+                        ),
+                        ProviderAuthStatus::LoggedIn | ProviderAuthStatus::Unknown => {
+                            (true, format!("CLI Ready: {}", check.detail))
+                        }
+                    }
+                };
                 let _ = tx.send(UiAsyncMsg::ConnectResult {
                     provider_id: pid,
-                    ok: check.available,
-                    message: if check.available {
-                        format!("CLI Ready: {}", check.detail)
-                    } else {
-                        check.detail
-                    },
+                    ok,
+                    message,
                 });
             }
         });
@@ -2846,7 +2874,10 @@ impl SameAppView {
                     // Once per provider and environment per run, ask a
                     // working agent for its real model list.
                     let key = (res.provider_id.clone(), res.target.clone());
-                    if res.available && !self.models_discovered.contains(&key) {
+                    if res.available
+                        && res.auth_status.is_usable()
+                        && !self.models_discovered.contains(&key)
+                    {
                         if let Some(p) = self.config.find_provider(&res.provider_id).cloned() {
                             self.start_model_discovery(p, false);
                         }
@@ -2856,10 +2887,11 @@ impl SameAppView {
             }
             UiAsyncMsg::QuotaFetched {
                 provider_id,
+                generation,
                 context,
                 target,
                 result,
-            } => self.on_quota_fetched(provider_id, context, target, result),
+            } => self.on_quota_fetched(provider_id, generation, context, target, result),
             UiAsyncMsg::StatsFetched {
                 provider_id,
                 days,
@@ -2945,6 +2977,7 @@ impl SameAppView {
                 result,
             } => {
                 self.setup_running.remove(&provider_id);
+                let pid_for_quota = provider_id.clone();
                 match result {
                     Ok(outcome) => {
                         if let Some(command) = outcome.installed_command {
@@ -2967,6 +3000,7 @@ impl SameAppView {
                 }
                 // Whatever was installed or signed in to, show the new state.
                 self.refresh_provider_checks();
+                self.invalidate_and_refresh_quotas(Some(&pid_for_quota));
             }
             UiAsyncMsg::LoginOutput {
                 attempt_id,
@@ -2998,6 +3032,7 @@ impl SameAppView {
                 }
                 self.active_login = None;
                 self.setup_running.remove(&provider_id);
+                let pid_for_quota = provider_id.clone();
                 let lang = self.config.language;
                 match result {
                     Ok(_) => {
@@ -3016,6 +3051,7 @@ impl SameAppView {
                     }
                 }
                 self.refresh_provider_checks();
+                self.invalidate_and_refresh_quotas(Some(&pid_for_quota));
             }
             UiAsyncMsg::Event(ev) => self.handle_same_event(ev, cx),
         }
@@ -3267,6 +3303,28 @@ impl SameAppView {
                 self.finalize_live_draft(&session_id, SessionStatus::Cancelled, None, cx);
             }
             SameEvent::SessionFailed { session_id, error } => {
+                let same_exec_context = self
+                    .live_drafts
+                    .get(&session_id)
+                    .is_some_and(|d| d.exec_context == self.exec_label());
+                if same_exec_context && same_agent::is_claude_subscription_error(&error) {
+                    if let Some(pid) = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == session_id)
+                        .map(|s| s.provider_id.clone())
+                    {
+                        let is_claude = self
+                            .config
+                            .find_provider(&pid)
+                            .is_some_and(|p| p.kind == ProviderKind::ClaudeCli);
+                        if is_claude {
+                            if let Some(chk) = self.provider_checks.get_mut(&pid) {
+                                chk.auth_status = ProviderAuthStatus::NoSubscription;
+                            }
+                        }
+                    }
+                }
                 self.finalize_live_draft(&session_id, SessionStatus::Failed, Some(error), cx);
             }
             SameEvent::AgentLog {
@@ -3658,8 +3716,9 @@ impl SameAppView {
             .map(|s| (s.name, s.skill_md_path))
             .collect();
 
-        self.live_drafts
-            .insert(session.id.clone(), LiveDraft::new());
+        let mut draft = LiveDraft::new();
+        draft.exec_context = self.exec_label();
+        self.live_drafts.insert(session.id.clone(), draft);
         if self
             .live_markdown_view
             .as_ref()
@@ -5008,6 +5067,7 @@ impl SameAppView {
                         .label(t(lang, "すべて再確認", "Refresh All"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.refresh_provider_checks();
+                            this.invalidate_and_refresh_quotas(None);
                             cx.notify();
                         }))
                         .into_any_element(),
@@ -5204,16 +5264,33 @@ impl SameAppView {
         let (status_color, status_text) = if let Some((ok, msg)) = connect_res {
             (if *ok { status_green() } else { status_red() }, msg.clone())
         } else if let Some(chk) = check {
+            let auth_warning = if chk.available {
+                match chk.auth_status {
+                    ProviderAuthStatus::NotLoggedIn => Some(t(lang, "未ログイン", "Not logged in")),
+                    ProviderAuthStatus::NoSubscription => {
+                        Some(t(lang, "サブスクリプションなし", "No active subscription"))
+                    }
+                    ProviderAuthStatus::LoggedIn | ProviderAuthStatus::Unknown => None,
+                }
+            } else {
+                None
+            };
+            let color = if !chk.available || auth_warning.is_some() {
+                status_amber()
+            } else {
+                status_green()
+            };
+            let base = if let Some(prefix) = auth_warning {
+                format!("{prefix} · {}", chk.detail)
+            } else {
+                chk.detail.clone()
+            };
             (
-                if chk.available {
-                    status_green()
-                } else {
-                    status_amber()
-                },
+                color,
                 if cfg!(windows) {
-                    format!("{} · {}", chk.detail, chk.target)
+                    format!("{base} · {}", chk.target)
                 } else {
-                    chk.detail.clone()
+                    base
                 },
             )
         } else {
@@ -5531,6 +5608,7 @@ impl SameAppView {
                                             this.editing_provider_id = None;
                                             this.save_config();
                                             this.refresh_provider_checks();
+                                            this.invalidate_and_refresh_quotas(Some(&pid_save));
                                             cx.notify();
                                         })),
                                 )
@@ -7064,6 +7142,21 @@ impl SameAppView {
 
     /// The row under the prompt: agent and model pickers (like the Codex /
     /// Claude Code composers), the auto-approve toggle, and key hints.
+    /// Returns whether `provider` should be shown in workspace pickers
+    /// (enabled, CLI installed, and logged in with an active subscription when
+    /// auth status is known).
+    pub(super) fn is_provider_visible_in_workspace(&self, provider: &ProviderConfig) -> bool {
+        if !provider.enabled {
+            return false;
+        }
+        if let Some(check) = self.provider_checks.get(&provider.id) {
+            if !check.available || !check.auth_status.is_usable() {
+                return false;
+            }
+        }
+        true
+    }
+
     fn render_composer_bar(
         &self,
         session: &Session,
@@ -7096,28 +7189,30 @@ impl SameAppView {
         let discovering = self.models_discovering.contains(&session.provider_id);
         let sid = session.id.clone();
 
-        // Agent picker
-        let providers: Vec<(String, String, Option<bool>)> = self
+        // Agent picker (workspace principle: show only usable providers;
+        // quota-exhausted ones are shown disabled with remaining quota).
+        let providers: Vec<(String, String, Option<String>)> = self
             .config
             .providers
             .iter()
-            .filter(|p| p.enabled)
+            .filter(|p| self.is_provider_visible_in_workspace(p))
             .map(|p| {
-                (
-                    p.id.clone(),
-                    p.name.clone(),
-                    self.provider_checks.get(&p.id).map(|c| c.available),
-                )
+                let exhausted_suffix = self
+                    .provider_quota_summary(&p.id)
+                    .filter(|q| q.exhausted)
+                    .map(|q| Self::format_exhausted_quota_suffix(&q, lang));
+                (p.id.clone(), p.name.clone(), exhausted_suffix)
             })
             .collect();
         let active_pid = session.provider_id.clone();
-        let avail = self
-            .provider_checks
-            .get(&session.provider_id)
-            .map(|c| c.available);
-        let dot: Hsla = match avail {
-            Some(true) => status_green().into(),
-            Some(false) => status_red().into(),
+        let active_check = self.provider_checks.get(&session.provider_id);
+        let active_exhausted = self
+            .provider_quota_summary(&session.provider_id)
+            .is_some_and(|q| q.exhausted);
+        let dot: Hsla = match active_check {
+            Some(c) if !c.available || !c.auth_status.is_usable() => status_red().into(),
+            Some(_) if active_exhausted => status_amber().into(),
+            Some(_) => status_green().into(),
             None => gpui::rgb(0x888888).into(),
         };
         let provider_view = view.clone();
@@ -7131,27 +7226,41 @@ impl SameAppView {
             .label(format!("{} ▾", self.provider_name(&session.provider_id)))
             .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu;
-                for (pid, name, ok) in providers.iter() {
-                    let v = provider_view.clone();
-                    let pid2 = pid.clone();
-                    let sid2 = provider_sid.clone();
-                    let label = if *ok == Some(false) {
-                        format!("{name}  ⚠")
-                    } else {
-                        name.clone()
-                    };
+                if providers.is_empty() {
                     menu = menu.item(
-                        PopupMenuItem::new(label)
-                            .checked(*pid == active_pid)
-                            .on_click(move |_, _, cx| {
-                                let pid3 = pid2.clone();
-                                let sid3 = sid2.clone();
-                                let _ = v.update(cx, |this, cx| {
-                                    this.switch_session_provider(&sid3, &pid3);
-                                    cx.notify();
-                                });
-                            }),
+                        PopupMenuItem::new(t(
+                            lang,
+                            "利用可能なプロバイダがありません",
+                            "No available providers",
+                        ))
+                        .disabled(true),
                     );
+                } else {
+                    for (pid, name, exhausted_suffix) in providers.iter() {
+                        if let Some(suffix) = exhausted_suffix {
+                            menu = menu.item(
+                                PopupMenuItem::new(format!("{name}  {suffix}"))
+                                    .checked(*pid == active_pid)
+                                    .disabled(true),
+                            );
+                        } else {
+                            let v = provider_view.clone();
+                            let pid2 = pid.clone();
+                            let sid2 = provider_sid.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(name.clone())
+                                    .checked(*pid == active_pid)
+                                    .on_click(move |_, _, cx| {
+                                        let pid3 = pid2.clone();
+                                        let sid3 = sid2.clone();
+                                        let _ = v.update(cx, |this, cx| {
+                                            this.switch_session_provider(&sid3, &pid3);
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                        }
+                    }
                 }
                 menu = menu.item(PopupMenuItem::separator());
                 let v = provider_view.clone();
@@ -7804,10 +7913,40 @@ impl SameAppView {
             .cloned()
             .unwrap_or_default();
 
-        let provider_missing = self
+        let provider_issue = self
             .provider_checks
             .get(&session.provider_id)
-            .is_some_and(|c| !c.available);
+            .and_then(|c| {
+                let name = self.provider_name(&session.provider_id);
+                if !c.available {
+                    Some(format!(
+                        "⚠ {} — {}",
+                        match lang {
+                            Language::Ja => format!("{name} を起動できません"),
+                            Language::En => format!("{name} is not available"),
+                        },
+                        c.detail
+                    ))
+                } else if c.auth_status == ProviderAuthStatus::NotLoggedIn {
+                    Some(format!(
+                        "⚠ {}",
+                        match lang {
+                            Language::Ja => format!("{name} にログインしていません"),
+                            Language::En => format!("{name} is not logged in"),
+                        }
+                    ))
+                } else if c.auth_status == ProviderAuthStatus::NoSubscription {
+                    Some(format!(
+                        "⚠ {}",
+                        match lang {
+                            Language::Ja => format!("{name} の有効なサブスクリプションがありません"),
+                            Language::En => format!("{name} has no active subscription"),
+                        }
+                    ))
+                } else {
+                    None
+                }
+            });
 
         let suggestions = self
             .render_skill_picker_popover(cx)
@@ -7824,12 +7963,7 @@ impl SameAppView {
             .h_full()
             .bg(theme.background)
             .child(self.render_chat_header(&session, running, cx))
-            .when(provider_missing, |el| {
-                let detail = self
-                    .provider_checks
-                    .get(&session.provider_id)
-                    .map(|c| c.detail.clone())
-                    .unwrap_or_default();
+            .when_some(provider_issue, |el, banner| {
                 el.child(
                     div()
                         .h_flex()
@@ -7839,21 +7973,13 @@ impl SameAppView {
                         .px_4()
                         .py_1()
                         .bg(theme.warning.opacity(0.12))
-                        .child(div().text_xs().text_color(status_amber()).truncate().child(
-                            format!(
-                                "⚠ {} — {detail}",
-                                match lang {
-                                    Language::Ja => format!(
-                                        "{} を起動できません",
-                                        self.provider_name(&session.provider_id)
-                                    ),
-                                    Language::En => format!(
-                                        "{} is not available",
-                                        self.provider_name(&session.provider_id)
-                                    ),
-                                }
-                            ),
-                        ))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(status_amber())
+                                .truncate()
+                                .child(banner),
+                        )
                         .child(
                             Button::new("fix-provider")
                                 .xsmall()

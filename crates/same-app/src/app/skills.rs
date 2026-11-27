@@ -751,16 +751,26 @@ impl SameAppView {
     }
 
     fn selected_ai_provider(&self) -> Option<ProviderConfig> {
-        let wanted = self
-            .skills_ui
-            .ai_provider_id
-            .as_deref()
-            .unwrap_or(&self.config.default_provider_id);
+        let is_selectable = |p: &&ProviderConfig| {
+            self.is_provider_visible_in_workspace(p)
+                && !self
+                    .provider_quota_summary(&p.id)
+                    .is_some_and(|q| q.exhausted)
+        };
+        if let Some(explicit) = self.skills_ui.ai_provider_id.as_deref() {
+            return self
+                .config
+                .providers
+                .iter()
+                .find(|p| p.id == explicit && is_selectable(p))
+                .cloned();
+        }
+        let default_id = &self.config.default_provider_id;
         self.config
             .providers
             .iter()
-            .find(|p| p.enabled && p.id == wanted)
-            .or_else(|| self.config.providers.iter().find(|p| p.enabled))
+            .find(|p| p.id == *default_id && is_selectable(p))
+            .or_else(|| self.config.providers.iter().find(is_selectable))
             .cloned()
     }
 
@@ -1369,7 +1379,7 @@ impl SameAppView {
             .config
             .providers
             .iter()
-            .filter(|p| p.enabled)
+            .filter(|p| self.is_provider_visible_in_workspace(p))
             .cloned()
             .collect();
         let active_provider_id = self
@@ -1381,12 +1391,22 @@ impl SameAppView {
             .iter()
             .map(|p| {
                 let pid = p.id.clone();
-                let selected = p.id == active_provider_id;
+                let exhausted_suffix = self
+                    .provider_quota_summary(&p.id)
+                    .filter(|q| q.exhausted)
+                    .map(|q| Self::format_exhausted_quota_suffix(&q, lang));
+                let exhausted = exhausted_suffix.is_some();
+                let selected = !exhausted && p.id == active_provider_id;
+                let label = match exhausted_suffix {
+                    Some(suffix) => format!("{} {suffix}", p.name),
+                    None => p.name.clone(),
+                };
                 Button::new(SharedString::from(format!("ai-prov-{}", p.id)))
                     .xsmall()
+                    .disabled(exhausted)
                     .when(selected, |b| b.primary())
                     .when(!selected, |b| b.ghost())
-                    .label(p.name.clone())
+                    .label(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.skills_ui.ai_provider_id = Some(pid.clone());
                         cx.notify();

@@ -49,6 +49,16 @@ pub(super) struct QuotaEntry {
     pub attempted_at: DateTime<Utc>,
 }
 
+/// Quota exhaustion summary for a provider in the current execution context.
+pub(super) struct ProviderQuotaSummary {
+    /// Whether any active quota window has reached 100% usage (0% remaining).
+    pub exhausted: bool,
+    /// Remaining percentage (0.0..=100.0) of the most constrained active window.
+    pub remaining_percent: f64,
+    /// Reset time of the most constrained active window, if reported.
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
 /// Providers whose CLI can be asked for its limits.
 fn reports_quota(provider: &ProviderConfig) -> bool {
     matches!(
@@ -58,6 +68,44 @@ fn reports_quota(provider: &ProviderConfig) -> bool {
 }
 
 impl SameAppView {
+    /// Returns the current account-wide quota summary for `provider_id` if a
+    /// quota snapshot is available for the active execution context.
+    pub(super) fn provider_quota_summary(&self, provider_id: &str) -> Option<ProviderQuotaSummary> {
+        let context = self.exec_label();
+        let entry = self
+            .quotas
+            .get(provider_id)
+            .filter(|e| e.context == context && e.error.is_none())?;
+        let QuotaReport::Available(snap) = entry.report.as_ref()? else {
+            return None;
+        };
+        summarize_provider_quota(snap, Utc::now())
+    }
+
+    /// Formats a short suffix for a quota-exhausted provider in a picker, e.g.
+    /// `(残量 0% · リセットまで 2時間)` / `(0% left · resets in 2h)`.
+    pub(super) fn format_exhausted_quota_suffix(
+        summary: &ProviderQuotaSummary,
+        lang: Language,
+    ) -> String {
+        let rem = fmt_pct(summary.remaining_percent);
+        let base = match lang {
+            Language::Ja => format!("残量 {rem}%"),
+            Language::En => format!("{rem}% left"),
+        };
+        if let Some(r) = summary.resets_at {
+            let secs = (r - Utc::now()).num_seconds();
+            if secs > 0 {
+                let left = fmt_duration(secs, lang);
+                return match lang {
+                    Language::Ja => format!("({base} · リセットまで {left})"),
+                    Language::En => format!("({base} · resets in {left})"),
+                };
+            }
+        }
+        format!("({base})")
+    }
+
     pub(super) fn open_usage(&mut self) {
         self.active_view = MainView::Usage;
         self.refresh_quotas(QUOTA_REFRESH_SOON, None);
@@ -90,6 +138,29 @@ impl SameAppView {
         self.refresh_quotas(QUOTA_REFRESH_SOON, Some(&provider_id));
     }
 
+    /// Invalidates cached and in-flight quota fetches for `only` (or all
+    /// providers when `None`) so results started before a login or config
+    /// change cannot overwrite or gate the updated provider, then triggers a
+    /// fresh fetch.
+    pub(super) fn invalidate_and_refresh_quotas(&mut self, only: Option<&str>) {
+        let ids: Vec<String> = match only {
+            Some(id) => vec![id.to_string()],
+            None => self
+                .config
+                .providers
+                .iter()
+                .map(|p| p.id.clone())
+                .collect(),
+        };
+        for id in ids {
+            let gen = self.quota_generations.entry(id.clone()).or_insert(0);
+            *gen = gen.wrapping_add(1);
+            self.quotas.remove(&id);
+            self.quotas_fetching.remove(&id);
+        }
+        self.refresh_quotas(Duration::ZERO, only);
+    }
+
     /// Fetches the limits of every enabled provider (or only `only`) whose
     /// last fetch is older than `max_age` (or was for another environment).
     pub(super) fn refresh_quotas(&mut self, max_age: Duration, only: Option<&str>) {
@@ -99,7 +170,7 @@ impl SameAppView {
             .config
             .providers
             .iter()
-            .filter(|p| p.enabled && reports_quota(p))
+            .filter(|p| self.is_provider_visible_in_workspace(p) && reports_quota(p))
             .filter(|p| only.is_none_or(|id| p.id == id))
             .filter(|p| !self.quotas_fetching.contains(&p.id))
             .filter(|p| match self.quotas.get(&p.id) {
@@ -114,6 +185,11 @@ impl SameAppView {
         let pref = self.exec_pref();
         let cwd = self.exec_cwd();
         for provider in stale {
+            let generation = self
+                .quota_generations
+                .get(&provider.id)
+                .copied()
+                .unwrap_or(0);
             self.quotas_fetching.insert(provider.id.clone());
             let manager = self.agent_manager.clone();
             let tx = self.ui_tx.clone();
@@ -123,6 +199,7 @@ impl SameAppView {
                 let (target, res) = manager.fetch_quota(&provider, pref, &cwd).await;
                 let _ = tx.send(UiAsyncMsg::QuotaFetched {
                     provider_id: provider.id,
+                    generation,
                     context,
                     target,
                     result: res.map_err(|e| format!("{e:#}")),
@@ -134,10 +211,19 @@ impl SameAppView {
     pub(super) fn on_quota_fetched(
         &mut self,
         provider_id: String,
+        generation: u64,
         context: String,
         target: String,
         result: Result<QuotaReport, String>,
     ) {
+        let expected = self
+            .quota_generations
+            .get(&provider_id)
+            .copied()
+            .unwrap_or(0);
+        if generation != expected {
+            return;
+        }
         self.quotas_fetching.remove(&provider_id);
         if context != self.exec_label() {
             // The user switched execution context while this fetch was in
@@ -415,7 +501,7 @@ impl SameAppView {
             .config
             .providers
             .iter()
-            .filter(|p| p.enabled && reports_quota(p))
+            .filter(|p| self.is_provider_visible_in_workspace(p) && reports_quota(p))
             .collect();
         let on_usage = self.active_view == MainView::Usage;
         if providers.is_empty() {
@@ -886,9 +972,169 @@ pub(super) fn local_time(at: DateTime<Utc>) -> String {
     }
 }
 
+/// Maximum age of a cached quota snapshot before it stops gating provider
+/// selection (stale snapshots from failed refreshes are kept for display only).
+const QUOTA_GATE_MAX_AGE_SECS: i64 = 30 * 60;
+
+/// Summarizes account-wide (`Rolling`) quota windows for provider-level
+/// availability. Model-specific windows are excluded because exhausting a
+/// single model's limit does not prevent using other models on the provider.
+fn summarize_provider_quota(snap: &QuotaSnapshot, now: DateTime<Utc>) -> Option<ProviderQuotaSummary> {
+    if (now - snap.fetched_at).num_seconds() > QUOTA_GATE_MAX_AGE_SECS {
+        return None;
+    }
+    let mut worst: Option<(f64, Option<DateTime<Utc>>)> = None;
+    let mut any_exhausted = false;
+    let mut latest_exhausted_reset: Option<DateTime<Utc>> = None;
+    let mut exhausted_missing_reset = false;
+    for w in &snap.windows {
+        if !matches!(w.kind, QuotaWindowKind::Rolling { .. }) {
+            continue;
+        }
+        if w.resets_at.is_some_and(|r| r <= now) {
+            continue;
+        }
+        let used = w.used_percent.clamp(0.0, 100.0);
+        if used >= 100.0 {
+            any_exhausted = true;
+            match w.resets_at {
+                Some(r) => {
+                    if latest_exhausted_reset.is_none_or(|cur| r > cur) {
+                        latest_exhausted_reset = Some(r);
+                    }
+                }
+                None => exhausted_missing_reset = true,
+            }
+        }
+        if worst.is_none_or(|(u, _)| used > u) {
+            worst = Some((used, w.resets_at));
+        }
+    }
+    let (used, worst_reset) = worst?;
+    let remaining_percent = (100.0 - used).max(0.0);
+    let resets_at = if any_exhausted {
+        if exhausted_missing_reset {
+            None
+        } else {
+            latest_exhausted_reset
+        }
+    } else {
+        worst_reset
+    };
+    Some(ProviderQuotaSummary {
+        exhausted: any_exhausted,
+        remaining_percent,
+        resets_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_quota_summary_ignores_model_specific_exhaustion() {
+        let now = DateTime::parse_from_rfc3339("2026-11-27T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let soon = DateTime::parse_from_rfc3339("2026-11-27T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let later = DateTime::parse_from_rfc3339("2026-12-02T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let snap = QuotaSnapshot {
+            plan: Some("pro".into()),
+            windows: vec![
+                QuotaWindow {
+                    kind: QuotaWindowKind::Rolling { minutes: 300 },
+                    used_percent: 40.0,
+                    resets_at: Some(soon),
+                },
+                QuotaWindow {
+                    kind: QuotaWindowKind::Model {
+                        minutes: 10080,
+                        model: "Sonnet".into(),
+                    },
+                    used_percent: 100.0,
+                    resets_at: Some(later),
+                },
+            ],
+            fetched_at: now,
+        };
+        let summary = summarize_provider_quota(&snap, now).unwrap();
+        assert!(!summary.exhausted);
+        assert!((summary.remaining_percent - 60.0).abs() < 0.01);
+
+        // When multiple rolling windows are exhausted, report the latest reset.
+        let both_exhausted = QuotaSnapshot {
+            plan: Some("pro".into()),
+            windows: vec![
+                QuotaWindow {
+                    kind: QuotaWindowKind::Rolling { minutes: 300 },
+                    used_percent: 100.0,
+                    resets_at: Some(soon),
+                },
+                QuotaWindow {
+                    kind: QuotaWindowKind::Rolling { minutes: 10080 },
+                    used_percent: 100.0,
+                    resets_at: Some(later),
+                },
+            ],
+            fetched_at: now,
+        };
+        let exhausted = summarize_provider_quota(&both_exhausted, now).unwrap();
+        assert!(exhausted.exhausted);
+        assert_eq!(exhausted.resets_at, Some(later));
+
+        // If any exhausted window has no known reset time, omit the countdown.
+        let unknown_reset = QuotaSnapshot {
+            plan: Some("pro".into()),
+            windows: vec![
+                QuotaWindow {
+                    kind: QuotaWindowKind::Rolling { minutes: 300 },
+                    used_percent: 100.0,
+                    resets_at: Some(soon),
+                },
+                QuotaWindow {
+                    kind: QuotaWindowKind::Rolling { minutes: 10080 },
+                    used_percent: 100.0,
+                    resets_at: None,
+                },
+            ],
+            fetched_at: now,
+        };
+        let exhausted_unknown = summarize_provider_quota(&unknown_reset, now).unwrap();
+        assert!(exhausted_unknown.exhausted);
+        assert_eq!(exhausted_unknown.resets_at, None);
+
+        // Fractional nonzero remaining quota (e.g. 99.96% used) is not exhausted.
+        let almost_exhausted = QuotaSnapshot {
+            plan: Some("pro".into()),
+            windows: vec![QuotaWindow {
+                kind: QuotaWindowKind::Rolling { minutes: 300 },
+                used_percent: 99.96,
+                resets_at: Some(soon),
+            }],
+            fetched_at: now,
+        };
+        let almost = summarize_provider_quota(&almost_exhausted, now).unwrap();
+        assert!(!almost.exhausted);
+
+        // Stale snapshots older than QUOTA_GATE_MAX_AGE_SECS do not gate selection.
+        let stale = QuotaSnapshot {
+            plan: Some("pro".into()),
+            windows: vec![QuotaWindow {
+                kind: QuotaWindowKind::Rolling { minutes: 300 },
+                used_percent: 100.0,
+                resets_at: None,
+            }],
+            fetched_at: DateTime::parse_from_rfc3339("2026-11-27T09:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert!(summarize_provider_quota(&stale, now).is_none());
+    }
 
     #[test]
     fn window_labels() {
