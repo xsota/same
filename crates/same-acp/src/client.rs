@@ -81,9 +81,24 @@ pub struct AcpClient {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     next_id: AtomicU64,
+    /// Active `session/load` RPCs (`request_id -> session_id`).
+    /// The stdout reader removes an entry on the exact wire line of that RPC's
+    /// response so history-replay `session/update` notifications for that
+    /// session are dropped without affecting other sessions or subsequent turns.
+    loading_sessions: Arc<std::sync::Mutex<HashMap<u64, String>>>,
     child: Arc<Mutex<Option<Child>>>,
     target: ExecTarget,
     pub init_result: InitializeResult,
+}
+
+fn is_transcript_update(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::AgentMessageChunk { .. }
+            | SessionUpdate::AgentThoughtChunk { .. }
+            | SessionUpdate::ToolCall { .. }
+            | SessionUpdate::ToolCallUpdate { .. }
+    )
 }
 
 impl AcpClient {
@@ -158,6 +173,7 @@ impl AcpClient {
         let terminals: Arc<Mutex<HashMap<String, ManagedTerminal>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let child_arc = Arc::new(Mutex::new(Some(child)));
+        let loading_sessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         // Stderr reader task
@@ -181,6 +197,7 @@ impl AcpClient {
             let base_cwd = config.cwd.clone();
             let target = config.target.clone();
             let auto_approve = auto_approve_flag.clone();
+            let loading_sessions = loading_sessions.clone();
 
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout).lines();
@@ -203,6 +220,9 @@ impl AcpClient {
                     if !has_method && has_id {
                         // Response to our request
                         if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                            if let Ok(mut guard) = loading_sessions.lock() {
+                                guard.remove(&id);
+                            }
                             let tx = pending.lock().await.remove(&id);
                             if let Some(tx) = tx {
                                 if let Some(err) = msg.get("error") {
@@ -230,6 +250,13 @@ impl AcpClient {
                                     .to_string();
                                 if let Some(update_val) = params.get("update") {
                                     let update = parse_session_update(update_val);
+                                    let suppressing = is_transcript_update(&update)
+                                        && loading_sessions.lock().is_ok_and(|guard| {
+                                            guard.values().any(|sid| sid == &session_id)
+                                        });
+                                    if suppressing {
+                                        continue;
+                                    }
                                     let _ = event_tx
                                         .send(AcpEvent::SessionUpdate { session_id, update });
                                 }
@@ -273,6 +300,9 @@ impl AcpClient {
                 }
 
                 // Process stdout closed: fail any pending requests and report exit
+                if let Ok(mut guard) = loading_sessions.lock() {
+                    guard.clear();
+                }
                 let mut map = pending.lock().await;
                 for (_, tx) in map.drain() {
                     let _ = tx.send(Err(anyhow!("ACP agent process exited unexpectedly")));
@@ -290,6 +320,7 @@ impl AcpClient {
             stdin,
             pending,
             next_id: AtomicU64::new(1),
+            loading_sessions,
             child: child_arc,
             target: config.target.clone(),
             init_result: InitializeResult {
@@ -334,6 +365,16 @@ impl AcpClient {
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.request_with_id(id, method, params, None).await
+    }
+
+    async fn request_with_id(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+        loading_session: Option<String>,
+    ) -> Result<Value> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
@@ -343,9 +384,27 @@ impl AcpClient {
             method: method.to_string(),
             params: Some(params),
         };
-        if let Err(err) = write_json_line(&self.stdin, &req).await {
+        let mut line = serde_json::to_string(&req)?;
+        line.push('\n');
+
+        let write_res = {
+            let mut stdin_guard = self.stdin.lock().await;
+            if let Some(sid) = loading_session {
+                if let Ok(mut guard) = self.loading_sessions.lock() {
+                    guard.insert(id, sid);
+                }
+            }
+            match stdin_guard.write_all(line.as_bytes()).await {
+                Ok(()) => stdin_guard.flush().await,
+                Err(err) => Err(err),
+            }
+        };
+        if let Err(err) = write_res {
             self.pending.lock().await.remove(&id);
-            return Err(err);
+            if let Ok(mut guard) = self.loading_sessions.lock() {
+                guard.remove(&id);
+            }
+            return Err(err.into());
         }
 
         rx.await
@@ -378,20 +437,25 @@ impl AcpClient {
     }
 
     /// Resumes a session; returns its model choice and modes if the agent
-    /// reports them.
+    /// reports them. Transcript replay notifications emitted by the agent
+    /// during `session/load` are suppressed so resumed turns do not duplicate
+    /// prior replies.
     pub async fn load_session(
         &self,
         session_id: &str,
         cwd: &Path,
     ) -> Result<(Option<AcpModelState>, Option<Value>)> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let val = self
-            .request(
+            .request_with_id(
+                id,
                 "session/load",
                 json!({
                     "sessionId": session_id,
                     "cwd": self.target.to_target_path(cwd),
                     "mcpServers": []
                 }),
+                Some(session_id.to_string()),
             )
             .await?;
         Ok((parse_model_state(&val), val.get("modes").cloned()))
@@ -1002,6 +1066,125 @@ rl.on('line', (line) => {
         }
         assert!(saw_thought);
         assert!(saw_text);
+        client.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_session_suppresses_replayed_transcript_updates() -> Result<()> {
+        if tokio::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let script = r#"
+const rl = require('readline').createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      id: msg.id,
+      result: { protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: 'mock-acp', version: '0.1' } }
+    }));
+  } else if (msg.method === 'session/load') {
+    // Per ACP spec, session/load replays prior turns before returning.
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'sess-prev',
+        update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'old thought' } }
+      }
+    }));
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'sess-prev',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'old reply' } }
+      }
+    }));
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'sess-prev',
+        update: { sessionUpdate: 'tool_call', toolCallId: 'tc-old', title: 'old cmd', status: 'completed' }
+      }
+    }));
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'sess-prev',
+        update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'help', description: 'Show help' }] }
+      }
+    }));
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      id: msg.id,
+      result: {}
+    }));
+  } else if (msg.method === 'session/prompt') {
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: 'sess-prev',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'new reply' } }
+      }
+    }));
+    console.log(JSON.stringify({
+      jsonrpc: '2.0',
+      id: msg.id,
+      result: { stopReason: 'end_turn' }
+    }));
+  }
+});
+"#;
+        let (client, mut rx) = AcpClient::spawn(AcpClientConfig {
+            command: "node".to_string(),
+            args: vec!["-e".to_string(), script.to_string()],
+            env: BTreeMap::new(),
+            cwd: std::env::temp_dir(),
+            auto_approve: true,
+            target: ExecTarget::Host,
+        })
+        .await?;
+
+        client
+            .load_session("sess-prev", &std::env::temp_dir())
+            .await?;
+        let res = client.prompt("sess-prev", "Continue").await?;
+        assert_eq!(res.stop_reason.as_deref(), Some("end_turn"));
+
+        let mut messages = Vec::new();
+        let mut thoughts = Vec::new();
+        let mut tools = Vec::new();
+        let mut saw_commands = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AcpEvent::SessionUpdate { update, .. } = ev {
+                match update {
+                    SessionUpdate::AgentMessageChunk { text } => messages.push(text),
+                    SessionUpdate::AgentThoughtChunk { text } => thoughts.push(text),
+                    SessionUpdate::ToolCall { tool_call_id, .. } => tools.push(tool_call_id),
+                    SessionUpdate::AvailableCommands { commands } => {
+                        saw_commands = commands.iter().any(|(name, _)| name == "help");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(messages, vec!["new reply".to_string()]);
+        assert!(thoughts.is_empty());
+        assert!(tools.is_empty());
+        assert!(saw_commands);
         client.shutdown().await;
         Ok(())
     }
