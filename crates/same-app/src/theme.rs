@@ -438,7 +438,11 @@ pub fn apply_gpui_theme(config: &AppConfig, window: Option<&mut Window>, cx: &mu
         }
     });
     Theme::change(gpui_mode, window, cx);
-    tracing::info!("THEMECHECK {} bg={:?}", Theme::global(cx).theme_name(), Rgba::from(Theme::global(cx).background));
+    tracing::info!(
+        "THEMECHECK {} bg={:?}",
+        Theme::global(cx).theme_name(),
+        Rgba::from(Theme::global(cx).background)
+    );
     Theme::update(cx, |theme| {
         // Always assigned (not only when overridden) so "reset" takes effect
         // even if `Theme::change` keeps the previous families.

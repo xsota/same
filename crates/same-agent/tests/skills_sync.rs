@@ -46,7 +46,13 @@ fn syncs_all_p0_providers_and_isolates_concurrent_projects() -> Result<()> {
     let mgr = SkillManager::new(tmp.0.clone(), storage.clone(), events.clone());
     let sync = SkillSynchronizer::new(tmp.0.clone(), storage.clone(), events);
 
-    mgr.create_skill("global-helper", "Global skill", SkillScope::Global, None, "# Global\n")?;
+    mgr.create_skill(
+        "global-helper",
+        "Global skill",
+        SkillScope::Global,
+        None,
+        "# Global\n",
+    )?;
     mgr.create_skill(
         "secret-a",
         "Only for project A",
@@ -144,7 +150,13 @@ fn detects_external_edit_conflict_and_preserves_unmanaged_files() -> Result<()> 
     let mgr = SkillManager::new(tmp.0.clone(), storage.clone(), events.clone());
     let sync = SkillSynchronizer::new(tmp.0.clone(), storage.clone(), events);
 
-    mgr.create_skill("demo", "Demo skill", SkillScope::Global, None, "# Original\n")?;
+    mgr.create_skill(
+        "demo",
+        "Demo skill",
+        SkillScope::Global,
+        None,
+        "# Original\n",
+    )?;
     let all = mgr.list_skills()?;
     let res = resolve_skills(None, &all, &[], &[]);
     let claude = default_providers()
@@ -164,7 +176,10 @@ fn detects_external_edit_conflict_and_preserves_unmanaged_files() -> Result<()> 
 
     // Externally edit the staged skill
     let staged_md = stage.join("skills/demo/SKILL.md");
-    fs::write(&staged_md, "---\nname: demo\ndescription: Hand-edited\n---\n\n# Hand-edited\n")?;
+    fs::write(
+        &staged_md,
+        "---\nname: demo\ndescription: Hand-edited\n---\n\n# Hand-edited\n",
+    )?;
 
     // Second sync must detect Conflict and NOT overwrite the external edit or delete unmanaged dir
     let plan2 = sync.sync_for_provider(&claude, None, &ExecTarget::Host, &res)?;

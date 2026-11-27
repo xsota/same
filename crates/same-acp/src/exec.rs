@@ -532,7 +532,9 @@ fn macos_command_script(
     out.push_str("#!/bin/sh\n");
     out.push_str("status=1\n");
     out.push_str("done_written=0\n");
-    out.push_str(&format!("printf '%s\\n' \"$$\" > {pid_q} 2>/dev/null || true\n"));
+    out.push_str(&format!(
+        "printf '%s\\n' \"$$\" > {pid_q} 2>/dev/null || true\n"
+    ));
     out.push_str("write_done() {\n");
     out.push_str("  if [ \"$done_written\" -eq 0 ]; then\n");
     out.push_str("    done_written=1\n");
@@ -873,8 +875,15 @@ mod tests {
         let mut env = BTreeMap::new();
         env.insert("SAME_TEST_ENV".to_string(), "hello macos".to_string());
 
-        let contents =
-            macos_command_script(&dir, &script, &env, &script_path, &done_path, &pid_path, false);
+        let contents = macos_command_script(
+            &dir,
+            &script,
+            &env,
+            &script_path,
+            &done_path,
+            &pid_path,
+            false,
+        );
         write_executable_script(&script_path, &contents).unwrap();
 
         let status = Command::new(&script_path)

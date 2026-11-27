@@ -47,8 +47,12 @@ pub async fn generate_skill_draft(
     };
     let raw_res = tokio::time::timeout(GENERATE_TIMEOUT, fut).await;
     let _ = std::fs::remove_dir_all(&isolated_dir);
-    let raw = raw_res
-        .map_err(|_| anyhow!("AI generation timed out after {}s", GENERATE_TIMEOUT.as_secs()))??;
+    let raw = raw_res.map_err(|_| {
+        anyhow!(
+            "AI generation timed out after {}s",
+            GENERATE_TIMEOUT.as_secs()
+        )
+    })??;
     extract_skill_draft_from_ai_output(&raw, user_request)
 }
 
@@ -56,10 +60,7 @@ fn create_isolated_draft_dir() -> Result<std::path::PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(1);
     let id = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "same-skill-draft-{}-{id}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("same-skill-draft-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

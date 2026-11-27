@@ -367,7 +367,9 @@ fn format_yaml_scalar(val: &str) -> String {
             .join("\n");
         format!("|-\n{indented}")
     } else if val.is_empty()
-        || val.starts_with([' ', '-', '?', ':', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`', '{', '['])
+        || val.starts_with([
+            ' ', '-', '?', ':', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`', '{', '[',
+        ])
         || val.ends_with(' ')
         || val.contains(": ")
         || val.contains(" #")
@@ -438,9 +440,7 @@ pub fn validate_skill_md(
     } else if parsed.description.chars().count() > MAX_SKILL_DESCRIPTION_LEN {
         report.push_warning(
             "description_too_long",
-            format!(
-                "Description exceeds recommended {MAX_SKILL_DESCRIPTION_LEN} characters"
-            ),
+            format!("Description exceeds recommended {MAX_SKILL_DESCRIPTION_LEN} characters"),
         );
     }
 
@@ -505,7 +505,9 @@ pub fn validate_relative_skill_path(rel: &str) -> Result<PathBuf, String> {
     }
     let path = Path::new(rel);
     if path.is_absolute() {
-        return Err(format!("Path '{rel}' must be relative to the skill directory"));
+        return Err(format!(
+            "Path '{rel}' must be relative to the skill directory"
+        ));
     }
     let mut clean = PathBuf::new();
     for comp in path.components() {
@@ -584,7 +586,9 @@ pub fn validate_skill_dir(
     report.issues.extend(md_report.issues);
 
     // Walk directory safely, rejecting symlinks escaping canonical_root.
-    if let Err(err) = collect_related_files(&canonical_root, &canonical_root, &mut related, &mut report) {
+    if let Err(err) =
+        collect_related_files(&canonical_root, &canonical_root, &mut related, &mut report)
+    {
         report.push_error("walk_error", err.to_string());
     }
     related.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -660,7 +664,18 @@ pub fn is_executable_file(path: &Path, meta: &fs::Metadata) -> bool {
         .unwrap_or_default();
     if matches!(
         ext.as_str(),
-        "sh" | "bash" | "zsh" | "ps1" | "bat" | "cmd" | "py" | "js" | "mjs" | "ts" | "rb" | "pl" | "exe"
+        "sh" | "bash"
+            | "zsh"
+            | "ps1"
+            | "bat"
+            | "cmd"
+            | "py"
+            | "js"
+            | "mjs"
+            | "ts"
+            | "rb"
+            | "pl"
+            | "exe"
     ) {
         return true;
     }

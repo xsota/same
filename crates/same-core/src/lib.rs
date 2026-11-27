@@ -14,8 +14,8 @@ pub use models::*;
 pub use skills::{
     EffectiveSkillState, ExternalSkill, ImportCandidate, ImportConflictPolicy, ImportPreview,
     ParsedSkillMd, RelatedFileInfo, ResolvedSkillEntry, Skill, SkillAssignment, SkillConflict,
-    SkillConflictKind, SkillDeployment, SkillDeploymentMethod, SkillDeploymentStatus,
-    SkillManager, SkillOrigin, SkillResolution, SkillScope, SkillSourceType, SkillValidationIssue,
+    SkillConflictKind, SkillDeployment, SkillDeploymentMethod, SkillDeploymentStatus, SkillManager,
+    SkillOrigin, SkillResolution, SkillScope, SkillSourceType, SkillValidationIssue,
     SkillValidationReport, ValidationSeverity,
 };
 pub use storage::Storage;

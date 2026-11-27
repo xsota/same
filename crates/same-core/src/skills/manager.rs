@@ -101,7 +101,12 @@ impl SkillManager {
             .join("skills")
     }
 
-    pub fn skill_dir_for(&self, scope: SkillScope, project_id: Option<&str>, name: &str) -> Result<PathBuf> {
+    pub fn skill_dir_for(
+        &self,
+        scope: SkillScope,
+        project_id: Option<&str>,
+        name: &str,
+    ) -> Result<PathBuf> {
         validate_skill_name(name).map_err(|e| anyhow!(e))?;
         match scope {
             SkillScope::Global => Ok(self.global_skills_dir().join(name)),
@@ -159,7 +164,10 @@ impl SkillManager {
             bail!("{}", report.error_summary());
         }
 
-        if self.find_by_scope_and_name(scope, project_id, name)?.is_some() {
+        if self
+            .find_by_scope_and_name(scope, project_id, name)?
+            .is_some()
+        {
             bail!("Skill '{name}' already exists in this scope");
         }
 
@@ -373,10 +381,7 @@ impl SkillManager {
             .find_by_scope_and_name(target_scope, normalized_pid.as_deref(), &skill.name)?
             .is_some()
         {
-            bail!(
-                "Skill '{}' already exists in target scope",
-                skill.name
-            );
+            bail!("Skill '{}' already exists in target scope", skill.name);
         }
         let dst_dir = self.skill_dir_for(target_scope, normalized_pid.as_deref(), &skill.name)?;
         if dst_dir.exists() {
@@ -414,8 +419,8 @@ impl SkillManager {
             .ok_or_else(|| anyhow!("Skill '{skill_id}' not found"))?;
         let dir = PathBuf::from(&skill.path);
         if dir.exists() {
-            let canon_data = fs::canonicalize(&self.data_dir)
-                .unwrap_or_else(|_| self.data_dir.clone());
+            let canon_data =
+                fs::canonicalize(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone());
             let canon_dir = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
             if canon_dir.starts_with(&canon_data) {
                 fs::remove_dir_all(&canon_dir).with_context(|| {
@@ -460,12 +465,11 @@ impl SkillManager {
         project_id: &str,
         enabled: bool,
     ) -> Result<()> {
-        self.storage
-            .upsert_skill_assignment(&SkillAssignment {
-                skill_id: skill_id.to_string(),
-                project_id: project_id.to_string(),
-                enabled,
-            })?;
+        self.storage.upsert_skill_assignment(&SkillAssignment {
+            skill_id: skill_id.to_string(),
+            project_id: project_id.to_string(),
+            enabled,
+        })?;
         self.events.publish(SameEvent::SkillAssignmentChanged {
             skill_id: skill_id.to_string(),
             project_id: project_id.to_string(),
@@ -846,7 +850,10 @@ impl SkillManager {
             } else {
                 if dst_dir.exists() {
                     let _ = fs::remove_dir_all(&stage_dir);
-                    bail!("Destination directory already exists: {}", dst_dir.display());
+                    bail!(
+                        "Destination directory already exists: {}",
+                        dst_dir.display()
+                    );
                 }
                 if let Err(err) = fs::rename(&stage_dir, &dst_dir) {
                     let _ = fs::remove_dir_all(&stage_dir);
@@ -950,7 +957,8 @@ impl SkillManager {
     ) -> Result<String> {
         for idx in 2..1000 {
             let suffix = format!("-{idx}");
-            let max_base = crate::skills::validator::MAX_SKILL_NAME_LEN.saturating_sub(suffix.len());
+            let max_base =
+                crate::skills::validator::MAX_SKILL_NAME_LEN.saturating_sub(suffix.len());
             let trimmed: String = base.chars().take(max_base).collect();
             let candidate = format!("{}{suffix}", trimmed.trim_end_matches('-'));
             let disk_free = self

@@ -117,25 +117,27 @@ impl Ord for SemVer {
     fn cmp(&self, other: &Self) -> Ordering {
         (self.major, self.minor, self.patch)
             .cmp(&(other.major, other.minor, other.patch))
-            .then_with(|| match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => Ordering::Greater,
-                (false, true) => Ordering::Less,
-                (false, false) => {
-                    for (a, b) in self.prerelease.iter().zip(other.prerelease.iter()) {
-                        let ord = match (a.parse::<u64>(), b.parse::<u64>()) {
-                            (Ok(na), Ok(nb)) => na.cmp(&nb),
-                            (Ok(_), Err(_)) => Ordering::Less,
-                            (Err(_), Ok(_)) => Ordering::Greater,
-                            (Err(_), Err(_)) => a.cmp(b),
-                        };
-                        if ord != Ordering::Equal {
-                            return ord;
+            .then_with(
+                || match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => {
+                        for (a, b) in self.prerelease.iter().zip(other.prerelease.iter()) {
+                            let ord = match (a.parse::<u64>(), b.parse::<u64>()) {
+                                (Ok(na), Ok(nb)) => na.cmp(&nb),
+                                (Ok(_), Err(_)) => Ordering::Less,
+                                (Err(_), Ok(_)) => Ordering::Greater,
+                                (Err(_), Err(_)) => a.cmp(b),
+                            };
+                            if ord != Ordering::Equal {
+                                return ord;
+                            }
                         }
+                        self.prerelease.len().cmp(&other.prerelease.len())
                     }
-                    self.prerelease.len().cmp(&other.prerelease.len())
-                }
-            })
+                },
+            )
     }
 }
 
@@ -201,12 +203,8 @@ pub async fn check_for_updates() -> Result<UpdateCheckOutcome> {
     }
 
     let suffix = expected_asset_suffix();
-    let matched_asset = suffix.and_then(|suf| {
-        release
-            .assets
-            .iter()
-            .find(|a| a.name.ends_with(suf))
-    });
+    let matched_asset =
+        suffix.and_then(|suf| release.assets.iter().find(|a| a.name.ends_with(suf)));
     let checksums_asset = release
         .assets
         .iter()
@@ -233,10 +231,9 @@ pub async fn download_and_install(release: &ReleaseInfo) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("No release archive found for this platform"))?;
     // Refuse to install anything we cannot verify.
-    let checksums_url = release
-        .checksums_url
-        .as_deref()
-        .ok_or_else(|| anyhow!("Release has no {CHECKSUMS_ASSET_NAME}; refusing to install unverified update"))?;
+    let checksums_url = release.checksums_url.as_deref().ok_or_else(|| {
+        anyhow!("Release has no {CHECKSUMS_ASSET_NAME}; refusing to install unverified update")
+    })?;
 
     let client = reqwest::Client::builder()
         .user_agent(format!("same/{CURRENT_VERSION}"))
@@ -250,7 +247,10 @@ pub async fn download_and_install(release: &ReleaseInfo) -> Result<()> {
         .await
         .context("Failed to download checksum manifest")?;
     if !sums_resp.status().is_success() {
-        bail!("Checksum manifest download failed with HTTP {}", sums_resp.status());
+        bail!(
+            "Checksum manifest download failed with HTTP {}",
+            sums_resp.status()
+        );
     }
     let sums_text = sums_resp
         .text()
@@ -371,8 +371,7 @@ fn extract_and_replace(archive_bytes: &[u8], asset_name: &str) -> Result<()> {
             let _ = ORIGINAL_EXE.set(exe);
         }
 
-        self_replace::self_replace(&bin_path)
-            .context("Failed to replace current executable")?;
+        self_replace::self_replace(&bin_path).context("Failed to replace current executable")?;
         Ok(())
     })();
 
@@ -418,8 +417,7 @@ fn extract_zip_binary(archive_bytes: &[u8], dest_dir: &Path) -> Result<PathBuf> 
             let out_path = dest_dir.join(target_name);
             let mut out_file =
                 fs::File::create(&out_path).context("Failed to create extracted binary file")?;
-            std::io::copy(&mut file, &mut out_file)
-                .context("Failed to extract binary from zip")?;
+            std::io::copy(&mut file, &mut out_file).context("Failed to extract binary from zip")?;
             return Ok(out_path);
         }
     }
@@ -470,9 +468,7 @@ mod tests {
     fn finds_checksum_in_sha256sum_output() {
         let a = "a".repeat(64);
         let b = "B".repeat(64);
-        let manifest = format!(
-            "{a}  same-linux-x86_64.tar.gz\n{b} *same-windows-x86_64.zip\n"
-        );
+        let manifest = format!("{a}  same-linux-x86_64.tar.gz\n{b} *same-windows-x86_64.zip\n");
         assert_eq!(
             find_checksum(&manifest, "same-linux-x86_64.tar.gz"),
             Some(a.clone())
@@ -485,6 +481,12 @@ mod tests {
         // A suffix of a listed name must not match.
         assert_eq!(find_checksum(&manifest, "x86_64.tar.gz"), None);
         // Malformed hashes are ignored.
-        assert_eq!(find_checksum("deadbeef  same-linux-x86_64.tar.gz", "same-linux-x86_64.tar.gz"), None);
+        assert_eq!(
+            find_checksum(
+                "deadbeef  same-linux-x86_64.tar.gz",
+                "same-linux-x86_64.tar.gz"
+            ),
+            None
+        );
     }
 }

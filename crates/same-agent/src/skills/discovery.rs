@@ -161,7 +161,11 @@ pub async fn discover_external_skills(
         scan_root(&root, &target_label, &mut seen_paths, &mut found);
     }
 
-    found.sort_by(|a, b| a.name.cmp(&b.name).then(a.source_label.cmp(&b.source_label)));
+    found.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.source_label.cmp(&b.source_label))
+    });
     found
 }
 

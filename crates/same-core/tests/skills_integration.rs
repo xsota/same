@@ -216,7 +216,11 @@ fn project_assignment_and_precedence_end_to_end() -> Result<()> {
 
     // P2 is unaffected and gets both Global skills
     let res_p2 = resolve_skills(Some(&p2.id), &all, &mgr.list_assignments(&p2.id)?, &[]);
-    let p2_names: Vec<&str> = res_p2.active_skills.iter().map(|s| s.name.as_str()).collect();
+    let p2_names: Vec<&str> = res_p2
+        .active_skills
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
     assert_eq!(p2_names, vec!["common", "shared"]);
     assert_eq!(
         res_p2

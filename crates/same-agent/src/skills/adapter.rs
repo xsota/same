@@ -164,9 +164,7 @@ impl SkillSynchronizer {
 
         let skills_root = match method {
             SkillDeploymentMethod::ClaudePluginDir => staging_root.join("skills"),
-            SkillDeploymentMethod::AntigravityAddDir => {
-                staging_root.join(".agents").join("skills")
-            }
+            SkillDeploymentMethod::AntigravityAddDir => staging_root.join(".agents").join("skills"),
             SkillDeploymentMethod::CodexExtraRoots
             | SkillDeploymentMethod::OpenCodeConfigEnv
             | SkillDeploymentMethod::StagingCopy => staging_root.join("skills"),
@@ -299,7 +297,8 @@ impl SkillSynchronizer {
         for skill in &resolution.active_skills {
             let src_dir = Path::new(&skill.path);
             let dst_dir = skills_root.join(&skill.name);
-            let current_src_hash = compute_dir_hash(src_dir).unwrap_or_else(|_| skill.content_hash.clone());
+            let current_src_hash =
+                compute_dir_hash(src_dir).unwrap_or_else(|_| skill.content_hash.clone());
             let prev_deployed = manifest.skills.get(&skill.name).cloned();
 
             let mut status = SkillDeploymentStatus::Synced;
@@ -327,8 +326,7 @@ impl SkillSynchronizer {
                         manifest
                             .skills
                             .insert(skill.name.clone(), current_src_hash.clone());
-                        let _ =
-                            fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
+                        let _ = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
                     }
                 } else {
                     // Unmanaged directory at target path: treat as conflict and never

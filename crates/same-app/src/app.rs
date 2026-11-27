@@ -223,9 +223,7 @@ impl LiveDraft {
                     let before_err = self.content[..err_pos].trim_end();
                     let plan_scan_from = scan_from.min(before_err.len());
                     let body_len = match before_err[plan_scan_from..].find(PLAN_MARKER) {
-                        Some(rel_plan) => {
-                            before_err[..plan_scan_from + rel_plan].trim_end().len()
-                        }
+                        Some(rel_plan) => before_err[..plan_scan_from + rel_plan].trim_end().len(),
                         None => before_err.len(),
                     };
                     self.body_marker = LiveBodyMarkerState::Frozen(body_len);
@@ -973,9 +971,8 @@ impl SameAppView {
                 }
             },
         ));
-        let skill_picker_search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("スキル名・説明でフィルタ...")
-        });
+        let skill_picker_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("スキル名・説明でフィルタ..."));
         subscriptions.push(cx.subscribe_in(
             &skill_picker_search,
             window,
@@ -1694,7 +1691,7 @@ impl SameAppView {
         if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
             self.commit_rename(cx);
             self.clear_attachments();
-        self.selected_prompt_skills.clear();
+            self.selected_prompt_skills.clear();
         }
         self.selected_session_id = Some(session_id);
         self.active_view = MainView::Chat;
@@ -1764,7 +1761,7 @@ impl SameAppView {
             self.sessions.clear();
             self.selected_session_id = None;
             self.clear_attachments();
-        self.selected_prompt_skills.clear();
+            self.selected_prompt_skills.clear();
             self.messages.clear();
             self.session_markdown_views.clear();
             self.live_markdown_view = None;
@@ -1804,7 +1801,7 @@ impl SameAppView {
         if !keep_selected {
             self.selected_session_id = self.sessions.first().map(|s| s.id.clone());
             self.clear_attachments();
-        self.selected_prompt_skills.clear();
+            self.selected_prompt_skills.clear();
         }
 
         self.expanded_dirs.clear();
@@ -2104,7 +2101,7 @@ impl SameAppView {
         if self.selected_session_id.as_deref() == Some(sid.as_str()) {
             self.selected_session_id = self.sessions.first().map(|x| x.id.clone());
             self.clear_attachments();
-        self.selected_prompt_skills.clear();
+            self.selected_prompt_skills.clear();
             if self.selected_session_id.is_none() {
                 // Always keep a session to type into.
                 self.reload_project_state(window, cx);
@@ -2530,7 +2527,11 @@ impl SameAppView {
                     match check.auth_status {
                         ProviderAuthStatus::NotLoggedIn => (
                             false,
-                            format!("{} · {}", t(lang, "未ログイン", "Not logged in"), check.detail),
+                            format!(
+                                "{} · {}",
+                                t(lang, "未ログイン", "Not logged in"),
+                                check.detail
+                            ),
                         ),
                         ProviderAuthStatus::NoSubscription => (
                             false,
@@ -2632,24 +2633,24 @@ impl SameAppView {
         let tx = self.ui_tx.clone();
         let cwd = self.exec_cwd();
         let pref = self.exec_pref();
-        let handle = self
-            .agent_manager
-            .start_in_app_login(provider, pref, cwd, move |ev| match ev {
-                InteractiveLoginEvent::Output(chunk) => {
-                    let _ = tx.send(UiAsyncMsg::LoginOutput {
-                        attempt_id,
-                        provider_id: pid_ev.clone(),
-                        chunk,
-                    });
-                }
-                InteractiveLoginEvent::Done(result) => {
-                    let _ = tx.send(UiAsyncMsg::LoginDone {
-                        attempt_id,
-                        provider_id: pid_ev.clone(),
-                        result,
-                    });
-                }
-            });
+        let handle =
+            self.agent_manager
+                .start_in_app_login(provider, pref, cwd, move |ev| match ev {
+                    InteractiveLoginEvent::Output(chunk) => {
+                        let _ = tx.send(UiAsyncMsg::LoginOutput {
+                            attempt_id,
+                            provider_id: pid_ev.clone(),
+                            chunk,
+                        });
+                    }
+                    InteractiveLoginEvent::Done(result) => {
+                        let _ = tx.send(UiAsyncMsg::LoginDone {
+                            attempt_id,
+                            provider_id: pid_ev.clone(),
+                            result,
+                        });
+                    }
+                });
         self.active_login = Some((attempt_id, pid, handle));
     }
 
@@ -2779,7 +2780,9 @@ impl SameAppView {
                         self.pending_notes.push((
                             NoteKind::Success,
                             match lang {
-                                Language::Ja => format!("{count} 件のエージェントへスキルを同期しました"),
+                                Language::Ja => {
+                                    format!("{count} 件のエージェントへスキルを同期しました")
+                                }
                                 Language::En => format!("Synced skills for {count} provider(s)"),
                             },
                         ));
@@ -2830,7 +2833,9 @@ impl SameAppView {
                             self.pending_notes.push((
                                 NoteKind::Error,
                                 match lang {
-                                    Language::Ja => format!("アップデート確認に失敗しました: {err}"),
+                                    Language::Ja => {
+                                        format!("アップデート確認に失敗しました: {err}")
+                                    }
                                     Language::En => format!("Update check failed: {err}"),
                                 },
                             ));
@@ -3040,7 +3045,11 @@ impl SameAppView {
                         if !entry.ends_with('\n') && !entry.is_empty() {
                             entry.push('\n');
                         }
-                        entry.push_str(t(lang, "ログインが完了しました。", "Signed in successfully."));
+                        entry.push_str(t(
+                            lang,
+                            "ログインが完了しました。",
+                            "Signed in successfully.",
+                        ));
                     }
                     Err(e) => {
                         let entry = self.login_results.entry(provider_id).or_default();
@@ -3060,9 +3069,7 @@ impl SameAppView {
     fn handle_same_event(&mut self, ev: SameEvent, cx: &mut Context<Self>) {
         match ev {
             SameEvent::SessionStarted { session_id, .. } => {
-                self.live_drafts
-                    .entry(session_id.clone())
-                    .or_default();
+                self.live_drafts.entry(session_id.clone()).or_default();
                 if self.is_selected_session(&session_id) {
                     self.mark_feed_tail_dirty();
                 }
@@ -3609,7 +3616,8 @@ impl SameAppView {
                 }
             }
         }
-        let picked_skill_names: Vec<String> = picked_skills.iter().map(|s| s.name.clone()).collect();
+        let picked_skill_names: Vec<String> =
+            picked_skills.iter().map(|s| s.name.clone()).collect();
 
         if session.title == DEFAULT_SESSION_TITLE {
             let first_line = text
@@ -4315,7 +4323,10 @@ fn split_error(content: &str) -> (&str, Option<&str>) {
 
 /// Builds a compact 1-line status badge + summary label for a turn's tool calls
 /// in the main chat feed, keeping full inputs/outputs in the right-pane Tools view.
-fn summarize_tool_calls(tool_calls: &[ToolCallRecord], lang: Language) -> (&'static str, Hsla, String) {
+fn summarize_tool_calls(
+    tool_calls: &[ToolCallRecord],
+    lang: Language,
+) -> (&'static str, Hsla, String) {
     let total = tool_calls.len();
     let in_progress = tool_calls
         .iter()
@@ -4509,12 +4520,10 @@ impl SameAppView {
                     .when_some(
                         match &self.update_state {
                             UpdateState::Available(info) => Some(format!("↑ v{}", info.version)),
-                            UpdateState::Installed(ver) => Some(
-                                match lang {
-                                    Language::Ja => format!("再起動 (v{ver})"),
-                                    Language::En => format!("Restart (v{ver})"),
-                                },
-                            ),
+                            UpdateState::Installed(ver) => Some(match lang {
+                                Language::Ja => format!("再起動 (v{ver})"),
+                                Language::En => format!("Restart (v{ver})"),
+                            }),
                             _ => None,
                         },
                         |el, badge| {
@@ -5489,10 +5498,12 @@ impl SameAppView {
                                         .small()
                                         .primary()
                                         .label(t(lang, "送信", "Submit"))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.submit_in_app_login_code(window, cx);
-                                            cx.notify();
-                                        })),
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.submit_in_app_login_code(window, cx);
+                                                cx.notify();
+                                            }),
+                                        ),
                                     )
                                     .child(
                                         Button::new(SharedString::from(format!(
@@ -5502,10 +5513,12 @@ impl SameAppView {
                                         .small()
                                         .ghost()
                                         .label(t(lang, "キャンセル", "Cancel"))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.cancel_in_app_login(&pid_cancel);
-                                            cx.notify();
-                                        })),
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.cancel_in_app_login(&pid_cancel);
+                                                cx.notify();
+                                            }),
+                                        ),
                                     ),
                             )
                         }),
@@ -6288,7 +6301,11 @@ impl SameAppView {
                     .child(settings_row(
                         t(lang, "ソースコード", "Source code"),
                         &repo_url,
-                        div().h_flex().gap_1().child(releases_button).child(repo_button),
+                        div()
+                            .h_flex()
+                            .gap_1()
+                            .child(releases_button)
+                            .child(repo_button),
                         false,
                         &theme,
                     ))
@@ -6306,170 +6323,169 @@ impl SameAppView {
     fn render_update_row(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let lang = self.config.language;
-                let (update_desc, update_control): (String, AnyElement) = match &self.update_state {
-                    UpdateState::Idle => (
-                        t(
-                            lang,
-                            "GitHub Releases で新しいバージョンを確認します",
-                            "Check GitHub Releases for a newer version",
-                        )
-                        .to_string(),
-                        Button::new("settings-check-update")
-                            .small()
-                            .outline()
-                            .label(t(lang, "アップデートを確認", "Check for updates"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.check_for_updates(true);
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    ),
-                    UpdateState::Checking => (
-                        t(lang, "最新バージョンを確認しています...", "Checking for updates...")
-                            .to_string(),
-                        Button::new("settings-check-update")
-                            .small()
-                            .outline()
-                            .disabled(true)
-                            .label(t(lang, "確認中...", "Checking..."))
-                            .into_any_element(),
-                    ),
-                    UpdateState::UpToDate => (
-                        match lang {
-                            Language::Ja => {
-                                format!("v{CURRENT_VERSION} は最新です")
-                            }
-                            Language::En => {
-                                format!("v{CURRENT_VERSION} is up to date")
-                            }
-                        },
-                        Button::new("settings-check-update")
-                            .small()
-                            .outline()
-                            .label(t(lang, "再確認", "Check again"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.check_for_updates(true);
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    ),
-                    UpdateState::Available(info) => {
-                        let info_clone = info.clone();
-                        let has_asset =
-                            info.download_url.is_some() && info.checksums_url.is_some();
-                        let desc = match lang {
-                            Language::Ja => format!(
-                                "現在: v{CURRENT_VERSION} → 最新: v{}",
-                                info.version
-                            ),
-                            Language::En => format!(
-                                "Current: v{CURRENT_VERSION} → Latest: v{}",
-                                info.version
-                            ),
-                        };
-                        let ctrl = div()
-                            .h_flex()
-                            .gap_1()
-                            .when(has_asset, |d| {
-                                let ver_label = match lang {
-                                    Language::Ja => format!("v{} にアップデート", info.version),
-                                    Language::En => format!("Update to v{}", info.version),
-                                };
-                                d.child(
-                                    Button::new("settings-install-update")
-                                        .small()
-                                        .primary()
-                                        .label(ver_label)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.install_update(info_clone.clone());
-                                            cx.notify();
-                                        })),
-                                )
-                            })
-                            .child(
-                                Button::new("settings-recheck-update")
-                                    .small()
-                                    .ghost()
-                                    .label(t(lang, "再確認", "Recheck"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.check_for_updates(true);
-                                        cx.notify();
-                                    })),
-                            )
-                            .into_any_element();
-                        (desc, ctrl)
-                    }
-                    UpdateState::Downloading(info) => (
-                        match lang {
-                            Language::Ja => format!("v{} をダウンロードして適用しています...", info.version),
-                            Language::En => format!("Downloading and installing v{}...", info.version),
-                        },
-                        Button::new("settings-downloading-update")
-                            .small()
-                            .outline()
-                            .disabled(true)
-                            .label(t(lang, "アップデート中...", "Updating..."))
-                            .into_any_element(),
-                    ),
-                    UpdateState::Installed(ver) => (
-                        match lang {
-                            Language::Ja => format!("v{ver} の準備ができました。再起動して適用します"),
-                            Language::En => format!("v{ver} is ready. Restart to apply"),
-                        },
-                        Button::new("settings-restart-update")
-                            .small()
-                            .primary()
-                            .label(t(lang, "再起動して適用", "Restart to apply"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if this.file_dirty {
-                                    this.pending_notes.push((
-                                        NoteKind::Warning,
-                                        t(
-                                            this.config.language,
-                                            "未保存のファイルがあります。保存してから再起動してください",
-                                            "You have unsaved file changes. Save them before restarting",
-                                        )
-                                        .to_string(),
-                                    ));
-                                    cx.notify();
-                                    return;
-                                }
-                                if let Err(err) = updater::restart_self() {
-                                    this.pending_notes.push((
-                                        NoteKind::Error,
-                                        format!("Restart failed: {err:#}"),
-                                    ));
-                                    cx.notify();
-                                } else {
-                                    cx.quit();
-                                }
-                            }))
-                            .into_any_element(),
-                    ),
-                    UpdateState::Error(err) => (
-                        match lang {
-                            Language::Ja => format!("エラー: {err}"),
-                            Language::En => format!("Error: {err}"),
-                        },
-                        Button::new("settings-retry-update")
-                            .small()
-                            .outline()
-                            .label(t(lang, "再試行", "Retry"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.check_for_updates(true);
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    ),
-                };
-
-                settings_row(
-                    t(lang, "アップデート", "Updates"),
-                    &update_desc,
-                    update_control,
-                    false,
-                    &theme,
+        let (update_desc, update_control): (String, AnyElement) = match &self.update_state {
+            UpdateState::Idle => (
+                t(
+                    lang,
+                    "GitHub Releases で新しいバージョンを確認します",
+                    "Check GitHub Releases for a newer version",
                 )
+                .to_string(),
+                Button::new("settings-check-update")
+                    .small()
+                    .outline()
+                    .label(t(lang, "アップデートを確認", "Check for updates"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.check_for_updates(true);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            ),
+            UpdateState::Checking => (
+                t(
+                    lang,
+                    "最新バージョンを確認しています...",
+                    "Checking for updates...",
+                )
+                .to_string(),
+                Button::new("settings-check-update")
+                    .small()
+                    .outline()
+                    .disabled(true)
+                    .label(t(lang, "確認中...", "Checking..."))
+                    .into_any_element(),
+            ),
+            UpdateState::UpToDate => (
+                match lang {
+                    Language::Ja => {
+                        format!("v{CURRENT_VERSION} は最新です")
+                    }
+                    Language::En => {
+                        format!("v{CURRENT_VERSION} is up to date")
+                    }
+                },
+                Button::new("settings-check-update")
+                    .small()
+                    .outline()
+                    .label(t(lang, "再確認", "Check again"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.check_for_updates(true);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            ),
+            UpdateState::Available(info) => {
+                let info_clone = info.clone();
+                let has_asset = info.download_url.is_some() && info.checksums_url.is_some();
+                let desc = match lang {
+                    Language::Ja => format!("現在: v{CURRENT_VERSION} → 最新: v{}", info.version),
+                    Language::En => {
+                        format!("Current: v{CURRENT_VERSION} → Latest: v{}", info.version)
+                    }
+                };
+                let ctrl = div()
+                    .h_flex()
+                    .gap_1()
+                    .when(has_asset, |d| {
+                        let ver_label = match lang {
+                            Language::Ja => format!("v{} にアップデート", info.version),
+                            Language::En => format!("Update to v{}", info.version),
+                        };
+                        d.child(
+                            Button::new("settings-install-update")
+                                .small()
+                                .primary()
+                                .label(ver_label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.install_update(info_clone.clone());
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("settings-recheck-update")
+                            .small()
+                            .ghost()
+                            .label(t(lang, "再確認", "Recheck"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.check_for_updates(true);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element();
+                (desc, ctrl)
+            }
+            UpdateState::Downloading(info) => (
+                match lang {
+                    Language::Ja => {
+                        format!("v{} をダウンロードして適用しています...", info.version)
+                    }
+                    Language::En => format!("Downloading and installing v{}...", info.version),
+                },
+                Button::new("settings-downloading-update")
+                    .small()
+                    .outline()
+                    .disabled(true)
+                    .label(t(lang, "アップデート中...", "Updating..."))
+                    .into_any_element(),
+            ),
+            UpdateState::Installed(ver) => (
+                match lang {
+                    Language::Ja => format!("v{ver} の準備ができました。再起動して適用します"),
+                    Language::En => format!("v{ver} is ready. Restart to apply"),
+                },
+                Button::new("settings-restart-update")
+                    .small()
+                    .primary()
+                    .label(t(lang, "再起動して適用", "Restart to apply"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.file_dirty {
+                            this.pending_notes.push((
+                                NoteKind::Warning,
+                                t(
+                                    this.config.language,
+                                    "未保存のファイルがあります。保存してから再起動してください",
+                                    "You have unsaved file changes. Save them before restarting",
+                                )
+                                .to_string(),
+                            ));
+                            cx.notify();
+                            return;
+                        }
+                        if let Err(err) = updater::restart_self() {
+                            this.pending_notes
+                                .push((NoteKind::Error, format!("Restart failed: {err:#}")));
+                            cx.notify();
+                        } else {
+                            cx.quit();
+                        }
+                    }))
+                    .into_any_element(),
+            ),
+            UpdateState::Error(err) => (
+                match lang {
+                    Language::Ja => format!("エラー: {err}"),
+                    Language::En => format!("Error: {err}"),
+                },
+                Button::new("settings-retry-update")
+                    .small()
+                    .outline()
+                    .label(t(lang, "再試行", "Retry"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.check_for_updates(true);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            ),
+        };
+
+        settings_row(
+            t(lang, "アップデート", "Updates"),
+            &update_desc,
+            update_control,
+            false,
+            &theme,
+        )
     }
 
     fn render_appearance_settings(&self, cx: &mut Context<Self>) -> Div {
@@ -7939,7 +7955,8 @@ impl SameAppView {
                     Some(format!(
                         "⚠ {}",
                         match lang {
-                            Language::Ja => format!("{name} の有効なサブスクリプションがありません"),
+                            Language::Ja =>
+                                format!("{name} の有効なサブスクリプションがありません"),
                             Language::En => format!("{name} has no active subscription"),
                         }
                     ))
@@ -8081,8 +8098,7 @@ impl SameAppView {
                                 .read_with(&*cx, |this, _| {
                                     let anchor_changed =
                                         has_turn_anchor && this.sync_turn_anchor_tail_height().1;
-                                    let jump_changed =
-                                        this.is_feed_scrolled_up() != is_scrolled_up;
+                                    let jump_changed = this.is_feed_scrolled_up() != is_scrolled_up;
                                     anchor_changed || jump_changed
                                 })
                                 .unwrap_or(false);
@@ -8556,10 +8572,7 @@ impl SameAppView {
                 } else if let Some(state) = self.tracked_markdown_state(msg, is_live) {
                     TextView::new(state)
                 } else {
-                    TextView::markdown(
-                        SharedString::from(format!("md-{}", msg.id)),
-                        body.clone(),
-                    )
+                    TextView::markdown(SharedString::from(format!("md-{}", msg.id)), body.clone())
                 };
                 el.child(div().text_sm().child(text_view.selectable(true)))
             })
@@ -8912,12 +8925,10 @@ impl SameAppView {
                             t(lang, "ファイル", "Files").into(),
                             active_tab == RightTab::Files,
                         )
-                        .on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.select_right_tab(top, RightTab::Files, cx);
-                                cx.notify();
-                            },
-                        )),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_right_tab(top, RightTab::Files, cx);
+                            cx.notify();
+                        })),
                     )
                     .when(self.git_info.is_repo, |el| {
                         let changes = self
@@ -8957,12 +8968,10 @@ impl SameAppView {
                             },
                             active_tab == RightTab::Tools,
                         )
-                        .on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.select_right_tab(top, RightTab::Tools, cx);
-                                cx.notify();
-                            },
-                        )),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_right_tab(top, RightTab::Tools, cx);
+                            cx.notify();
+                        })),
                     )
                     .child(
                         tab(
@@ -8970,12 +8979,10 @@ impl SameAppView {
                             t(lang, "ログ", "Logs").into(),
                             active_tab == RightTab::Logs,
                         )
-                        .on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.select_right_tab(top, RightTab::Logs, cx);
-                                cx.notify();
-                            },
-                        )),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_right_tab(top, RightTab::Logs, cx);
+                            cx.notify();
+                        })),
                     ),
             )
             .child(if top {
@@ -9126,16 +9133,11 @@ impl SameAppView {
                         .bg(theme.background)
                         .border_1()
                         .border_color(theme.border)
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(t(
-                                    lang,
-                                    "選択中のターンのツール実行を表示中",
-                                    "Showing tool calls for selected turn",
-                                )),
-                        )
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(t(
+                            lang,
+                            "選択中のターンのツール実行を表示中",
+                            "Showing tool calls for selected turn",
+                        )))
                         .child(
                             Button::new("clear-tool-turn-filter")
                                 .xsmall()
@@ -9169,43 +9171,47 @@ impl SameAppView {
                                 )),
                         )
                     })
-                    .children(groups.into_iter().map(|(turn_no, msg_id, index_offset, tcs)| {
-                        let total_in_turn = index_offset + tcs.len();
-                        let header = match turn_no {
-                            None => t(lang, "実行中のターン", "Current turn").to_string(),
-                            Some(n) => match lang {
-                                Language::Ja => format!("ターン #{n} ({total_in_turn}件)"),
-                                Language::En => format!("Turn #{n} ({total_in_turn})"),
-                            },
-                        };
-                        let rows = if has_matching_filter {
-                            tcs.iter()
-                                .enumerate()
-                                .map(|(i, tc)| {
-                                    self.render_tool_call(&msg_id, index_offset + i, tc, cx)
-                                })
-                                .collect::<Vec<_>>()
-                        } else {
-                            tcs.iter()
-                                .enumerate()
-                                .rev()
-                                .map(|(i, tc)| {
-                                    self.render_tool_call(&msg_id, index_offset + i, tc, cx)
-                                })
-                                .collect::<Vec<_>>()
-                        };
-                        div()
-                            .v_flex()
-                            .gap_1()
-                            .child(
+                    .children(
+                        groups
+                            .into_iter()
+                            .map(|(turn_no, msg_id, index_offset, tcs)| {
+                                let total_in_turn = index_offset + tcs.len();
+                                let header = match turn_no {
+                                    None => t(lang, "実行中のターン", "Current turn").to_string(),
+                                    Some(n) => match lang {
+                                        Language::Ja => format!("ターン #{n} ({total_in_turn}件)"),
+                                        Language::En => format!("Turn #{n} ({total_in_turn})"),
+                                    },
+                                };
+                                let rows = if has_matching_filter {
+                                    tcs.iter()
+                                        .enumerate()
+                                        .map(|(i, tc)| {
+                                            self.render_tool_call(&msg_id, index_offset + i, tc, cx)
+                                        })
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    tcs.iter()
+                                        .enumerate()
+                                        .rev()
+                                        .map(|(i, tc)| {
+                                            self.render_tool_call(&msg_id, index_offset + i, tc, cx)
+                                        })
+                                        .collect::<Vec<_>>()
+                                };
                                 div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.muted_foreground)
-                                    .child(header),
-                            )
-                            .children(rows)
-                    }))
+                                    .v_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.muted_foreground)
+                                            .child(header),
+                                    )
+                                    .children(rows)
+                            }),
+                    )
                     .when(hidden_tool_count > 0, |el| {
                         el.child(
                             div().h_flex().justify_center().child(
@@ -9964,7 +9970,12 @@ fn user_markdown(text: &str) -> String {
 /// Extracts the first `https://` or `http://` URL from CLI login output.
 fn extract_first_url(text: &str) -> Option<String> {
     for token in text.split_whitespace() {
-        let cleaned = token.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | '"' | '\'' | ',' | ';'));
+        let cleaned = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '<' | '>' | '"' | '\'' | ',' | ';'
+            )
+        });
         if cleaned.starts_with("https://") || cleaned.starts_with("http://") {
             return Some(cleaned.to_string());
         }
@@ -10120,7 +10131,8 @@ mod tests {
     #[test]
     fn live_draft_incremental_markdown_body_matches_full_split() {
         let spaces_24 = " ".repeat(24);
-        let long_ws_case = format!("hello\n\n<!--same:plan-->\n{spaces_24}\n\n<!--same:error-->boom");
+        let long_ws_case =
+            format!("hello\n\n<!--same:plan-->\n{spaces_24}\n\n<!--same:error-->boom");
         let cases = [
             "こんにちは、日本語テキストと ASCII markdown `code` の混在応答です。",
             "末尾空白あり   \n\n<!--same:error-->connection dropped: 詳細はログ参照",
@@ -10164,7 +10176,11 @@ mod tests {
         }
 
         let mut split_ws = LiveDraft::new();
-        for chunk in ["hello\n\n<!--same:plan-->\n", spaces_24.as_str(), "\n\n<!--same:error-->boom"] {
+        for chunk in [
+            "hello\n\n<!--same:plan-->\n",
+            spaces_24.as_str(),
+            "\n\n<!--same:error-->boom",
+        ] {
             split_ws.push_content(chunk);
             assert_eq!(
                 split_ws.markdown_body(),

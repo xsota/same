@@ -51,7 +51,11 @@ pub(super) fn extract_dollar_skill_names(text: &str) -> Vec<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'$' {
-            let preceded_ok = i == 0 || text[..i].chars().next_back().is_some_and(char::is_whitespace);
+            let preceded_ok = i == 0
+                || text[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace);
             if preceded_ok {
                 let start = i + 1;
                 let mut end = start;
@@ -480,44 +484,48 @@ impl SameAppView {
                         .iter()
                         .any(|s| s.name == skill.name);
                     let fill = format!("{prefix}${} ", skill.name);
-                    list_row(SharedString::from(format!("skill-sug-{i}")), selected, &theme)
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(accent_text())
-                                .child(format!("${}", skill.name)),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .px_1()
-                                .rounded(px(3.0))
-                                .bg(theme.secondary)
-                                .text_color(theme.muted_foreground)
-                                .child(skill.badge.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(skill.description.clone()),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.prompt_input.update(cx, |ta, cx| {
-                                ta.set_value(fill.clone(), window, cx);
-                                ta.focus(window, cx);
-                            });
-                            this.prompt_empty = false;
-                            this.prompt_is_skill_mention = false;
-                            cx.notify();
-                        }))
+                    list_row(
+                        SharedString::from(format!("skill-sug-{i}")),
+                        selected,
+                        &theme,
+                    )
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(accent_text())
+                            .child(format!("${}", skill.name)),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .px_1()
+                            .rounded(px(3.0))
+                            .bg(theme.secondary)
+                            .text_color(theme.muted_foreground)
+                            .child(skill.badge.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(skill.description.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.prompt_input.update(cx, |ta, cx| {
+                            ta.set_value(fill.clone(), window, cx);
+                            ta.focus(window, cx);
+                        });
+                        this.prompt_empty = false;
+                        this.prompt_is_skill_mention = false;
+                        cx.notify();
+                    }))
                 }))
                 .into_any_element(),
         )
@@ -698,13 +706,11 @@ impl SameAppView {
             SkillScope::Global => None,
             SkillScope::Project => self.selected_project_id.clone(),
         };
-        match self.skills_ui.manager.create_skill(
-            &name,
-            &desc,
-            scope,
-            project_id.as_deref(),
-            &body,
-        ) {
+        match self
+            .skills_ui
+            .manager
+            .create_skill(&name, &desc, scope, project_id.as_deref(), &body)
+        {
             Ok(skill) => {
                 self.skills_ui.ai_error = None;
                 self.skills_ui.new_preview_mode = false;
@@ -735,7 +741,11 @@ impl SameAppView {
         }
     }
 
-    pub(super) fn apply_pending_skill_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn apply_pending_skill_draft(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(draft) = self.skills_ui.pending_generated_draft.take() {
             self.skills_ui.selected = Some(SelectedSkillItem::Creating);
             self.skills_ui
@@ -865,7 +875,11 @@ impl SameAppView {
                             SkillScope::Global => None,
                             SkillScope::Project => this.selected_project_id.as_deref(),
                         };
-                        match this.skills_ui.manager.inspect_import_source(&src, scope, pid) {
+                        match this
+                            .skills_ui
+                            .manager
+                            .inspect_import_source(&src, scope, pid)
+                        {
                             Ok(preview) => {
                                 if preview.candidates.is_empty() {
                                     this.pending_notes.push((
@@ -1077,8 +1091,12 @@ impl SameAppView {
                         self.trigger_skills_sync_all(false);
                         self.pending_notes.push((
                             NoteKind::Success,
-                            t(lang, "外部スキルを SAME にインポートしました", "Imported external skill into SAME")
-                                .to_string(),
+                            t(
+                                lang,
+                                "外部スキルを SAME にインポートしました",
+                                "Imported external skill into SAME",
+                            )
+                            .to_string(),
                         ));
                     }
                     Err(e) => {
@@ -1183,12 +1201,11 @@ impl SameAppView {
                             .h_flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(t(lang, "Skills Manager", "Skills Manager")),
-                            )
+                            .child(div().text_base().font_weight(FontWeight::BOLD).child(t(
+                                lang,
+                                "Skills Manager",
+                                "Skills Manager",
+                            )))
                             .child(
                                 div()
                                     .text_xs()
@@ -1434,13 +1451,15 @@ impl SameAppView {
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(accent_text())
-                            .child(t(
-                                lang,
-                                "✨ AIにお願いして下書きを作る",
-                                "✨ Draft with AI",
-                            )),
+                            .child(t(lang, "✨ AIにお願いして下書きを作る", "✨ Draft with AI")),
                     )
-                    .child(div().h_flex().items_center().gap_1().children(provider_buttons)),
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .gap_1()
+                            .children(provider_buttons),
+                    ),
             )
             .child(
                 div()
@@ -1469,8 +1488,7 @@ impl SameAppView {
                     .label(t(lang, "中断", "Stop"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.skills_ui.ai_generating = false;
-                        this.skills_ui.ai_request_id =
-                            this.skills_ui.ai_request_id.wrapping_add(1);
+                        this.skills_ui.ai_request_id = this.skills_ui.ai_request_id.wrapping_add(1);
                         cx.notify();
                     })),
             );
@@ -1525,16 +1543,11 @@ impl SameAppView {
                     .v_flex()
                     .gap_1()
                     .flex_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(t(
-                                lang,
-                                "スキル名（小文字英数字とハイフン 例: pr-security-review）",
-                                "Skill Name (lowercase letters, digits, hyphens, e.g. pr-security-review)",
-                            )),
-                    )
+                    .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(t(
+                        lang,
+                        "スキル名（小文字英数字とハイフン 例: pr-security-review）",
+                        "Skill Name (lowercase letters, digits, hyphens, e.g. pr-security-review)",
+                    )))
                     .child(Input::new(&self.skills_ui.new_name)),
             )
             .child(
@@ -1542,12 +1555,11 @@ impl SameAppView {
                     .v_flex()
                     .gap_1()
                     .flex_shrink_0()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(t(lang, "管理範囲", "Scope")),
-                    )
+                    .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(t(
+                        lang,
+                        "管理範囲",
+                        "Scope",
+                    )))
                     .child(
                         div()
                             .h_flex()
@@ -1555,8 +1567,12 @@ impl SameAppView {
                             .child(
                                 Button::new("new-scope-global")
                                     .small()
-                                    .when(self.skills_ui.new_scope == SkillScope::Global, |b| b.primary())
-                                    .when(self.skills_ui.new_scope != SkillScope::Global, |b| b.outline())
+                                    .when(self.skills_ui.new_scope == SkillScope::Global, |b| {
+                                        b.primary()
+                                    })
+                                    .when(self.skills_ui.new_scope != SkillScope::Global, |b| {
+                                        b.outline()
+                                    })
                                     .label("Global")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.skills_ui.new_scope = SkillScope::Global;
@@ -1567,8 +1583,12 @@ impl SameAppView {
                                 Button::new("new-scope-project")
                                     .small()
                                     .disabled(!has_project)
-                                    .when(self.skills_ui.new_scope == SkillScope::Project, |b| b.primary())
-                                    .when(self.skills_ui.new_scope != SkillScope::Project, |b| b.outline())
+                                    .when(self.skills_ui.new_scope == SkillScope::Project, |b| {
+                                        b.primary()
+                                    })
+                                    .when(self.skills_ui.new_scope != SkillScope::Project, |b| {
+                                        b.outline()
+                                    })
                                     .label("Project")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.skills_ui.new_scope = SkillScope::Project;
@@ -1586,16 +1606,11 @@ impl SameAppView {
         div()
             .v_flex()
             .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(t(
-                        lang,
-                        "説明（AIがこのスキルを使うべき条件を判断するための説明）",
-                        "Description (tells agents what this skill does and when to activate it)",
-                    )),
-            )
+            .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(t(
+                lang,
+                "説明（AIがこのスキルを使うべき条件を判断するための説明）",
+                "Description (tells agents what this skill does and when to activate it)",
+            )))
             .child(Input::new(&self.skills_ui.new_desc))
             .into_any_element()
     }
@@ -1626,12 +1641,11 @@ impl SameAppView {
                     .h_flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(t(lang, "指示内容 (SKILL.md 本文)", "Instructions (SKILL.md body)")),
-                    )
+                    .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(t(
+                        lang,
+                        "指示内容 (SKILL.md 本文)",
+                        "Instructions (SKILL.md body)",
+                    )))
                     .child(
                         Button::new("btn-new-preview-toggle")
                             .xsmall()
@@ -2250,7 +2264,9 @@ impl SameAppView {
         let lang = self.config.language;
 
         match &self.skills_ui.selected {
-            Some(SelectedSkillItem::Creating) => self.render_create_skill_pane(cx).into_any_element(),
+            Some(SelectedSkillItem::Creating) => {
+                self.render_create_skill_pane(cx).into_any_element()
+            }
 
             None => div()
                 .v_flex()
@@ -2259,16 +2275,11 @@ impl SameAppView {
                 .justify_center()
                 .p_6()
                 .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(t(
-                            lang,
-                            "左の一覧からスキルを選択して詳細・編集・同期状態を確認できます",
-                            "Select a skill from the list to view, edit, and inspect sync status",
-                        )),
-                )
+                .child(div().text_sm().text_color(theme.muted_foreground).child(t(
+                    lang,
+                    "左の一覧からスキルを選択して詳細・編集・同期状態を確認できます",
+                    "Select a skill from the list to view, edit, and inspect sync status",
+                )))
                 .into_any_element(),
 
             Some(SelectedSkillItem::Managed(skill_id)) => {
@@ -2376,7 +2387,8 @@ impl SameAppView {
                                                 t(lang, "プレビュー", "Preview")
                                             })
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.skills_ui.preview_mode = !this.skills_ui.preview_mode;
+                                                this.skills_ui.preview_mode =
+                                                    !this.skills_ui.preview_mode;
                                                 cx.notify();
                                             })),
                                     )
@@ -2449,7 +2461,8 @@ impl SameAppView {
                                                 this.trigger_skills_sync_all(false);
                                             }
                                             Err(e) => {
-                                                this.pending_notes.push((NoteKind::Error, format!("{e:#}")));
+                                                this.pending_notes
+                                                    .push((NoteKind::Error, format!("{e:#}")));
                                             }
                                         }
                                         cx.notify();
@@ -2466,8 +2479,12 @@ impl SameAppView {
                                     .ghost()
                                     .disabled(target_scope == SkillScope::Project && !has_project)
                                     .label(match target_scope {
-                                        SkillScope::Project => t(lang, "Projectへ移動", "Move to Project"),
-                                        SkillScope::Global => t(lang, "Globalへ移動", "Move to Global"),
+                                        SkillScope::Project => {
+                                            t(lang, "Projectへ移動", "Move to Project")
+                                        }
+                                        SkillScope::Global => {
+                                            t(lang, "Globalへ移動", "Move to Global")
+                                        }
                                     })
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         let pid = match target_scope {
@@ -2485,7 +2502,8 @@ impl SameAppView {
                                                 this.trigger_skills_sync_all(false);
                                             }
                                             Err(e) => {
-                                                this.pending_notes.push((NoteKind::Error, format!("{e:#}")));
+                                                this.pending_notes
+                                                    .push((NoteKind::Error, format!("{e:#}")));
                                             }
                                         }
                                         cx.notify();
@@ -2513,7 +2531,8 @@ impl SameAppView {
                                                     this.trigger_skills_sync_all(false);
                                                 }
                                                 Err(e) => {
-                                                    this.pending_notes.push((NoteKind::Error, format!("{e:#}")));
+                                                    this.pending_notes
+                                                        .push((NoteKind::Error, format!("{e:#}")));
                                                 }
                                             }
                                         }
@@ -2540,16 +2559,29 @@ impl SameAppView {
                                         .primary()
                                         .label(t(lang, "適用", "Apply"))
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            let next = this.skills_ui.rename_input.read(cx).value().trim().to_string();
-                                            match this.skills_ui.manager.rename_skill(&ren_id, &next) {
+                                            let next = this
+                                                .skills_ui
+                                                .rename_input
+                                                .read(cx)
+                                                .value()
+                                                .trim()
+                                                .to_string();
+                                            match this
+                                                .skills_ui
+                                                .manager
+                                                .rename_skill(&ren_id, &next)
+                                            {
                                                 Ok(updated) => {
                                                     this.skills_ui.renaming = false;
                                                     this.reload_skills_state();
-                                                    this.select_managed_skill(updated.id, window, cx);
+                                                    this.select_managed_skill(
+                                                        updated.id, window, cx,
+                                                    );
                                                     this.trigger_skills_sync_all(false);
                                                 }
                                                 Err(e) => {
-                                                    this.pending_notes.push((NoteKind::Error, format!("{e:#}")));
+                                                    this.pending_notes
+                                                        .push((NoteKind::Error, format!("{e:#}")));
                                                 }
                                             }
                                             cx.notify();
@@ -2583,7 +2615,10 @@ impl SameAppView {
                                     .p_3()
                                     .size_full()
                                     .overflow_y_scrollbar()
-                                    .child(TextView::markdown("skill-md-preview", editor_text).selectable(true))
+                                    .child(
+                                        TextView::markdown("skill-md-preview", editor_text)
+                                            .selectable(true),
+                                    )
                                     .into_any_element()
                             } else {
                                 Textarea::new(&self.skills_ui.editor_input)
@@ -2606,7 +2641,11 @@ impl SameAppView {
                                             .text_xs()
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(theme.muted_foreground)
-                                            .child(t(lang, "関連ファイル (scripts / references / assets)", "RELATED FILES")),
+                                            .child(t(
+                                                lang,
+                                                "関連ファイル (scripts / references / assets)",
+                                                "RELATED FILES",
+                                            )),
                                     )
                                     .child(
                                         Button::new("btn-skill-add-file")
@@ -2620,10 +2659,11 @@ impl SameAppView {
                             )
                             .when(self.skills_ui.related_files.is_empty(), |el| {
                                 el.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(t(lang, "関連ファイルはありません", "No related files")),
+                                    div().text_xs().text_color(theme.muted_foreground).child(t(
+                                        lang,
+                                        "関連ファイルはありません",
+                                        "No related files",
+                                    )),
                                 )
                             })
                             .children(self.skills_ui.related_files.iter().map(|rf| {
@@ -2656,11 +2696,15 @@ impl SameAppView {
                                             }),
                                     )
                                     .child(
-                                        Button::new(SharedString::from(format!("rm-rf-{}", rf.relative_path)))
-                                            .xsmall()
-                                            .ghost()
-                                            .label("✕")
-                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                        Button::new(SharedString::from(format!(
+                                            "rm-rf-{}",
+                                            rf.relative_path
+                                        )))
+                                        .xsmall()
+                                        .ghost()
+                                        .label("✕")
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
                                                 if this
                                                     .skills_ui
                                                     .manager
@@ -2676,7 +2720,8 @@ impl SameAppView {
                                                     this.trigger_skills_sync_all(false);
                                                 }
                                                 cx.notify();
-                                            })),
+                                            }),
+                                        ),
                                     )
                             })),
                     )
@@ -2690,20 +2735,41 @@ impl SameAppView {
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme.muted_foreground)
-                                    .child(t(lang, "エージェント別提供状態", "AGENT DEPLOYMENT STATUS")),
+                                    .child(t(
+                                        lang,
+                                        "エージェント別提供状態",
+                                        "AGENT DEPLOYMENT STATUS",
+                                    )),
                             )
                             .children(self.config.providers.iter().map(|provider| {
                                 let dep = deployments.iter().find(|d| d.provider_id == provider.id);
                                 let method = provider_skill_method(provider);
-                                let (st_label, st_color): (&str, Hsla) = match dep.map(|d| d.status) {
-                                    Some(SkillDeploymentStatus::Synced) => ("Synced", status_green().into()),
-                                    Some(SkillDeploymentStatus::Disabled) => ("Disabled", theme.muted_foreground),
-                                    Some(SkillDeploymentStatus::Conflict) => ("Conflict", status_amber().into()),
-                                    Some(SkillDeploymentStatus::Unsupported) => ("Unsupported", theme.muted_foreground),
-                                    Some(SkillDeploymentStatus::RestartRequired) => ("Restart Required", status_amber().into()),
-                                    Some(SkillDeploymentStatus::Error) => ("Error", status_red().into()),
-                                    Some(SkillDeploymentStatus::Syncing) => ("Syncing", accent_text().into()),
-                                    Some(SkillDeploymentStatus::Available) | None => ("Available", theme.muted_foreground),
+                                let (st_label, st_color): (&str, Hsla) = match dep.map(|d| d.status)
+                                {
+                                    Some(SkillDeploymentStatus::Synced) => {
+                                        ("Synced", status_green().into())
+                                    }
+                                    Some(SkillDeploymentStatus::Disabled) => {
+                                        ("Disabled", theme.muted_foreground)
+                                    }
+                                    Some(SkillDeploymentStatus::Conflict) => {
+                                        ("Conflict", status_amber().into())
+                                    }
+                                    Some(SkillDeploymentStatus::Unsupported) => {
+                                        ("Unsupported", theme.muted_foreground)
+                                    }
+                                    Some(SkillDeploymentStatus::RestartRequired) => {
+                                        ("Restart Required", status_amber().into())
+                                    }
+                                    Some(SkillDeploymentStatus::Error) => {
+                                        ("Error", status_red().into())
+                                    }
+                                    Some(SkillDeploymentStatus::Syncing) => {
+                                        ("Syncing", accent_text().into())
+                                    }
+                                    Some(SkillDeploymentStatus::Available) | None => {
+                                        ("Available", theme.muted_foreground)
+                                    }
                                 };
                                 let detail = dep
                                     .and_then(|d| d.last_error.clone())
@@ -2896,7 +2962,10 @@ mod prompt_skill_tests {
     #[test]
     fn detects_trailing_dollar_skill_token() {
         assert_eq!(detect_dollar_skill_token("$"), Some((0, "")));
-        assert_eq!(detect_dollar_skill_token("$code-rev"), Some((0, "code-rev")));
+        assert_eq!(
+            detect_dollar_skill_token("$code-rev"),
+            Some((0, "code-rev"))
+        );
         assert_eq!(
             detect_dollar_skill_token("PRを見て $sec"),
             Some(("PRを見て ".len(), "sec"))

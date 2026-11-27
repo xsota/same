@@ -266,19 +266,23 @@ mod tests {
         assert_eq!(active_names, vec!["global-only", "shared"]);
 
         // `shared` came from Project, not Global.
-        let shared = res.active_skills.iter().find(|s| s.name == "shared").unwrap();
+        let shared = res
+            .active_skills
+            .iter()
+            .find(|s| s.name == "shared")
+            .unwrap();
         assert_eq!(shared.scope, SkillScope::Project);
 
         // `blocked` must NOT fall back to Global!
         assert!(!active_names.contains(&"blocked"));
-        assert!(res
-            .conflicts
-            .iter()
-            .any(|c| c.skill_name == "blocked" && c.kind == SkillConflictKind::DisabledProjectBlocksGlobal));
-        assert!(res
-            .conflicts
-            .iter()
-            .any(|c| c.skill_name == "shared" && c.kind == SkillConflictKind::ProjectShadowsGlobal));
+        assert!(res.conflicts.iter().any(|c| c.skill_name == "blocked"
+            && c.kind == SkillConflictKind::DisabledProjectBlocksGlobal));
+        assert!(
+            res.conflicts
+                .iter()
+                .any(|c| c.skill_name == "shared"
+                    && c.kind == SkillConflictKind::ProjectShadowsGlobal)
+        );
     }
 
     #[test]
@@ -298,12 +302,25 @@ mod tests {
             },
         ];
 
-        let res_p1 = resolve_skills(Some("p1"), &[g.clone(), g_disabled.clone()], &assignments, &[]);
-        let names_p1: Vec<&str> = res_p1.active_skills.iter().map(|s| s.name.as_str()).collect();
+        let res_p1 = resolve_skills(
+            Some("p1"),
+            &[g.clone(), g_disabled.clone()],
+            &assignments,
+            &[],
+        );
+        let names_p1: Vec<&str> = res_p1
+            .active_skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
         assert_eq!(names_p1, vec!["opt-in"]);
 
         let res_p2 = resolve_skills(Some("p2"), &[g, g_disabled], &assignments, &[]);
-        let names_p2: Vec<&str> = res_p2.active_skills.iter().map(|s| s.name.as_str()).collect();
+        let names_p2: Vec<&str> = res_p2
+            .active_skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
         assert_eq!(names_p2, vec!["lint"]);
     }
 
@@ -333,10 +350,9 @@ mod tests {
             related_files: vec![],
         }];
         let res = resolve_skills(Some("p1"), &skills, &[], &externals);
-        assert!(res
-            .conflicts
-            .iter()
-            .any(|c| c.kind == SkillConflictKind::ExternalNameCollision && c.skill_name == "deploy"));
+        assert!(res.conflicts.iter().any(
+            |c| c.kind == SkillConflictKind::ExternalNameCollision && c.skill_name == "deploy"
+        ));
         assert!(res.entries[0].has_external_conflict);
     }
 }

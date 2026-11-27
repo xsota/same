@@ -155,8 +155,11 @@ fn has_dollar_skill_token(prompt: &str, name: &str) -> bool {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'$' {
-            let preceded_ok =
-                i == 0 || prompt[..i].chars().next_back().is_some_and(char::is_whitespace);
+            let preceded_ok = i == 0
+                || prompt[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace);
             if preceded_ok {
                 let start = i + 1;
                 let mut end = start;
@@ -664,11 +667,9 @@ impl AgentManager {
             return true;
         }
         match target {
-            ExecTarget::Host => ["OPENAI_API_KEY", "CODEX_API_KEY"].iter().any(|k| {
-                std::env::var(k)
-                    .ok()
-                    .is_some_and(|v| !v.trim().is_empty())
-            }),
+            ExecTarget::Host => ["OPENAI_API_KEY", "CODEX_API_KEY"]
+                .iter()
+                .any(|k| std::env::var(k).ok().is_some_and(|v| !v.trim().is_empty())),
             ExecTarget::Wsl { .. } => {
                 let mut cmd = build_command(
                     target,
@@ -1699,11 +1700,8 @@ impl AgentManager {
                             let is_edit =
                                 tool_call.get("kind").and_then(Value::as_str) == Some("edit");
                             let auto = if is_edit
-                                && acp_edit_within_workspace(
-                                    &tool_call,
-                                    &workspace_cwd,
-                                    &agent_cwd,
-                                ) {
+                                && acp_edit_within_workspace(&tool_call, &workspace_cwd, &agent_cwd)
+                            {
                                 AutoAllow::Edit
                             } else {
                                 AutoAllow::InFullAccess
@@ -2047,12 +2045,9 @@ fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
 /// config/profile flags that can supply credentials independently of
 /// `codex login status`.
 fn has_codex_runtime_auth_override(provider: &ProviderConfig) -> bool {
-    let has_env_key = ["OPENAI_API_KEY", "CODEX_API_KEY"].iter().any(|k| {
-        provider
-            .env
-            .get(*k)
-            .is_some_and(|v| !v.trim().is_empty())
-    });
+    let has_env_key = ["OPENAI_API_KEY", "CODEX_API_KEY"]
+        .iter()
+        .any(|k| provider.env.get(*k).is_some_and(|v| !v.trim().is_empty()));
     if has_env_key {
         return true;
     }
@@ -2214,11 +2209,7 @@ fn refine_claude_auth_with_state(
         }
     }
     // Extra usage (pay-as-you-go credits) or an active trial keeps the account usable.
-    if account
-        .get("hasExtraUsageEnabled")
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
+    if account.get("hasExtraUsageEnabled").and_then(Value::as_bool) == Some(true) {
         return ProviderAuthStatus::LoggedIn;
     }
     if let Some(trial_end) = account

@@ -757,7 +757,8 @@ impl Storage {
 
     pub fn list_all_skill_assignments(&self) -> Result<Vec<SkillAssignment>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT skill_id, project_id, enabled FROM skill_assignments")?;
+        let mut stmt =
+            conn.prepare("SELECT skill_id, project_id, enabled FROM skill_assignments")?;
         let rows = stmt.query_map([], |r| {
             Ok(SkillAssignment {
                 skill_id: r.get(0)?,

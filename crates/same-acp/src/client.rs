@@ -564,10 +564,7 @@ async fn handle_agent_request(
         | "terminal/release"
             if read_only =>
         {
-            Err((
-                -32601,
-                format!("{method} is disabled in read-only mode"),
-            ))
+            Err((-32601, format!("{method} is disabled in read-only mode")))
         }
         "terminal/create" => handle_terminal_create(params, base_cwd, target, terminals).await,
         "terminal/output" => handle_terminal_output(params, terminals).await,

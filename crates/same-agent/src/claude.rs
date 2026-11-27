@@ -403,8 +403,8 @@ async fn run_turn_on(
     let stdin = process.proc.stdin.clone();
 
     let wanted = claude_permission_mode(t.gate.mode(session_id));
-    let needs_mode_sync =
-        *process.mode.lock().unwrap() != wanted || !process.pending_modes.lock().unwrap().is_empty();
+    let needs_mode_sync = *process.mode.lock().unwrap() != wanted
+        || !process.pending_modes.lock().unwrap().is_empty();
     if needs_mode_sync {
         let (rid, req) = set_mode_request(wanted);
         process

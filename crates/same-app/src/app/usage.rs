@@ -145,12 +145,7 @@ impl SameAppView {
     pub(super) fn invalidate_and_refresh_quotas(&mut self, only: Option<&str>) {
         let ids: Vec<String> = match only {
             Some(id) => vec![id.to_string()],
-            None => self
-                .config
-                .providers
-                .iter()
-                .map(|p| p.id.clone())
-                .collect(),
+            None => self.config.providers.iter().map(|p| p.id.clone()).collect(),
         };
         for id in ids {
             let gen = self.quota_generations.entry(id.clone()).or_insert(0);
@@ -979,7 +974,10 @@ const QUOTA_GATE_MAX_AGE_SECS: i64 = 30 * 60;
 /// Summarizes account-wide (`Rolling`) quota windows for provider-level
 /// availability. Model-specific windows are excluded because exhausting a
 /// single model's limit does not prevent using other models on the provider.
-fn summarize_provider_quota(snap: &QuotaSnapshot, now: DateTime<Utc>) -> Option<ProviderQuotaSummary> {
+fn summarize_provider_quota(
+    snap: &QuotaSnapshot,
+    now: DateTime<Utc>,
+) -> Option<ProviderQuotaSummary> {
     if (now - snap.fetched_at).num_seconds() > QUOTA_GATE_MAX_AGE_SECS {
         return None;
     }
