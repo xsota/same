@@ -265,6 +265,7 @@ impl SameAppView {
     ) {
         self.pending_permissions
             .retain(|p| p.request_id != request_id);
+        self.mark_feed_tail_dirty();
         let mgr = self.agent_manager.clone();
         let rid = request_id.to_string();
         self.rt.spawn(async move {
@@ -289,6 +290,7 @@ impl SameAppView {
             return;
         };
         let pending = self.pending_inputs.remove(pos);
+        self.mark_feed_tail_dirty();
         let answers = submit.then(|| collect_answers(&pending, cx));
         let mgr = self.agent_manager.clone();
         let rid = request_id.to_string();

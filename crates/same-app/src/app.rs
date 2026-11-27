@@ -15,8 +15,9 @@ use gpui::{
     actions, div, list, prelude::FluentBuilder as _, px, AnyElement, App, AppContext, ClickEvent,
     ClipboardEntry, ClipboardItem, Context, Div, ElementId, Entity, ExternalPaths, FocusHandle,
     Focusable, FollowMode, FontWeight, Hsla, InteractiveElement, IntoElement, KeyBinding,
-    ListAlignment, ListState, ObjectFit, ParentElement, PathPromptOptions, Render, SharedString,
-    Stateful, StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Window,
+    ListAlignment, ListState, ObjectFit, ParentElement, PathPromptOptions, Pixels, Render,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, StyledImage as _, Subscription,
+    Window,
 };
 use gpui_component::button::{Button, ButtonRounded, ButtonVariants as _};
 use gpui_component::input::{
@@ -25,11 +26,11 @@ use gpui_component::input::{
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarMode};
-use gpui_component::text::TextView;
+use gpui_component::text::{RenderedText, TextView, TextViewState};
 use gpui_component::Selectable;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
-    TitleBar, WindowExt as _,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
+    StyledExt as _, Theme, TitleBar, WindowExt as _,
 };
 use same_agent::{
     exec as agent_exec, AgentManager, ExecPreference, InteractiveLoginEvent,
@@ -42,7 +43,7 @@ use same_core::{
     SameEvent, Session, SessionStatus, SlashCommandInfo, Storage, SubmitKey, ThemeMode,
     ToolCallRecord, ToolCallStatus, Workspace, MAX_FONT_SIZE, MIN_FONT_SIZE,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -109,13 +110,278 @@ const TOOL_OUTPUT_PREVIEW_CHARS: usize = 4000;
 /// An HTML comment, so it stays invisible if the text is shown as markdown.
 const ERROR_MARKER: &str = "\n\n<!--same:error-->";
 
-#[derive(Default)]
+const TURN_ANCHOR_TOP_GAP: Pixels = px(16.0);
+const FEED_ITEM_BOTTOM_PAD: Pixels = px(16.0);
+
+#[derive(Clone, Debug)]
+struct FeedTurnAnchor {
+    session_id: String,
+    user_msg_id: String,
+    estimated_user_height: Pixels,
+    measured_user_height: Option<Pixels>,
+    measured_assistant_height: Option<Pixels>,
+}
+
+/// Rough initial height of a newly sent user bubble row (including feed padding)
+/// before GPUI's first list layout pass measures its real bounds.
+fn estimate_user_row_height(content: &str, viewport_height: Pixels) -> Pixels {
+    let approx_lines = content
+        .lines()
+        .map(|line| (line.chars().count() / 48) + 1)
+        .sum::<usize>()
+        .max(1);
+    let raw = px(56.0 + approx_lines as f32 * 22.0);
+    raw.min((viewport_height * 0.65).max(px(64.0)))
+}
+
+/// Minimum height to reserve on the trailing live item so a newly sent prompt
+/// stays near the top of the viewport until the reply fills the space below.
+fn compute_turn_tail_min_height(
+    viewport_height: Pixels,
+    user_row_height: Pixels,
+    finalized_assistant_height: Option<Pixels>,
+) -> Pixels {
+    if viewport_height <= px(0.0) {
+        return px(0.0);
+    }
+    (viewport_height
+        - user_row_height
+        - finalized_assistant_height.unwrap_or(px(0.0))
+        - TURN_ANCHOR_TOP_GAP
+        - FEED_ITEM_BOTTOM_PAD)
+        .max(px(0.0))
+}
+
+const MAX_BODY_MARKER_LEN: usize = if ERROR_MARKER.len() > PLAN_MARKER.len() {
+    ERROR_MARKER.len()
+} else {
+    PLAN_MARKER.len()
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveBodyMarkerState {
+    /// Neither marker has appeared yet; the full `content` is the markdown body.
+    Unmarked,
+    /// `PLAN_MARKER` appeared (trailing newline at `err_start`), leaving
+    /// `body_len` bytes before it. Still tracking whether only whitespace
+    /// separates `PLAN_MARKER` from an `ERROR_MARKER` (which would cause
+    /// `split_error`'s `trim_end` to strip `PLAN_MARKER`'s trailing newline).
+    PlanSeen {
+        err_start: usize,
+        body_len: usize,
+        ws_scan_pos: usize,
+        err_candidate: Option<usize>,
+    },
+    /// The markdown body prefix length is permanently fixed at `usize` bytes.
+    Frozen(usize),
+}
+
 struct LiveDraft {
+    id: String,
     content: String,
+    body_marker: LiveBodyMarkerState,
     thinking: String,
     tool_calls: Vec<ToolCallRecord>,
     /// The plan the agent proposed (plan mode).
     plan: Option<String>,
+}
+
+impl LiveDraft {
+    fn new() -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            content: String::new(),
+            body_marker: LiveBodyMarkerState::Unmarked,
+            thinking: String::new(),
+            tool_calls: Vec::new(),
+            plan: None,
+        }
+    }
+
+    fn push_content(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let old_len = self.content.len();
+        self.content.push_str(text);
+        match self.body_marker {
+            LiveBodyMarkerState::Frozen(_) => {}
+            LiveBodyMarkerState::PlanSeen { .. } => self.advance_plan_seen(),
+            LiveBodyMarkerState::Unmarked => {
+                let mut scan_from = old_len.saturating_sub(MAX_BODY_MARKER_LEN - 1);
+                while scan_from > 0 && !self.content.is_char_boundary(scan_from) {
+                    scan_from -= 1;
+                }
+                let window = &self.content[scan_from..];
+                if let Some(rel_err) = window.find(ERROR_MARKER) {
+                    let err_pos = scan_from + rel_err;
+                    let before_err = self.content[..err_pos].trim_end();
+                    let plan_scan_from = scan_from.min(before_err.len());
+                    let body_len = match before_err[plan_scan_from..].find(PLAN_MARKER) {
+                        Some(rel_plan) => {
+                            before_err[..plan_scan_from + rel_plan].trim_end().len()
+                        }
+                        None => before_err.len(),
+                    };
+                    self.body_marker = LiveBodyMarkerState::Frozen(body_len);
+                } else if let Some(rel_plan) = window.find(PLAN_MARKER) {
+                    let plan_pos = scan_from + rel_plan;
+                    let body_len = self.content[..plan_pos].trim_end().len();
+                    let err_start = plan_pos + PLAN_MARKER.len() - 1;
+                    self.body_marker = LiveBodyMarkerState::PlanSeen {
+                        err_start,
+                        body_len,
+                        ws_scan_pos: plan_pos + PLAN_MARKER.len(),
+                        err_candidate: None,
+                    };
+                    self.advance_plan_seen();
+                }
+            }
+        }
+    }
+
+    fn advance_plan_seen(&mut self) {
+        let LiveBodyMarkerState::PlanSeen {
+            err_start,
+            body_len,
+            mut ws_scan_pos,
+            mut err_candidate,
+        } = self.body_marker
+        else {
+            return;
+        };
+
+        if err_candidate.is_none() {
+            if let Some((rel, _)) = self.content[ws_scan_pos..]
+                .char_indices()
+                .find(|(_, ch)| !ch.is_whitespace())
+            {
+                let non_ws_pos = ws_scan_pos + rel;
+                ws_scan_pos = non_ws_pos;
+                // `ERROR_MARKER` begins with ASCII `"\n\n"`, so checking raw
+                // bytes first guarantees `non_ws_pos - 2` is a UTF-8 char
+                // boundary even if preceded by multi-byte Unicode whitespace.
+                if non_ws_pos >= err_start + 2
+                    && self.content.as_bytes()[non_ws_pos - 2..non_ws_pos] == *b"\n\n"
+                {
+                    err_candidate = Some(non_ws_pos - 2);
+                } else {
+                    self.body_marker = LiveBodyMarkerState::Frozen(body_len);
+                    return;
+                }
+            } else {
+                self.body_marker = LiveBodyMarkerState::PlanSeen {
+                    err_start,
+                    body_len,
+                    ws_scan_pos: self.content.len(),
+                    err_candidate: None,
+                };
+                return;
+            }
+        }
+
+        if let Some(candidate) = err_candidate {
+            let tail = &self.content[candidate..];
+            if tail.len() >= ERROR_MARKER.len() {
+                if tail.starts_with(ERROR_MARKER) {
+                    let trimmed = self.content[..candidate].trim_end().len();
+                    self.body_marker = LiveBodyMarkerState::Frozen(trimmed);
+                } else {
+                    self.body_marker = LiveBodyMarkerState::Frozen(body_len);
+                }
+            } else if !ERROR_MARKER.starts_with(tail) {
+                self.body_marker = LiveBodyMarkerState::Frozen(body_len);
+            } else {
+                self.body_marker = LiveBodyMarkerState::PlanSeen {
+                    err_start,
+                    body_len,
+                    ws_scan_pos,
+                    err_candidate: Some(candidate),
+                };
+            }
+        }
+    }
+
+    fn markdown_body(&self) -> &str {
+        match self.body_marker {
+            LiveBodyMarkerState::Unmarked => &self.content,
+            LiveBodyMarkerState::PlanSeen { body_len, .. }
+            | LiveBodyMarkerState::Frozen(body_len) => &self.content[..body_len],
+        }
+    }
+}
+
+impl Default for LiveDraft {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Maximum number of recently finalized streamed replies whose `TextViewState`
+/// is retained in the active session for smooth handoff without unbounded growth.
+const MAX_SESSION_MARKDOWN_VIEWS: usize = 4;
+
+struct LiveMarkdownView {
+    session_id: String,
+    draft_id: String,
+    synced_len: usize,
+    state: Entity<TextViewState>,
+    last_rendered: RenderedText,
+    _subscription: Subscription,
+}
+
+struct FinalizedMarkdownView {
+    msg_id: String,
+    state: Entity<TextViewState>,
+    /// Full-document parse and its observer warming up in the background for
+    /// replies larger than `gpui-base`'s synchronous threshold; swapped into
+    /// `state` once committed.
+    _pending_full: Option<(Entity<TextViewState>, Subscription)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MarkdownBodySync<'a> {
+    Unchanged,
+    Append(&'a str),
+    Replace(&'a str),
+}
+
+fn message_markdown_body(content: &str) -> &str {
+    let (body, _) = split_error(content);
+    let (body, _) = split_plan(body);
+    body
+}
+
+fn diff_markdown_body(body: &str, synced_len: usize) -> MarkdownBodySync<'_> {
+    if body.len() > synced_len && body.is_char_boundary(synced_len) {
+        MarkdownBodySync::Append(&body[synced_len..])
+    } else if body.len() != synced_len {
+        MarkdownBodySync::Replace(body)
+    } else {
+        MarkdownBodySync::Unchanged
+    }
+}
+
+fn apply_markdown_body_sync(
+    view: &mut LiveMarkdownView,
+    body: &str,
+    cx: &mut Context<SameAppView>,
+) {
+    match diff_markdown_body(body, view.synced_len) {
+        MarkdownBodySync::Unchanged => {}
+        MarkdownBodySync::Append(delta) => {
+            let state = view.state.clone();
+            state.update(cx, |s, cx| s.push_str(delta, cx));
+            view.synced_len = body.len();
+            view.last_rendered = state.read(cx).rendered_text();
+        }
+        MarkdownBodySync::Replace(full) => {
+            let state = view.state.clone();
+            state.update(cx, |s, cx| s.set_text(full, cx));
+            view.synced_len = body.len();
+            view.last_rendered = state.read(cx).rendered_text();
+        }
+    }
 }
 
 enum UiAsyncMsg {
@@ -282,6 +548,13 @@ pub struct SameAppView {
     messages: Vec<Message>,
 
     live_drafts: HashMap<String, LiveDraft>,
+    /// Observed `TextViewState` for the selected session's streaming markdown body,
+    /// so async markdown parses invalidate the trailing feed row height without
+    /// allocating parser state for unselected background sessions.
+    live_markdown_view: Option<LiveMarkdownView>,
+    /// Bounded handoff cache of recently finalized `TextViewState` instances for the
+    /// active session, avoiding reparse flicker on finalize and catching late parses.
+    session_markdown_views: VecDeque<FinalizedMarkdownView>,
     pending_permissions: Vec<PermissionRequest>,
     /// Question cards waiting for answers.
     pending_inputs: Vec<PendingInput>,
@@ -367,6 +640,14 @@ pub struct SameAppView {
     feed: ListState,
     /// (session id, item count) the feed was last synced with.
     feed_synced: std::cell::RefCell<(Option<String>, usize)>,
+    /// Whether the trailing item's rendered height needs remeasurement next frame.
+    feed_tail_dirty: std::cell::Cell<bool>,
+    /// Minimum height reserved for the trailing item to keep a newly sent user prompt near the top.
+    feed_tail_min_height: std::cell::Cell<Pixels>,
+    /// Most recent prepainted height of the live reply content inside the trailing item.
+    feed_live_content_height: std::rc::Rc<std::cell::Cell<Pixels>>,
+    /// Active turn anchor keeping the newly sent user prompt near the viewport top.
+    feed_turn_anchor: std::cell::RefCell<Option<FeedTurnAnchor>>,
     renaming_session_id: Option<String>,
     rename_input: Entity<InputState>,
 
@@ -477,7 +758,7 @@ impl SameAppView {
         cx.spawn(async move |this, cx| {
             while let Some(msg) = ui_rx.recv().await {
                 let updated = this.update(cx, |view, cx| {
-                    view.handle_async_msg(msg);
+                    view.handle_async_msg(msg, cx);
                     cx.notify();
                 });
                 if updated.is_err() {
@@ -706,6 +987,8 @@ impl SameAppView {
             selected_session_id: None,
             messages: vec![],
             live_drafts: HashMap::new(),
+            live_markdown_view: None,
+            session_markdown_views: VecDeque::new(),
             pending_permissions: vec![],
             pending_inputs: vec![],
             approval_focus: cx.focus_handle(),
@@ -754,6 +1037,10 @@ impl SameAppView {
                 feed
             },
             feed_synced: Default::default(),
+            feed_tail_dirty: std::cell::Cell::new(false),
+            feed_tail_min_height: std::cell::Cell::new(px(0.0)),
+            feed_live_content_height: std::rc::Rc::new(std::cell::Cell::new(px(0.0))),
+            feed_turn_anchor: std::cell::RefCell::new(None),
             renaming_session_id: None,
             rename_input,
             show_right_panel: true,
@@ -957,14 +1244,256 @@ impl SameAppView {
         self.live_drafts.contains_key(session_id)
     }
 
+    fn is_selected_session(&self, session_id: &str) -> bool {
+        self.selected_session_id.as_deref() == Some(session_id)
+    }
+
+    pub(super) fn mark_feed_tail_dirty(&self) {
+        self.feed_tail_dirty.set(true);
+    }
+
+    fn sync_live_markdown_for_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(sid) = self.selected_session_id.as_deref() else {
+            self.live_markdown_view = None;
+            return;
+        };
+        let Some(draft) = self.live_drafts.get(sid) else {
+            self.live_markdown_view = None;
+            return;
+        };
+        let body = draft.markdown_body();
+        if let Some(view) = self.live_markdown_view.as_mut() {
+            if view.session_id == sid && view.draft_id == draft.id {
+                if body.len() < view.synced_len && body.trim().is_empty() {
+                    self.live_markdown_view = None;
+                    return;
+                }
+                apply_markdown_body_sync(view, body, cx);
+                return;
+            }
+        }
+        if body.trim().is_empty() {
+            self.live_markdown_view = None;
+            return;
+        }
+
+        let sid_owned = sid.to_string();
+        let draft_id = draft.id.clone();
+        let synced_len = body.len();
+        let state = cx.new(|cx| TextViewState::markdown(body, cx));
+        let last_rendered = state.read(cx).rendered_text();
+        let obs_sid = sid_owned.clone();
+        let obs_msg_id = draft_id.clone();
+        let subscription = cx.observe(&state, move |this, state, cx| {
+            let rendered = state.read(cx).rendered_text();
+            if let Some(view) = this
+                .live_markdown_view
+                .as_mut()
+                .filter(|v| v.session_id == obs_sid && v.draft_id == obs_msg_id)
+            {
+                if view.last_rendered != rendered {
+                    view.last_rendered = rendered;
+                    if this.is_selected_session(&obs_sid) {
+                        this.mark_feed_tail_dirty();
+                        cx.notify();
+                    }
+                }
+            }
+        });
+        self.live_markdown_view = Some(LiveMarkdownView {
+            session_id: sid_owned,
+            draft_id,
+            synced_len,
+            state,
+            last_rendered,
+            _subscription: subscription,
+        });
+    }
+
+    fn handoff_finalized_markdown(
+        &mut self,
+        session_id: &str,
+        msg_id: &str,
+        final_body: &str,
+        live_md: LiveMarkdownView,
+        cx: &mut Context<Self>,
+    ) {
+        if live_md.draft_id != msg_id || final_body.trim().is_empty() {
+            return;
+        }
+        let full_state = cx.new(|cx| TextViewState::markdown(final_body, cx));
+        let initial_rendered = full_state.read(cx).rendered_text();
+        if initial_rendered.source().len() == final_body.len() {
+            // Replies within gpui-base's synchronous threshold parse completely
+            // right away; swap immediately so forward references resolve without
+            // keeping the incremental streaming state.
+            self.push_session_markdown_view(FinalizedMarkdownView {
+                msg_id: msg_id.to_string(),
+                state: full_state,
+                _pending_full: None,
+            });
+            return;
+        }
+
+        // Larger replies parse asynchronously in the background. Keep rendering
+        // the streamed state until the full-document parse commits so handoff
+        // does not flash blank, then swap atomically and remeasure the row.
+        let obs_sid = session_id.to_string();
+        let obs_msg_id = msg_id.to_string();
+        let subscription = cx.observe(&full_state, move |this, full_state, cx| {
+            let rendered = full_state.read(cx).rendered_text();
+            if rendered == initial_rendered {
+                return;
+            }
+            if let Some(view) = this
+                .session_markdown_views
+                .iter_mut()
+                .find(|v| v.msg_id == obs_msg_id)
+            {
+                view.state = full_state;
+                view._pending_full = None;
+                if this.is_selected_session(&obs_sid) {
+                    if let Some(ix) = this.messages.iter().rposition(|m| m.id == obs_msg_id) {
+                        this.remeasure_feed_item(ix);
+                        cx.notify();
+                    }
+                }
+            }
+        });
+        self.push_session_markdown_view(FinalizedMarkdownView {
+            msg_id: msg_id.to_string(),
+            state: live_md.state,
+            _pending_full: Some((full_state, subscription)),
+        });
+    }
+
+    fn push_session_markdown_view(&mut self, view: FinalizedMarkdownView) {
+        self.session_markdown_views
+            .retain(|existing| existing.msg_id != view.msg_id);
+        while self.session_markdown_views.len() >= MAX_SESSION_MARKDOWN_VIEWS {
+            self.session_markdown_views.pop_front();
+        }
+        self.session_markdown_views.push_back(view);
+    }
+
+    fn tracked_markdown_state(
+        &self,
+        msg: &Message,
+        is_live: bool,
+    ) -> Option<&Entity<TextViewState>> {
+        if is_live {
+            self.live_markdown_view
+                .as_ref()
+                .filter(|v| v.session_id == msg.session_id && v.draft_id == msg.id)
+                .map(|v| &v.state)
+        } else {
+            self.session_markdown_views
+                .iter()
+                .find(|v| v.msg_id == msg.id)
+                .map(|v| &v.state)
+        }
+    }
+
+    fn clear_turn_anchor(&self) {
+        *self.feed_turn_anchor.borrow_mut() = None;
+        self.feed_live_content_height.set(px(0.0));
+        if self.feed_tail_min_height.replace(px(0.0)) > px(0.0) {
+            self.feed_tail_dirty.set(true);
+        }
+    }
+
     /// Jumps the feed to the latest message and keeps following new output
     /// (until the user scrolls up; scrolling back down resumes following).
     fn scroll_feed_to_end(&self) {
         self.feed.set_follow_mode(FollowMode::Tail);
+        self.feed.scroll_to_end();
+    }
+
+    fn is_feed_scrolled_up(&self) -> bool {
+        let max_y = self.feed.max_offset_for_scrollbar().y;
+        if max_y <= px(0.0) || self.feed.is_following_tail() {
+            return false;
+        }
+        let current_y = -self.feed.scroll_px_offset_for_scrollbar().y;
+        current_y < max_y - px(2.0)
+    }
+
+    fn should_anchor_new_turn(&self) -> bool {
+        if self.messages.is_empty() {
+            return false;
+        }
+        let viewport = self.feed.viewport_bounds();
+        if viewport.size.height <= px(0.0) {
+            return false;
+        }
+        if self.feed.max_offset_for_scrollbar().y > px(0.0) {
+            return true;
+        }
+        let last_ix = self.messages.len() - 1;
+        self.feed
+            .bounds_for_item(last_ix)
+            .is_some_and(|b| b.bottom() - viewport.top() > viewport.size.height * 0.45)
+    }
+
+    fn sync_turn_anchor_tail_height(&self) -> (Pixels, bool) {
+        let viewport = self.feed.viewport_bounds();
+        let selected_sid = self.selected_session_id.as_deref();
+        let synced_matches = self.feed_synced.borrow().0 == self.selected_session_id;
+        let feed_count = self.feed.item_count();
+        let mut min_h = px(0.0);
+        let mut clear_stale = false;
+
+        if let Some(anchor) = self.feed_turn_anchor.borrow_mut().as_mut() {
+            if Some(anchor.session_id.as_str()) != selected_sid {
+                clear_stale = true;
+            } else if let Some(anchor_ix) = self
+                .messages
+                .iter()
+                .rposition(|m| m.id == anchor.user_msg_id)
+            {
+                let running = self.is_session_running(&anchor.session_id);
+                let has_finalized_reply = !running && anchor_ix + 1 < self.messages.len();
+                if synced_matches {
+                    if anchor_ix < feed_count {
+                        if let Some(b) = self.feed.bounds_for_item(anchor_ix) {
+                            anchor.measured_user_height = Some(b.size.height);
+                        }
+                    }
+                    if has_finalized_reply && anchor_ix + 1 < feed_count {
+                        if let Some(b) = self.feed.bounds_for_item(anchor_ix + 1) {
+                            anchor.measured_assistant_height = Some(b.size.height);
+                        }
+                    }
+                }
+                let user_h = anchor
+                    .measured_user_height
+                    .unwrap_or(anchor.estimated_user_height);
+                let assistant_h = if has_finalized_reply {
+                    anchor.measured_assistant_height
+                } else {
+                    None
+                };
+                min_h = compute_turn_tail_min_height(viewport.size.height, user_h, assistant_h);
+            } else {
+                clear_stale = true;
+            }
+        }
+
+        if clear_stale {
+            *self.feed_turn_anchor.borrow_mut() = None;
+        }
+
+        let changed = (min_h - self.feed_tail_min_height.get()).abs() > px(0.5);
+        if changed {
+            self.feed_tail_min_height.set(min_h);
+            self.feed_tail_dirty.set(true);
+        }
+
+        (min_h, changed)
     }
 
     /// Brings the feed's item count in line with the current session. Called
-    /// on every render; cheap when nothing changed.
+    /// on every render (and right after sending); cheap when nothing changed.
     fn sync_feed(&self) {
         let count = self.messages.len() + 1;
         let mut synced = self.feed_synced.borrow_mut();
@@ -973,13 +1502,39 @@ impl SameAppView {
         if session_changed || count < old || old == 0 {
             self.feed.reset(count);
             self.scroll_feed_to_end();
+            self.feed_tail_dirty.set(false);
         } else if count > old {
             // New messages: replace the old trailing item and append.
             self.feed.splice(old - 1..old, count - old + 1);
+            self.feed_tail_dirty.set(false);
+        } else if self.feed_tail_dirty.replace(false) && count > 0 {
+            self.feed.remeasure_items(count - 1..count);
         }
-        // The trailing item (live reply, permissions) changes while streaming.
-        self.feed.remeasure_items(count - 1..count);
         *synced = (self.selected_session_id.clone(), count);
+    }
+
+    /// Inserts the finalized assistant message before the trailing live item
+    /// without resetting `scroll_anchor` on that item if the user scrolled there.
+    fn sync_feed_after_finalize(&self) {
+        let count = self.messages.len() + 1;
+        let mut synced = self.feed_synced.borrow_mut();
+        if synced.0 == self.selected_session_id && synced.1 > 0 && count == synced.1 + 1 {
+            let old = synced.1;
+            self.feed.splice(old..old, 1);
+            self.feed.remeasure_items(old - 1..old);
+            *synced = (self.selected_session_id.clone(), count);
+            self.feed_tail_dirty.set(true);
+        } else {
+            drop(synced);
+            self.mark_feed_tail_dirty();
+            self.sync_feed();
+        }
+    }
+
+    fn remeasure_feed_item(&self, ix: usize) {
+        if ix < self.feed.item_count() {
+            self.feed.remeasure_items(ix..ix + 1);
+        }
     }
 
     /// Forces a full feed rebuild on the next render (messages replaced).
@@ -1063,6 +1618,10 @@ impl SameAppView {
             self.clear_attachments();
         self.selected_prompt_skills.clear();
             self.messages.clear();
+            self.session_markdown_views.clear();
+            self.live_markdown_view = None;
+            self.clear_turn_anchor();
+            self.invalidate_feed();
             self.file_entries.clear();
             self.git_info = GitInfo::default();
             return;
@@ -1104,13 +1663,17 @@ impl SameAppView {
         self.scroll_feed_to_end();
     }
 
-    fn reload_messages(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn reload_messages(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_turn_anchor();
+        self.session_markdown_views.clear();
         if let Some(sid) = self.selected_session_id.as_deref() {
             self.messages = self.storage.list_messages(sid).unwrap_or_default();
             self.invalidate_feed();
         } else {
             self.messages.clear();
+            self.invalidate_feed();
         }
+        self.sync_live_markdown_for_selected(cx);
     }
 
     fn reload_workspace_files(&mut self, cx: &Context<Self>) {
@@ -1360,6 +1923,13 @@ impl SameAppView {
             let s = sid.clone();
             self.rt.spawn(async move { mgr.cancel_session(&s).await });
             self.live_drafts.remove(&sid);
+        }
+        if self
+            .live_markdown_view
+            .as_ref()
+            .is_some_and(|v| v.session_id == sid)
+        {
+            self.live_markdown_view = None;
         }
         self.agent_manager.release_session(&sid);
         self.pending_permissions.retain(|p| p.session_id != sid);
@@ -1973,7 +2543,7 @@ impl SameAppView {
         });
     }
 
-    fn handle_async_msg(&mut self, msg: UiAsyncMsg) {
+    fn handle_async_msg(&mut self, msg: UiAsyncMsg, cx: &mut Context<Self>) {
         match msg {
             UiAsyncMsg::ExternalSkillsDiscovered { generation, skills } => {
                 if self.skills_ui.discovery_generation == generation {
@@ -2292,14 +2862,19 @@ impl SameAppView {
                 }
                 self.refresh_provider_checks();
             }
-            UiAsyncMsg::Event(ev) => self.handle_same_event(ev),
+            UiAsyncMsg::Event(ev) => self.handle_same_event(ev, cx),
         }
     }
 
-    fn handle_same_event(&mut self, ev: SameEvent) {
+    fn handle_same_event(&mut self, ev: SameEvent, cx: &mut Context<Self>) {
         match ev {
             SameEvent::SessionStarted { session_id, .. } => {
-                self.live_drafts.entry(session_id).or_default();
+                self.live_drafts
+                    .entry(session_id.clone())
+                    .or_default();
+                if self.is_selected_session(&session_id) {
+                    self.mark_feed_tail_dirty();
+                }
             }
             SameEvent::SessionStatusChanged { session_id, status } => {
                 let _ = self.storage.update_session_meta(
@@ -2312,6 +2887,9 @@ impl SameAppView {
                 );
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                     s.status = status;
+                }
+                if self.is_selected_session(&session_id) {
+                    self.mark_feed_tail_dirty();
                 }
             }
             SameEvent::ExternalSessionBound {
@@ -2332,12 +2910,21 @@ impl SameAppView {
             }
             SameEvent::MessageDelta { session_id, text } => {
                 if let Some(d) = self.live_drafts.get_mut(&session_id) {
-                    d.content.push_str(&text);
+                    d.push_content(&text);
+                } else {
+                    return;
+                }
+                if self.is_selected_session(&session_id) {
+                    self.mark_feed_tail_dirty();
+                    self.sync_live_markdown_for_selected(cx);
                 }
             }
             SameEvent::ThinkingDelta { session_id, text } => {
                 if let Some(d) = self.live_drafts.get_mut(&session_id) {
                     d.thinking.push_str(&text);
+                    if self.is_selected_session(&session_id) {
+                        self.mark_feed_tail_dirty();
+                    }
                 }
             }
             SameEvent::ToolCallStarted {
@@ -2351,6 +2938,9 @@ impl SameAppView {
                     *existing = tool_call;
                 } else {
                     draft.tool_calls.push(tool_call);
+                }
+                if self.is_selected_session(&session_id) {
+                    self.mark_feed_tail_dirty();
                 }
             }
             SameEvent::ToolCallUpdated {
@@ -2377,6 +2967,9 @@ impl SameAppView {
                 } else {
                     draft.tool_calls.push(tool_call);
                 }
+                if self.is_selected_session(&session_id) {
+                    self.mark_feed_tail_dirty();
+                }
             }
             SameEvent::ApprovalRequested { request } => {
                 // A request that arrives after the run was stopped can't be
@@ -2388,7 +2981,7 @@ impl SameAppView {
                         .spawn(async move { mgr.respond_permission(&rid, None).await });
                     return;
                 }
-                if self.selected_session_id.as_deref() != Some(request.session_id.as_str()) {
+                if !self.is_selected_session(&request.session_id) {
                     let title = self
                         .sessions
                         .iter()
@@ -2404,6 +2997,7 @@ impl SameAppView {
                     );
                 } else {
                     self.focus_approval = true;
+                    self.mark_feed_tail_dirty();
                 }
                 self.notify_waiting(
                     &request.session_id,
@@ -2420,8 +3014,9 @@ impl SameAppView {
                     return;
                 }
                 let lang = self.config.language;
-                if self.selected_session_id.as_deref() == Some(request.session_id.as_str()) {
+                if self.is_selected_session(&request.session_id) {
                     self.focus_approval = true;
+                    self.mark_feed_tail_dirty();
                 } else {
                     let title = self
                         .sessions
@@ -2440,13 +3035,22 @@ impl SameAppView {
                 );
                 self.pending_inputs.push(PendingInput::new(request));
             }
-            SameEvent::UserInputWithdrawn { request_id, .. } => {
+            SameEvent::UserInputWithdrawn {
+                session_id,
+                request_id,
+            } => {
                 self.pending_inputs
                     .retain(|p| p.request.request_id != request_id);
+                if self.is_selected_session(&session_id) {
+                    self.mark_feed_tail_dirty();
+                }
             }
             SameEvent::PlanProposed { session_id, plan } => {
                 if let Some(draft) = self.live_drafts.get_mut(&session_id) {
                     draft.plan = Some(plan);
+                    if self.is_selected_session(&session_id) {
+                        self.mark_feed_tail_dirty();
+                    }
                 }
             }
             SameEvent::ApprovalWithdrawn {
@@ -2456,6 +3060,9 @@ impl SameAppView {
             } => {
                 self.pending_permissions
                     .retain(|p| p.request_id != request_id);
+                if self.is_selected_session(&session_id) {
+                    self.mark_feed_tail_dirty();
+                }
                 if remaining == 0 && self.live_drafts.contains_key(&session_id) {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                         if s.status == SessionStatus::WaitingForApproval {
@@ -2498,14 +3105,14 @@ impl SameAppView {
                 }
             }
             SameEvent::SessionCompleted { session_id, .. } => {
-                self.finalize_live_draft(&session_id, SessionStatus::Completed, None);
+                self.finalize_live_draft(&session_id, SessionStatus::Completed, None, cx);
                 self.refresh_quota_after_turn(&session_id);
             }
             SameEvent::SessionCancelled { session_id } => {
-                self.finalize_live_draft(&session_id, SessionStatus::Cancelled, None);
+                self.finalize_live_draft(&session_id, SessionStatus::Cancelled, None, cx);
             }
             SameEvent::SessionFailed { session_id, error } => {
-                self.finalize_live_draft(&session_id, SessionStatus::Failed, Some(error));
+                self.finalize_live_draft(&session_id, SessionStatus::Failed, Some(error), cx);
             }
             SameEvent::AgentLog {
                 provider_id, line, ..
@@ -2556,11 +3163,21 @@ impl SameAppView {
         session_id: &str,
         status: SessionStatus,
         error: Option<String>,
+        cx: &mut Context<Self>,
     ) {
         // A run can report both failure and a final status; only the first
         // one owns the draft.
         let Some(draft) = self.live_drafts.remove(session_id) else {
             return;
+        };
+        let live_md = if self
+            .live_markdown_view
+            .as_ref()
+            .is_some_and(|v| v.session_id == session_id)
+        {
+            self.live_markdown_view.take()
+        } else {
+            None
         };
         let lang = self.config.language;
         let sess = self.storage.get_session(session_id).ok().flatten();
@@ -2598,9 +3215,11 @@ impl SameAppView {
             }
             content.push_str(t(lang, "_(停止しました)_", "_(Stopped)_"));
         }
-        if !content.is_empty() || !draft.thinking.is_empty() || !tool_calls.is_empty() {
+        let has_message =
+            !content.is_empty() || !draft.thinking.is_empty() || !tool_calls.is_empty();
+        if has_message {
             let msg = Message {
-                id: Uuid::new_v4().to_string(),
+                id: draft.id.clone(),
                 session_id: session_id.to_string(),
                 role: MessageRole::Assistant,
                 content,
@@ -2615,9 +3234,31 @@ impl SameAppView {
                 created_at: Utc::now(),
             };
             let _ = self.storage.append_message(&msg);
-            if self.selected_session_id.as_deref() == Some(session_id) {
+            if self.is_selected_session(session_id) {
+                if let Some(anchor) = self.feed_turn_anchor.borrow_mut().as_mut() {
+                    let live_h = self.feed_live_content_height.get();
+                    if anchor.session_id == session_id && live_h > px(0.0) {
+                        anchor.measured_assistant_height = Some((live_h - px(8.0)).max(px(0.0)));
+                    }
+                }
+                if let Some(live_md) = live_md {
+                    let final_body = message_markdown_body(&msg.content);
+                    self.handoff_finalized_markdown(session_id, &msg.id, final_body, live_md, cx);
+                }
                 self.messages.push(msg);
+                self.sync_feed_after_finalize();
             }
+        } else {
+            self.expanded_thinking.remove(&draft.id);
+            let prefix = format!("{}-", draft.id);
+            self.expanded_tools.retain(|k| !k.starts_with(&prefix));
+            if self.is_selected_session(session_id) {
+                self.clear_turn_anchor();
+                self.mark_feed_tail_dirty();
+            }
+        }
+        if self.is_selected_session(session_id) {
+            self.feed_live_content_height.set(px(0.0));
         }
         let _ = self
             .storage
@@ -2827,6 +3468,10 @@ impl SameAppView {
             model: model.clone(),
             created_at: Utc::now(),
         };
+        let should_anchor = self.should_anchor_new_turn();
+        let viewport = self.feed.viewport_bounds();
+        let user_msg_id = user_msg.id.clone();
+        let user_msg_content = user_msg.content.clone();
         let _ = self.storage.append_message(&user_msg);
         self.messages.push(user_msg);
 
@@ -2859,7 +3504,31 @@ impl SameAppView {
             .collect();
 
         self.live_drafts
-            .insert(session.id.clone(), LiveDraft::default());
+            .insert(session.id.clone(), LiveDraft::new());
+        if self
+            .live_markdown_view
+            .as_ref()
+            .is_some_and(|v| v.session_id == session.id)
+        {
+            self.live_markdown_view = None;
+        }
+        self.feed_live_content_height.set(px(0.0));
+        if should_anchor {
+            *self.feed_turn_anchor.borrow_mut() = Some(FeedTurnAnchor {
+                session_id: session.id.clone(),
+                user_msg_id,
+                estimated_user_height: estimate_user_row_height(
+                    &user_msg_content,
+                    viewport.size.height,
+                ),
+                measured_user_height: None,
+                measured_assistant_height: None,
+            });
+        } else {
+            self.clear_turn_anchor();
+        }
+        self.mark_feed_tail_dirty();
+        self.sync_feed();
         self.scroll_feed_to_end();
 
         self.agent_manager.start_prompt(PromptRequest {
@@ -3127,6 +3796,7 @@ impl SameAppView {
             .map(|p| p.request.request_id.clone())
             .collect();
         self.pending_inputs.retain(|p| p.request.session_id != sid);
+        self.mark_feed_tail_dirty();
         let mgr = self.agent_manager.clone();
         self.rt.spawn(async move {
             for rid in perms {
@@ -6952,7 +7622,10 @@ impl SameAppView {
             })
             // Message feed (virtualized)
             .child({
+                let (tail_min_height, _) = self.sync_turn_anchor_tail_height();
                 self.sync_feed();
+                let is_scrolled_up = self.is_feed_scrolled_up();
+                let has_turn_anchor = self.feed_turn_anchor.borrow().is_some();
                 div()
                     .relative()
                     .flex_1()
@@ -6961,8 +7634,8 @@ impl SameAppView {
                     .child(
                         list(
                             self.feed.clone(),
-                            cx.processor(|this, ix: usize, _window, cx| {
-                                this.render_feed_item(ix, cx)
+                            cx.processor(move |this, ix: usize, _window, cx| {
+                                this.render_feed_item(ix, tail_min_height, cx)
                             }),
                         )
                         .size_full(),
@@ -6978,6 +7651,48 @@ impl SameAppView {
                                 .viewport_from_layout(),
                         ),
                     )
+                    .when(is_scrolled_up, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_3()
+                                .h_flex()
+                                .justify_center()
+                                .child(
+                                    Button::new("btn-feed-jump-latest")
+                                        .xsmall()
+                                        .secondary()
+                                        .rounded(ButtonRounded::Size(px(999.0)))
+                                        .icon(IconName::ArrowDown)
+                                        .label(t(lang, "最新へ", "Jump to latest"))
+                                        .shadow_md()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.scroll_feed_to_end();
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                    })
+                    .on_prepaint({
+                        let view = cx.entity().downgrade();
+                        move |_bounds, window, cx| {
+                            let needs_reflow = view
+                                .read_with(&*cx, |this, _| {
+                                    let anchor_changed =
+                                        has_turn_anchor && this.sync_turn_anchor_tail_height().1;
+                                    let jump_changed =
+                                        this.is_feed_scrolled_up() != is_scrolled_up;
+                                    anchor_changed || jump_changed
+                                })
+                                .unwrap_or(false);
+                            if needs_reflow {
+                                let view_id = view.entity_id();
+                                window.on_next_frame(move |_, cx| cx.notify(view_id));
+                            }
+                        }
+                    })
             })
             // Prompt composer: one rounded card holding attachments, the
             // text and a toolbar (like ChatGPT / T3 Code / OpenCode).
@@ -7071,9 +7786,14 @@ impl SameAppView {
 
     /// Renders feed item `ix`: a stored message, or (last) the trailing
     /// item with the live reply, permission prompts and notices.
-    fn render_feed_item(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_feed_item(
+        &self,
+        ix: usize,
+        tail_min_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if let Some(m) = self.messages.get(ix) {
-            let el = self.render_message(m, None, cx);
+            let el = self.render_message(ix, m, None, cx);
             return self.feed_column(ix, el);
         }
         let Some(session) = self.current_session().cloned() else {
@@ -7083,6 +7803,7 @@ impl SameAppView {
         let lang = self.config.language;
         let running = self.is_session_running(&session.id);
         let live = self.live_drafts.get(&session.id);
+        let has_live = live.is_some();
         let pending_perms: Vec<PermissionRequest> = self
             .pending_permissions
             .iter()
@@ -7147,7 +7868,7 @@ impl SameAppView {
             })
             .when_some(live, |el, draft| {
                 let m = Message {
-                    id: format!("live-{}", session.id),
+                    id: draft.id.clone(),
                     session_id: session.id.clone(),
                     role: MessageRole::Assistant,
                     content: draft.content.clone(),
@@ -7162,7 +7883,7 @@ impl SameAppView {
                     created_at: Utc::now(),
                 };
                 let plan = draft.plan.clone();
-                el.child(self.render_message(&m, Some(waiting), cx))
+                el.child(self.render_message(ix, &m, Some(waiting), cx))
                     .when_some(plan, |el, plan| {
                         el.child(self.render_plan_card(&m.id, &plan, false, cx))
                     })
@@ -7193,13 +7914,28 @@ impl SameAppView {
                     )))
                 },
             );
-        self.feed_column(ix, tail)
+        let tail_el = if has_live {
+            let live_height = self.feed_live_content_height.clone();
+            tail.on_prepaint(move |bounds, _, _| {
+                live_height.set(bounds.size.height);
+            })
+            .into_any_element()
+        } else {
+            tail.into_any_element()
+        };
+        let outer = div()
+            .v_flex()
+            .w_full()
+            .when(tail_min_height > px(0.0), |el| el.min_h(tail_min_height))
+            .child(tail_el);
+        self.feed_column(ix, outer)
     }
 
     /// Renders one message. `live` is `Some(waiting_for_permission)` for the
     /// in-progress assistant reply.
     fn render_message(
         &self,
+        ix: usize,
         msg: &Message,
         live: Option<bool>,
         cx: &mut Context<Self>,
@@ -7382,10 +8118,10 @@ impl SameAppView {
                                         t(lang, "思考過程", "Thinking")
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.feed.remeasure();
                                         if !this.expanded_thinking.remove(&key) {
                                             this.expanded_thinking.insert(key.clone());
                                         }
+                                        this.remeasure_feed_item(ix);
                                         cx.notify();
                                     })),
                             )
@@ -7410,21 +8146,21 @@ impl SameAppView {
                         msg.tool_calls
                             .iter()
                             .enumerate()
-                            .map(|(i, tc)| self.render_tool_call(msg, i, tc, cx)),
+                            .map(|(i, tc)| self.render_tool_call(ix, msg, i, tc, cx)),
                     ),
                 )
             })
             // Message content
             .when(!body.trim().is_empty(), |el| {
-                el.child(
-                    div().text_sm().child(
-                        TextView::markdown(
-                            SharedString::from(format!("md-{}", msg.id)),
-                            body.clone(),
-                        )
-                        .selectable(true),
-                    ),
-                )
+                let text_view = if let Some(state) = self.tracked_markdown_state(msg, is_live) {
+                    TextView::new(state)
+                } else {
+                    TextView::markdown(
+                        SharedString::from(format!("md-{}", msg.id)),
+                        body.clone(),
+                    )
+                };
+                el.child(div().text_sm().child(text_view.selectable(true)))
             })
             .when_some(plan, |el, plan| {
                 el.child(self.render_plan_card(&msg.id, &plan, plan_actionable, cx))
@@ -7490,6 +8226,7 @@ impl SameAppView {
 
     fn render_tool_call(
         &self,
+        ix: usize,
         msg: &Message,
         i: usize,
         tc: &ToolCallRecord,
@@ -7555,10 +8292,10 @@ impl SameAppView {
                             .child(title),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.feed.remeasure();
                         if !this.expanded_tools.remove(&key_click) {
                             this.expanded_tools.insert(key_click.clone());
                         }
+                        this.remeasure_feed_item(ix);
                         cx.notify();
                     })),
             )
@@ -8476,5 +9213,166 @@ mod tests {
         // An ordinary reply that talks about errors is left alone.
         let normal = "Fixed it.\n\nError: auth token expired was the cause.";
         assert_eq!(split_error(normal), (normal, None));
+    }
+
+    #[test]
+    fn live_draft_generates_unique_id_per_turn() {
+        let first = LiveDraft::new();
+        let second = LiveDraft::new();
+        let third = LiveDraft::default();
+        assert!(!first.id.is_empty());
+        assert!(!second.id.is_empty());
+        assert!(!third.id.is_empty());
+        assert_ne!(first.id, second.id);
+        assert_ne!(second.id, third.id);
+        assert_ne!(first.id, third.id);
+    }
+
+    #[test]
+    fn turn_tail_min_height_anchors_user_prompt_at_top_and_collapses_when_reply_fills_viewport() {
+        assert_eq!(
+            compute_turn_tail_min_height(px(600.0), px(74.0), None),
+            px(494.0)
+        );
+        assert_eq!(
+            compute_turn_tail_min_height(px(600.0), px(74.0), Some(px(200.0))),
+            px(294.0)
+        );
+        assert_eq!(
+            compute_turn_tail_min_height(px(600.0), px(74.0), Some(px(700.0))),
+            px(0.0)
+        );
+        assert_eq!(
+            compute_turn_tail_min_height(px(0.0), px(74.0), None),
+            px(0.0)
+        );
+    }
+
+    #[test]
+    fn estimate_user_row_height_scales_with_lines_and_caps_at_viewport_fraction() {
+        let short = estimate_user_row_height("hello", px(800.0));
+        assert_eq!(short, px(78.0));
+
+        let multi = estimate_user_row_height("a\nb\nc\nd", px(800.0));
+        assert!(multi > short);
+
+        let huge = estimate_user_row_height(&"line\n".repeat(100), px(800.0));
+        assert_eq!(huge, px(520.0));
+    }
+
+    #[test]
+    fn list_state_splice_and_finalize_preserve_scroll_and_tail_follow() {
+        let feed = ListState::new(5, ListAlignment::Top, px(1000.0));
+        let old = feed.item_count();
+        feed.splice(old - 1..old, 2);
+        feed.set_follow_mode(FollowMode::Tail);
+        feed.scroll_to_end();
+        assert_eq!(feed.item_count(), 6);
+        assert_eq!(feed.logical_scroll_top().item_ix, 6);
+        assert!(feed.is_following_tail());
+
+        let old = feed.item_count();
+        feed.scroll_to(gpui::ListOffset {
+            item_ix: old - 1,
+            offset_in_item: px(120.0),
+        });
+        feed.splice(old..old, 1);
+        feed.remeasure_items(old - 1..old);
+        assert_eq!(feed.item_count(), 7);
+        let offset = feed.logical_scroll_top();
+        assert_eq!(offset.item_ix, old - 1);
+        assert_eq!(offset.offset_in_item, px(120.0));
+    }
+
+    #[test]
+    fn diff_markdown_body_tracks_appends_unchanged_and_marker_truncation() {
+        let initial = "hello";
+        let synced_len = message_markdown_body(initial).len();
+
+        let appended = "hello world";
+        assert_eq!(
+            diff_markdown_body(message_markdown_body(appended), synced_len),
+            MarkdownBodySync::Append(" world")
+        );
+
+        let error_appended = format!("hello world{ERROR_MARKER}tail error");
+        let after_marker_len = message_markdown_body(&error_appended).len();
+        let error_more = format!("{error_appended} more");
+        assert_eq!(
+            diff_markdown_body(message_markdown_body(&error_more), after_marker_len),
+            MarkdownBodySync::Unchanged
+        );
+
+        let partial = "hello\n\n<!--same:error--";
+        let partial_len = message_markdown_body(partial).len();
+        let completed = "hello\n\n<!--same:error-->boom";
+        assert_eq!(
+            diff_markdown_body(message_markdown_body(completed), partial_len),
+            MarkdownBodySync::Replace("hello")
+        );
+
+        let plan_appended = format!("hello{PLAN_MARKER}step 1");
+        let after_plan_len = message_markdown_body(&plan_appended).len();
+        let plan_more = format!("{plan_appended}\nstep 2");
+        assert_eq!(
+            diff_markdown_body(message_markdown_body(&plan_more), after_plan_len),
+            MarkdownBodySync::Unchanged
+        );
+    }
+
+    #[test]
+    fn live_draft_incremental_markdown_body_matches_full_split() {
+        let spaces_24 = " ".repeat(24);
+        let long_ws_case = format!("hello\n\n<!--same:plan-->\n{spaces_24}\n\n<!--same:error-->boom");
+        let cases = [
+            "こんにちは、日本語テキストと ASCII markdown `code` の混在応答です。",
+            "末尾空白あり   \n\n<!--same:error-->connection dropped: 詳細はログ参照",
+            "計画前の日本語本文  \n\n<!--same:plan-->\n日本語プラン手順１：修正する\n手順２：検証する",
+            "hello\n\n<!--same:plan-->\n\n<!--same:error-->boom",
+            "hello\n\n<!--same:plan-->\n   \n\n<!--same:error-->boom",
+            long_ws_case.as_str(),
+            "hello\n\n<!--same:plan-->\n\u{3000}\n\n<!--same:error-->boom",
+            "hello\n\n<!--same:plan-->\n\u{3000}次のテキスト",
+            "hello\n\n<!--same:plan-->\n  \n\n<!--same:error--X\n\n<!--same:error-->boom",
+            "日本語テスト\n\n<!--same:plan-->\nステップ日本語\n\n<!--same:error-->失敗詳細",
+        ];
+
+        for full in cases {
+            let mut single_char = LiveDraft::new();
+            for ch in full.chars() {
+                let mut buf = [0u8; 4];
+                single_char.push_content(ch.encode_utf8(&mut buf));
+                assert_eq!(
+                    single_char.markdown_body(),
+                    message_markdown_body(&single_char.content),
+                    "single-char mismatch on prefix {:?}",
+                    single_char.content
+                );
+            }
+
+            let boundaries: Vec<usize> = full.char_indices().map(|(i, _)| i).collect();
+            for &split_idx in &boundaries {
+                let mut two_chunks = LiveDraft::new();
+                two_chunks.push_content(&full[..split_idx]);
+                assert_eq!(
+                    two_chunks.markdown_body(),
+                    message_markdown_body(&two_chunks.content)
+                );
+                two_chunks.push_content(&full[split_idx..]);
+                assert_eq!(
+                    two_chunks.markdown_body(),
+                    message_markdown_body(&two_chunks.content)
+                );
+            }
+        }
+
+        let mut split_ws = LiveDraft::new();
+        for chunk in ["hello\n\n<!--same:plan-->\n", spaces_24.as_str(), "\n\n<!--same:error-->boom"] {
+            split_ws.push_content(chunk);
+            assert_eq!(
+                split_ws.markdown_body(),
+                message_markdown_body(&split_ws.content)
+            );
+        }
     }
 }
