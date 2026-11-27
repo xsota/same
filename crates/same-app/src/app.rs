@@ -320,6 +320,8 @@ impl Default for LiveDraft {
 /// Maximum number of recently finalized streamed replies whose `TextViewState`
 /// is retained in the active session for smooth handoff without unbounded growth.
 const MAX_SESSION_MARKDOWN_VIEWS: usize = 4;
+/// Number of recent tool calls rendered per page in the unfiltered right-pane Tools view.
+const TOOLS_HISTORY_PAGE_SIZE: usize = 30;
 
 struct LiveMarkdownView {
     session_id: String,
@@ -513,6 +515,7 @@ impl SettingsSection {
 enum RightTab {
     Files,
     Git,
+    Tools,
     Logs,
 }
 
@@ -654,6 +657,12 @@ pub struct SameAppView {
     // Right panel
     show_right_panel: bool,
     right_tab: RightTab,
+    right_split: bool,
+    right_bottom_tab: RightTab,
+    /// Optional turn filter (`Message::id` / `LiveDraft::id`) for the right-pane Tools view.
+    selected_tool_turn_id: Option<String>,
+    /// Maximum number of recent tool calls shown in the unfiltered Tools view.
+    tools_visible_limit: usize,
     file_filter_input: Entity<InputState>,
     file_entries: Vec<FileEntry>,
     expanded_dirs: HashSet<PathBuf>,
@@ -1045,6 +1054,10 @@ impl SameAppView {
             rename_input,
             show_right_panel: true,
             right_tab: RightTab::Files,
+            right_split: false,
+            right_bottom_tab: RightTab::Tools,
+            selected_tool_turn_id: None,
+            tools_visible_limit: TOOLS_HISTORY_PAGE_SIZE,
             file_filter_input,
             file_entries: vec![],
             expanded_dirs: HashSet::new(),
@@ -1620,6 +1633,8 @@ impl SameAppView {
             self.messages.clear();
             self.session_markdown_views.clear();
             self.live_markdown_view = None;
+            self.selected_tool_turn_id = None;
+            self.tools_visible_limit = TOOLS_HISTORY_PAGE_SIZE;
             self.clear_turn_anchor();
             self.invalidate_feed();
             self.file_entries.clear();
@@ -1666,6 +1681,8 @@ impl SameAppView {
     fn reload_messages(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.clear_turn_anchor();
         self.session_markdown_views.clear();
+        self.selected_tool_turn_id = None;
+        self.tools_visible_limit = TOOLS_HISTORY_PAGE_SIZE;
         if let Some(sid) = self.selected_session_id.as_deref() {
             self.messages = self.storage.list_messages(sid).unwrap_or_default();
             self.invalidate_feed();
@@ -1686,8 +1703,21 @@ impl SameAppView {
             self.file_entries.clear();
             self.git_info = GitInfo::default();
         }
-        if !self.git_info.is_repo && self.right_tab == RightTab::Git {
-            self.right_tab = RightTab::Files;
+        if !self.git_info.is_repo {
+            if self.right_tab == RightTab::Git {
+                self.right_tab = if self.right_split && self.right_bottom_tab == RightTab::Files {
+                    RightTab::Tools
+                } else {
+                    RightTab::Files
+                };
+            }
+            if self.right_bottom_tab == RightTab::Git {
+                self.right_bottom_tab = if self.right_tab == RightTab::Tools {
+                    RightTab::Logs
+                } else {
+                    RightTab::Tools
+                };
+            }
         }
     }
 
@@ -4096,6 +4126,124 @@ fn split_error(content: &str) -> (&str, Option<&str>) {
     match content.split_once(ERROR_MARKER) {
         Some((body, err)) => (body.trim_end(), Some(err)),
         None => (content, None),
+    }
+}
+
+/// Builds a compact 1-line status badge + summary label for a turn's tool calls
+/// in the main chat feed, keeping full inputs/outputs in the right-pane Tools view.
+fn summarize_tool_calls(tool_calls: &[ToolCallRecord], lang: Language) -> (&'static str, Hsla, String) {
+    let total = tool_calls.len();
+    let in_progress = tool_calls
+        .iter()
+        .filter(|tc| tc.status == ToolCallStatus::InProgress)
+        .count();
+    let pending = tool_calls
+        .iter()
+        .filter(|tc| tc.status == ToolCallStatus::Pending)
+        .count();
+    let failed = tool_calls
+        .iter()
+        .filter(|tc| tc.status == ToolCallStatus::Failed)
+        .count();
+    let denied = tool_calls
+        .iter()
+        .filter(|tc| tc.status == ToolCallStatus::Denied)
+        .count();
+
+    let title_for = |status: ToolCallStatus| -> String {
+        let raw = tool_calls
+            .iter()
+            .rev()
+            .find(|tc| tc.status == status)
+            .map(|tc| {
+                let t = tc.title.trim();
+                if t.is_empty() {
+                    tc.kind.as_deref().unwrap_or("")
+                } else {
+                    t
+                }
+            })
+            .unwrap_or("");
+        raw.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+
+    if in_progress > 0 {
+        let active_title = title_for(ToolCallStatus::InProgress);
+        let label = if active_title.is_empty() {
+            match lang {
+                Language::Ja => format!("ツール実行中 ({in_progress}/{total}件)"),
+                Language::En => format!("Running {in_progress}/{total} tools"),
+            }
+        } else {
+            match lang {
+                Language::Ja => format!("ツール実行中 ({in_progress}/{total}件): {active_title}"),
+                Language::En => format!("Running {in_progress}/{total}: {active_title}"),
+            }
+        };
+        ("◐", accent_text().into(), label)
+    } else if pending > 0 {
+        let waiting_title = title_for(ToolCallStatus::Pending);
+        let label = if waiting_title.is_empty() {
+            match lang {
+                Language::Ja => format!("ツール待機中 ({pending}/{total}件)"),
+                Language::En => format!("Waiting {pending}/{total} tools"),
+            }
+        } else {
+            match lang {
+                Language::Ja => format!("ツール待機中 ({pending}/{total}件): {waiting_title}"),
+                Language::En => format!("Waiting {pending}/{total}: {waiting_title}"),
+            }
+        };
+        ("○", status_amber().into(), label)
+    } else if failed > 0 && denied > 0 {
+        let label = match lang {
+            Language::Ja => format!("ツール {total}件（失敗 {failed} / 拒否 {denied}）"),
+            Language::En => format!("{total} tools ({failed} failed, {denied} denied)"),
+        };
+        ("✗", status_red().into(), label)
+    } else if failed > 0 {
+        let label = match lang {
+            Language::Ja => format!("{total}件のツールを実行（失敗 {failed}）"),
+            Language::En => {
+                if total == 1 {
+                    "Ran 1 tool (1 failed)".to_string()
+                } else {
+                    format!("Ran {total} tools ({failed} failed)")
+                }
+            }
+        };
+        ("✗", status_red().into(), label)
+    } else if denied > 0 {
+        let label = if denied == total {
+            match lang {
+                Language::Ja => format!("{total}件のツールを拒否"),
+                Language::En => {
+                    if total == 1 {
+                        "1 tool denied".to_string()
+                    } else {
+                        format!("{total} tools denied")
+                    }
+                }
+            }
+        } else {
+            match lang {
+                Language::Ja => format!("ツール {total}件（拒否 {denied}）"),
+                Language::En => format!("{total} tools ({denied} denied)"),
+            }
+        };
+        ("⊘", status_red().into(), label)
+    } else {
+        let label = match lang {
+            Language::Ja => format!("{total}件のツールを実行"),
+            Language::En => {
+                if total == 1 {
+                    "Ran 1 tool".to_string()
+                } else {
+                    format!("Ran {total} tools")
+                }
+            }
+        };
+        ("✓", status_green().into(), label)
     }
 }
 
@@ -8139,16 +8287,9 @@ impl SameAppView {
                     )
                 },
             )
-            // Tool calls
+            // Tool calls (compact 1-line summary; full details live in the right-pane Tools view)
             .when(!msg.tool_calls.is_empty(), |el| {
-                el.child(
-                    div().v_flex().gap_1().children(
-                        msg.tool_calls
-                            .iter()
-                            .enumerate()
-                            .map(|(i, tc)| self.render_tool_call(ix, msg, i, tc, cx)),
-                    ),
-                )
+                el.child(self.render_tool_calls_summary(msg, cx))
             })
             // Message content
             .when(!body.trim().is_empty(), |el| {
@@ -8224,17 +8365,125 @@ impl SameAppView {
             .into_any_element()
     }
 
+    fn select_right_tab(&mut self, top: bool, target: RightTab, cx: &mut Context<Self>) {
+        if self.right_split {
+            if top {
+                if self.right_bottom_tab == target {
+                    self.right_bottom_tab = self.right_tab;
+                }
+                self.right_tab = target;
+            } else {
+                if self.right_tab == target {
+                    self.right_tab = self.right_bottom_tab;
+                }
+                self.right_bottom_tab = target;
+            }
+        } else {
+            self.right_tab = target;
+        }
+        if target == RightTab::Git {
+            self.reload_workspace_files(cx);
+        }
+    }
+
+    fn toggle_right_split(&mut self) {
+        self.right_split = !self.right_split;
+        if self.right_split && self.right_tab == self.right_bottom_tab {
+            self.right_bottom_tab = if self.right_tab == RightTab::Tools {
+                RightTab::Files
+            } else {
+                RightTab::Tools
+            };
+        }
+    }
+
+    fn open_tools_for_turn(&mut self, msg_id: String) {
+        self.show_right_panel = true;
+        self.selected_tool_turn_id = Some(msg_id);
+        if self.right_split {
+            if self.right_tab != RightTab::Tools && self.right_bottom_tab != RightTab::Tools {
+                self.right_bottom_tab = RightTab::Tools;
+            }
+        } else {
+            self.right_tab = RightTab::Tools;
+        }
+    }
+
+    fn session_tool_call_count(&self) -> usize {
+        let persisted: usize = self.messages.iter().map(|m| m.tool_calls.len()).sum();
+        let live: usize = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|sid| self.live_drafts.get(sid))
+            .map(|d| d.tool_calls.len())
+            .unwrap_or(0);
+        persisted + live
+    }
+
+    fn render_tool_calls_summary(&self, msg: &Message, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+        let (badge, color, summary) = summarize_tool_calls(&msg.tool_calls, lang);
+        let selected = self.show_right_panel
+            && (self.right_tab == RightTab::Tools
+                || (self.right_split && self.right_bottom_tab == RightTab::Tools))
+            && self.selected_tool_turn_id.as_deref() == Some(msg.id.as_str());
+        let msg_id = msg.id.clone();
+
+        div()
+            .id(SharedString::from(format!("tc-summary-{}", msg.id)))
+            .h_flex()
+            .gap_2()
+            .items_center()
+            .px_2()
+            .py_1()
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(if selected {
+                Hsla::from(accent())
+            } else {
+                theme.border
+            })
+            .bg(if selected {
+                theme.list_active
+            } else {
+                theme.sidebar
+            })
+            .text_xs()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.list_hover))
+            .child(div().text_color(color).child(badge))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme.foreground)
+                    .child(summary),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(theme.muted_foreground)
+                    .child(t(lang, "詳細 →", "Details →")),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_tools_for_turn(msg_id.clone());
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     fn render_tool_call(
         &self,
-        ix: usize,
-        msg: &Message,
+        msg_id: &str,
         i: usize,
         tc: &ToolCallRecord,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
         let lang = self.config.language;
-        let tc_key = format!("{}-{}-{}", msg.id, tc.id, i);
+        let tc_key = format!("{msg_id}-{}-{i}", tc.id);
         let expanded = self.expanded_tools.contains(&tc_key);
         let (badge, color): (&str, Hsla) = match tc.status {
             ToolCallStatus::Completed => ("✓", status_green().into()),
@@ -8295,7 +8544,6 @@ impl SameAppView {
                         if !this.expanded_tools.remove(&key_click) {
                             this.expanded_tools.insert(key_click.clone());
                         }
-                        this.remeasure_feed_item(ix);
                         cx.notify();
                     })),
             )
@@ -8371,12 +8619,17 @@ impl SameAppView {
             .into_any_element()
     }
 
-    fn render_right_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
+    fn render_right_tab_bar(
+        &self,
+        top: bool,
+        active_tab: RightTab,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let lang = self.config.language;
-
-        let tab = |id: &'static str, label: String, active: bool| {
-            Button::new(id)
+        let prefix = if top { "top" } else { "bottom" };
+        let tool_count = self.session_tool_call_count();
+        let tab = |suffix: &'static str, label: String, active: bool| {
+            Button::new(SharedString::from(format!("tab-{prefix}-{suffix}")))
                 .xsmall()
                 .when(active, |b| b.primary())
                 .when(!active, |b| b.ghost())
@@ -8384,77 +8637,107 @@ impl SameAppView {
         };
 
         div()
-            .v_flex()
-            .w(px(380.0))
-            .h_full()
-            .flex_shrink_0()
-            .bg(theme.sidebar)
-            .border_l_1()
-            .border_color(theme.border)
-            .p_3()
-            .gap_2()
-            // Tab bar
+            .h_flex()
+            .justify_between()
+            .items_center()
+            .gap_1()
             .child(
                 div()
                     .h_flex()
-                    .justify_between()
-                    .items_center()
+                    .gap_1()
+                    .flex_wrap()
                     .child(
-                        div()
-                            .h_flex()
-                            .gap_1()
-                            .child(
-                                tab(
-                                    "tab-files",
-                                    t(lang, "ファイル", "Files").into(),
-                                    self.right_tab == RightTab::Files,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.right_tab = RightTab::Files;
-                                        cx.notify();
-                                    },
-                                )),
+                        tab(
+                            "files",
+                            t(lang, "ファイル", "Files").into(),
+                            active_tab == RightTab::Files,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.select_right_tab(top, RightTab::Files, cx);
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .when(self.git_info.is_repo, |el| {
+                        let changes = self
+                            .git_info
+                            .status
+                            .lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .count();
+                        el.child(
+                            tab(
+                                "git",
+                                if changes > 0 {
+                                    format!("Git ({changes})")
+                                } else {
+                                    "Git".to_string()
+                                },
+                                active_tab == RightTab::Git,
                             )
-                            .when(self.git_info.is_repo, |el| {
-                                let changes = self
-                                    .git_info
-                                    .status
-                                    .lines()
-                                    .filter(|l| !l.trim().is_empty())
-                                    .count();
-                                el.child(
-                                    tab(
-                                        "tab-git",
-                                        if changes > 0 {
-                                            format!("Git ({changes})")
-                                        } else {
-                                            "Git".to_string()
-                                        },
-                                        self.right_tab == RightTab::Git,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.right_tab = RightTab::Git;
-                                            this.reload_workspace_files(cx);
-                                            cx.notify();
-                                        },
-                                    )),
-                                )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.select_right_tab(top, RightTab::Git, cx);
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    })
+                    .child(
+                        tab(
+                            "tools",
+                            if tool_count > 0 {
+                                match lang {
+                                    Language::Ja => format!("ツール ({tool_count})"),
+                                    Language::En => format!("Tools ({tool_count})"),
+                                }
+                            } else {
+                                t(lang, "ツール", "Tools").into()
+                            },
+                            active_tab == RightTab::Tools,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.select_right_tab(top, RightTab::Tools, cx);
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        tab(
+                            "logs",
+                            t(lang, "ログ", "Logs").into(),
+                            active_tab == RightTab::Logs,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.select_right_tab(top, RightTab::Logs, cx);
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            .child(if top {
+                div()
+                    .h_flex()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("toggle-right-split")
+                            .xsmall()
+                            .when(self.right_split, |b| b.primary())
+                            .when(!self.right_split, |b| b.ghost())
+                            .tooltip(if self.right_split {
+                                t(lang, "上下分割を閉じる", "Close vertical split")
+                            } else {
+                                t(lang, "右ペインを上下分割", "Split right pane vertically")
                             })
-                            .child(
-                                tab(
-                                    "tab-logs",
-                                    t(lang, "ログ", "Logs").into(),
-                                    self.right_tab == RightTab::Logs,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.right_tab = RightTab::Logs;
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
+                            .label("⬓")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_right_split();
+                                cx.notify();
+                            })),
                     )
                     .child(
                         Button::new("refresh-right-panel")
@@ -8466,12 +8749,261 @@ impl SameAppView {
                                 this.reload_workspace_files(cx);
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    .into_any_element()
+            } else {
+                Button::new("close-right-split")
+                    .xsmall()
+                    .ghost()
+                    .tooltip(t(lang, "分割を閉じる", "Close split"))
+                    .label("×")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.right_split = false;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .into_any_element()
+    }
+
+    fn render_right_tab_content(&self, tab: RightTab, cx: &mut Context<Self>) -> AnyElement {
+        match tab {
+            RightTab::Files => self.render_files_tab(cx).into_any_element(),
+            RightTab::Git => self.render_git_tab(cx).into_any_element(),
+            RightTab::Tools => self.render_tools_tab(cx).into_any_element(),
+            RightTab::Logs => self.render_logs_tab(cx).into_any_element(),
+        }
+    }
+
+    fn render_tools_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let lang = self.config.language;
+        let selected_turn = self.selected_tool_turn_id.as_deref();
+
+        // Collect all turns with tool calls in the active session (persisted + live),
+        // numbering by actual assistant conversation turn before filtering or paging.
+        let mut groups: Vec<(Option<usize>, String, usize, &[ToolCallRecord])> = self
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .enumerate()
+            .filter(|(_, m)| !m.tool_calls.is_empty())
+            .map(|(turn_ix, m)| {
+                (
+                    Some(turn_ix + 1),
+                    m.id.clone(),
+                    0usize,
+                    m.tool_calls.as_slice(),
+                )
+            })
+            .collect();
+        if let Some(draft) = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|sid| self.live_drafts.get(sid))
+            .filter(|d| !d.tool_calls.is_empty())
+        {
+            groups.push((None, draft.id.clone(), 0usize, draft.tool_calls.as_slice()));
+        }
+
+        let has_matching_filter =
+            selected_turn.is_some_and(|tid| groups.iter().any(|(_, id, _, _)| id == tid));
+        let mut hidden_tool_count = 0usize;
+        if has_matching_filter {
+            groups.retain(|(_, id, _, _)| Some(id.as_str()) == selected_turn);
+        } else {
+            // Show newest turns first so live/recent activity is immediately visible
+            // at the top of the scroll area without fighting manual history browsing.
+            let total_tools: usize = groups.iter().map(|(_, _, _, tcs)| tcs.len()).sum();
+            let limit = self.tools_visible_limit.max(TOOLS_HISTORY_PAGE_SIZE);
+            if total_tools > limit {
+                hidden_tool_count = total_tools - limit;
+                let mut remaining = limit;
+                let mut paged = Vec::new();
+                for (turn_no, msg_id, _, tcs) in groups.into_iter().rev() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if tcs.len() <= remaining {
+                        remaining -= tcs.len();
+                        paged.push((turn_no, msg_id, 0usize, tcs));
+                    } else {
+                        let start = tcs.len() - remaining;
+                        paged.push((turn_no, msg_id, start, &tcs[start..]));
+                        remaining = 0;
+                    }
+                }
+                groups = paged;
+            } else {
+                groups.reverse();
+            }
+        }
+
+        let scroll_id = SharedString::from(format!(
+            "right-tools-scroll-{}-{}",
+            self.selected_session_id.as_deref().unwrap_or("none"),
+            if has_matching_filter {
+                selected_turn.unwrap_or("all")
+            } else {
+                "all"
+            }
+        ));
+
+        div()
+            .v_flex()
+            .flex_1()
+            .min_h_0()
+            .gap_2()
+            .when(has_matching_filter, |el| {
+                el.child(
+                    div()
+                        .h_flex()
+                        .justify_between()
+                        .items_center()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(6.0))
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(t(
+                                    lang,
+                                    "選択中のターンのツール実行を表示中",
+                                    "Showing tool calls for selected turn",
+                                )),
+                        )
+                        .child(
+                            Button::new("clear-tool-turn-filter")
+                                .xsmall()
+                                .ghost()
+                                .label(t(lang, "すべて表示", "Show all"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.selected_tool_turn_id = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .id(scroll_id)
+                    .v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .gap_2()
+                    .when(groups.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .p_2()
+                                .child(t(
+                                    lang,
+                                    "このセッションではまだツール実行がありません",
+                                    "No tool calls in this session yet",
+                                )),
+                        )
+                    })
+                    .children(groups.into_iter().map(|(turn_no, msg_id, index_offset, tcs)| {
+                        let total_in_turn = index_offset + tcs.len();
+                        let header = match turn_no {
+                            None => t(lang, "実行中のターン", "Current turn").to_string(),
+                            Some(n) => match lang {
+                                Language::Ja => format!("ターン #{n} ({total_in_turn}件)"),
+                                Language::En => format!("Turn #{n} ({total_in_turn})"),
+                            },
+                        };
+                        let rows = if has_matching_filter {
+                            tcs.iter()
+                                .enumerate()
+                                .map(|(i, tc)| {
+                                    self.render_tool_call(&msg_id, index_offset + i, tc, cx)
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            tcs.iter()
+                                .enumerate()
+                                .rev()
+                                .map(|(i, tc)| {
+                                    self.render_tool_call(&msg_id, index_offset + i, tc, cx)
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.muted_foreground)
+                                    .child(header),
+                            )
+                            .children(rows)
+                    }))
+                    .when(hidden_tool_count > 0, |el| {
+                        el.child(
+                            div().h_flex().justify_center().child(
+                                Button::new("load-earlier-tools")
+                                    .xsmall()
+                                    .ghost()
+                                    .label(match lang {
+                                        Language::Ja => format!(
+                                            "以前のツール実行を表示 (残り {hidden_tool_count} 件)"
+                                        ),
+                                        Language::En => format!(
+                                            "Show earlier tool calls ({hidden_tool_count} hidden)"
+                                        ),
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.tools_visible_limit = this
+                                            .tools_visible_limit
+                                            .saturating_add(TOOLS_HISTORY_PAGE_SIZE);
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                    }),
             )
-            .child(match self.right_tab {
-                RightTab::Files => self.render_files_tab(cx).into_any_element(),
-                RightTab::Git => self.render_git_tab(cx).into_any_element(),
-                RightTab::Logs => self.render_logs_tab(cx).into_any_element(),
+    }
+
+    fn render_right_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+
+        div()
+            .v_flex()
+            .w(px(380.0))
+            .h_full()
+            .flex_shrink_0()
+            .bg(theme.sidebar)
+            .border_l_1()
+            .border_color(theme.border)
+            .p_3()
+            .gap_2()
+            .child(
+                div()
+                    .v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .gap_2()
+                    .child(self.render_right_tab_bar(true, self.right_tab, cx))
+                    .child(self.render_right_tab_content(self.right_tab, cx)),
+            )
+            .when(self.right_split, |el| {
+                el.child(div().h(px(1.0)).bg(theme.border)).child(
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .gap_2()
+                        .child(self.render_right_tab_bar(false, self.right_bottom_tab, cx))
+                        .child(self.render_right_tab_content(self.right_bottom_tab, cx)),
+                )
             })
     }
 
@@ -8492,7 +9024,12 @@ impl SameAppView {
                 div()
                     .id("files-tree-scroll")
                     .v_flex()
-                    .when(file_open, |d| d.h(px(220.0)).flex_shrink_0())
+                    .when(file_open && !self.right_split, |d| {
+                        d.h(px(220.0)).flex_shrink_0()
+                    })
+                    .when(file_open && self.right_split, |d| {
+                        d.flex_1().min_h(px(56.0)).max_h(px(120.0))
+                    })
                     .when(!file_open, |d| d.flex_1().min_h_0())
                     .overflow_y_scroll()
                     .when(self.file_entries.is_empty(), |el| {
@@ -9374,5 +9911,51 @@ mod tests {
                 message_markdown_body(&split_ws.content)
             );
         }
+    }
+
+    #[test]
+    fn summarize_tool_calls_reflects_running_failed_and_completed_states() {
+        let mk = |id: &str, title: &str, status: ToolCallStatus| ToolCallRecord {
+            id: id.into(),
+            title: title.into(),
+            kind: Some("command".into()),
+            status,
+            input: None,
+            output: None,
+        };
+
+        let running = vec![
+            mk("1", "git status", ToolCallStatus::Completed),
+            mk("2", "cargo test\n--workspace", ToolCallStatus::InProgress),
+        ];
+        let (badge, _, label_ja) = summarize_tool_calls(&running, Language::Ja);
+        assert_eq!(badge, "◐");
+        assert_eq!(label_ja, "ツール実行中 (1/2件): cargo test --workspace");
+
+        let waiting = vec![
+            mk("1", "git status", ToolCallStatus::Completed),
+            mk("2", "cargo clippy", ToolCallStatus::Pending),
+        ];
+        let (badge, _, label_en) = summarize_tool_calls(&waiting, Language::En);
+        assert_eq!(badge, "○");
+        assert_eq!(label_en, "Waiting 1/2: cargo clippy");
+
+        let failed = vec![
+            mk("1", "git status", ToolCallStatus::Completed),
+            mk("2", "cargo test", ToolCallStatus::Failed),
+        ];
+        let (badge, _, label_en) = summarize_tool_calls(&failed, Language::En);
+        assert_eq!(badge, "✗");
+        assert_eq!(label_en, "Ran 2 tools (1 failed)");
+
+        let denied_only = vec![mk("1", "rm -rf /tmp/x", ToolCallStatus::Denied)];
+        let (badge, _, label_en) = summarize_tool_calls(&denied_only, Language::En);
+        assert_eq!(badge, "⊘");
+        assert_eq!(label_en, "1 tool denied");
+
+        let done_one = vec![mk("1", "git status", ToolCallStatus::Completed)];
+        let (badge, _, label_en) = summarize_tool_calls(&done_one, Language::En);
+        assert_eq!(badge, "✓");
+        assert_eq!(label_en, "Ran 1 tool");
     }
 }
