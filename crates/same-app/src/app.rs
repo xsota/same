@@ -317,9 +317,14 @@ impl Default for LiveDraft {
     }
 }
 
-/// Maximum number of recently finalized streamed replies whose `TextViewState`
-/// is retained in the active session for smooth handoff without unbounded growth.
-const MAX_SESSION_MARKDOWN_VIEWS: usize = 4;
+/// Maximum number of message `TextViewState` instances retained in the active
+/// session so manual scrolling through history reuses parsed Markdown without
+/// dropping state on virtualization or growing memory without bound.
+const MAX_SESSION_MARKDOWN_VIEWS: usize = 128;
+/// Conservative minimum-row height hint for unmeasured feed items so scrollbar
+/// geometry and upward scrolling stay stable without overestimating short rows
+/// or forcing `ListState::measure_all()`.
+const FEED_UNMEASURED_ITEM_HEIGHT_HINT: Pixels = px(56.0);
 /// Number of recent tool calls rendered per page in the unfiltered right-pane Tools view.
 const TOOLS_HISTORY_PAGE_SIZE: usize = 30;
 
@@ -335,6 +340,12 @@ struct LiveMarkdownView {
 struct FinalizedMarkdownView {
     msg_id: String,
     state: Entity<TextViewState>,
+    /// Whether `state` has committed its parsed document (immediately true for
+    /// synchronous parses `<= 4 KiB`, or flipped true when async parse finishes).
+    ready: bool,
+    /// Observer for an initial async parse when opening a `> 4 KiB` message
+    /// from history; cleared once committed.
+    _pending_parse: Option<Subscription>,
     /// Full-document parse and its observer warming up in the background for
     /// replies larger than `gpui-base`'s synchronous threshold; swapped into
     /// `state` once committed.
@@ -1043,6 +1054,12 @@ impl SameAppView {
             feed: {
                 let feed = ListState::new(0, ListAlignment::Top, px(1000.0));
                 feed.set_follow_mode(FollowMode::Tail);
+                let weak_view = cx.entity().downgrade();
+                feed.set_item_measurement_readiness(move |ix, cx| {
+                    weak_view
+                        .read_with(cx, |this, _| this.is_feed_item_measurement_ready(ix))
+                        .unwrap_or(true)
+                });
                 feed
             },
             feed_synced: Default::default(),
@@ -1343,6 +1360,8 @@ impl SameAppView {
             self.push_session_markdown_view(FinalizedMarkdownView {
                 msg_id: msg_id.to_string(),
                 state: full_state,
+                ready: true,
+                _pending_parse: None,
                 _pending_full: None,
             });
             return;
@@ -1364,6 +1383,7 @@ impl SameAppView {
                 .find(|v| v.msg_id == obs_msg_id)
             {
                 view.state = full_state;
+                view.ready = true;
                 view._pending_full = None;
                 if this.is_selected_session(&obs_sid) {
                     if let Some(ix) = this.messages.iter().rposition(|m| m.id == obs_msg_id) {
@@ -1376,8 +1396,112 @@ impl SameAppView {
         self.push_session_markdown_view(FinalizedMarkdownView {
             msg_id: msg_id.to_string(),
             state: live_md.state,
+            ready: true,
+            _pending_parse: None,
             _pending_full: Some((full_state, subscription)),
         });
+    }
+
+    fn ensure_session_markdown_state_for_stored_message(
+        &mut self,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TextViewState>> {
+        let msg = self.messages.get(ix)?;
+        if let Some(pos) = self
+            .session_markdown_views
+            .iter()
+            .position(|v| v.msg_id == msg.id)
+        {
+            if let Some(view) = self.session_markdown_views.remove(pos) {
+                let state = view.state.clone();
+                self.session_markdown_views.push_back(view);
+                return Some(state);
+            }
+        }
+
+        let (session_id, msg_id, body) = if msg.role == MessageRole::User {
+            (
+                msg.session_id.clone(),
+                msg.id.clone(),
+                user_markdown(&msg.content),
+            )
+        } else {
+            let body = message_markdown_body(&msg.content);
+            if body.trim().is_empty() {
+                return None;
+            }
+            (msg.session_id.clone(), msg.id.clone(), body.to_string())
+        };
+        Some(self.ensure_session_markdown_state(&session_id, &msg_id, &body, cx))
+    }
+
+    fn ensure_session_markdown_state(
+        &mut self,
+        session_id: &str,
+        msg_id: &str,
+        body: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextViewState> {
+        if let Some(pos) = self
+            .session_markdown_views
+            .iter()
+            .position(|v| v.msg_id == msg_id)
+        {
+            if let Some(view) = self.session_markdown_views.remove(pos) {
+                let state = view.state.clone();
+                self.session_markdown_views.push_back(view);
+                return state;
+            }
+        }
+
+        let state = cx.new(|cx| TextViewState::markdown(body, cx));
+        let initial_rendered = state.read(cx).rendered_text();
+        let ready = initial_rendered.source().len() == body.len();
+        let pending_parse = if ready {
+            None
+        } else {
+            let obs_sid = session_id.to_string();
+            let obs_msg_id = msg_id.to_string();
+            Some(cx.observe(&state, move |this, state, cx| {
+                let rendered = state.read(cx).rendered_text();
+                if rendered == initial_rendered {
+                    return;
+                }
+                if let Some(view) = this
+                    .session_markdown_views
+                    .iter_mut()
+                    .find(|v| v.msg_id == obs_msg_id)
+                {
+                    view.ready = true;
+                    view._pending_parse = None;
+                }
+                if this.is_selected_session(&obs_sid) {
+                    if let Some(ix) = this.messages.iter().rposition(|m| m.id == obs_msg_id) {
+                        this.remeasure_feed_item(ix);
+                        cx.notify();
+                    }
+                }
+            }))
+        };
+        self.push_session_markdown_view(FinalizedMarkdownView {
+            msg_id: msg_id.to_string(),
+            state: state.clone(),
+            ready,
+            _pending_parse: pending_parse,
+            _pending_full: None,
+        });
+        state
+    }
+
+    fn is_feed_item_measurement_ready(&self, ix: usize) -> bool {
+        let Some(msg) = self.messages.get(ix) else {
+            return true;
+        };
+        self.session_markdown_views
+            .iter()
+            .find(|v| v.msg_id == msg.id)
+            .is_none_or(|v| v.ready)
     }
 
     fn push_session_markdown_view(&mut self, view: FinalizedMarkdownView) {
@@ -1513,7 +1637,8 @@ impl SameAppView {
         let session_changed = synced.0 != self.selected_session_id;
         let old = synced.1;
         if session_changed || count < old || old == 0 {
-            self.feed.reset(count);
+            self.feed
+                .reset_with_uniform_height(count, FEED_UNMEASURED_ITEM_HEIGHT_HINT);
             self.scroll_feed_to_end();
             self.feed_tail_dirty.set(false);
         } else if count > old {
@@ -7935,13 +8060,14 @@ impl SameAppView {
     /// Renders feed item `ix`: a stored message, or (last) the trailing
     /// item with the live reply, permission prompts and notices.
     fn render_feed_item(
-        &self,
+        &mut self,
         ix: usize,
         tail_min_height: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if let Some(m) = self.messages.get(ix) {
-            let el = self.render_message(ix, m, None, cx);
+        if ix < self.messages.len() {
+            let cached_md = self.ensure_session_markdown_state_for_stored_message(ix, cx);
+            let el = self.render_message(ix, &self.messages[ix], None, cached_md.as_ref(), cx);
             return self.feed_column(ix, el);
         }
         let Some(session) = self.current_session().cloned() else {
@@ -7950,8 +8076,27 @@ impl SameAppView {
         let theme = cx.theme().clone();
         let lang = self.config.language;
         let running = self.is_session_running(&session.id);
-        let live = self.live_drafts.get(&session.id);
-        let has_live = live.is_some();
+        let live_msg = self.live_drafts.get(&session.id).map(|draft| {
+            (
+                Message {
+                    id: draft.id.clone(),
+                    session_id: session.id.clone(),
+                    role: MessageRole::Assistant,
+                    content: draft.content.clone(),
+                    thinking: if draft.thinking.is_empty() {
+                        None
+                    } else {
+                        Some(draft.thinking.clone())
+                    },
+                    tool_calls: draft.tool_calls.clone(),
+                    provider_id: Some(session.provider_id.clone()),
+                    model: session.model.clone(),
+                    created_at: Utc::now(),
+                },
+                draft.plan.clone(),
+            )
+        });
+        let has_live = live_msg.is_some();
         let pending_perms: Vec<PermissionRequest> = self
             .pending_permissions
             .iter()
@@ -7971,7 +8116,7 @@ impl SameAppView {
             .v_flex()
             .w_full()
             .gap_4()
-            .when(self.messages.is_empty() && live.is_none(), |el| {
+            .when(self.messages.is_empty() && !has_live, |el| {
                 let proj_label = self
                     .current_project()
                     .map(|p| p.workdir.clone())
@@ -8014,24 +8159,8 @@ impl SameAppView {
                         ),
                 )
             })
-            .when_some(live, |el, draft| {
-                let m = Message {
-                    id: draft.id.clone(),
-                    session_id: session.id.clone(),
-                    role: MessageRole::Assistant,
-                    content: draft.content.clone(),
-                    thinking: if draft.thinking.is_empty() {
-                        None
-                    } else {
-                        Some(draft.thinking.clone())
-                    },
-                    tool_calls: draft.tool_calls.clone(),
-                    provider_id: Some(session.provider_id.clone()),
-                    model: session.model.clone(),
-                    created_at: Utc::now(),
-                };
-                let plan = draft.plan.clone();
-                el.child(self.render_message(ix, &m, Some(waiting), cx))
+            .when_some(live_msg, |el, (m, plan)| {
+                el.child(self.render_message(ix, &m, Some(waiting), None, cx))
                     .when_some(plan, |el, plan| {
                         el.child(self.render_plan_card(&m.id, &plan, false, cx))
                     })
@@ -8086,6 +8215,7 @@ impl SameAppView {
         ix: usize,
         msg: &Message,
         live: Option<bool>,
+        cached_markdown: Option<&Entity<TextViewState>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
@@ -8094,6 +8224,14 @@ impl SameAppView {
         let copy_text = split_error(&msg.content).0.to_string();
 
         if is_user {
+            let text_view = if let Some(state) = cached_markdown {
+                TextView::new(state)
+            } else {
+                TextView::markdown(
+                    SharedString::from(format!("md-{}", msg.id)),
+                    user_markdown(&msg.content),
+                )
+            };
             return div()
                 .h_flex()
                 .justify_end()
@@ -8111,13 +8249,7 @@ impl SameAppView {
                                 .rounded(px(10.0))
                                 .bg(theme.secondary)
                                 .text_sm()
-                                .child(
-                                    TextView::markdown(
-                                        SharedString::from(format!("md-{}", msg.id)),
-                                        user_markdown(&msg.content),
-                                    )
-                                    .selectable(true),
-                                ),
+                                .child(text_view.selectable(true)),
                         )
                         .child(
                             div()
@@ -8293,7 +8425,9 @@ impl SameAppView {
             })
             // Message content
             .when(!body.trim().is_empty(), |el| {
-                let text_view = if let Some(state) = self.tracked_markdown_state(msg, is_live) {
+                let text_view = if let Some(state) = cached_markdown {
+                    TextView::new(state)
+                } else if let Some(state) = self.tracked_markdown_state(msg, is_live) {
                     TextView::new(state)
                 } else {
                     TextView::markdown(
@@ -9957,5 +10091,31 @@ mod tests {
         let (badge, _, label_en) = summarize_tool_calls(&done_one, Language::En);
         assert_eq!(badge, "✓");
         assert_eq!(label_en, "Ran 1 tool");
+    }
+
+    #[test]
+    fn list_state_uniform_height_and_readiness_stabilize_manual_scroll() {
+        let feed = ListState::new(0, ListAlignment::Top, px(1000.0));
+        feed.set_item_measurement_readiness(|_ix, _| true);
+        feed.reset_with_uniform_height(200, FEED_UNMEASURED_ITEM_HEIGHT_HINT);
+        assert_eq!(feed.item_count(), 200);
+        // Unmeasured items carry the uniform height hint instead of 0px, so
+        // total height is immediately non-zero without calling `measure_all()`.
+        assert_eq!(
+            feed.max_offset_for_scrollbar().y,
+            FEED_UNMEASURED_ITEM_HEIGHT_HINT * 200.0
+        );
+
+        let anchor = gpui::ListOffset {
+            item_ix: 120,
+            offset_in_item: px(45.0),
+        };
+        feed.scroll_to(anchor);
+        assert_eq!(feed.logical_scroll_top(), anchor);
+
+        // Remeasuring an item (e.g. after async >4 KiB Markdown finishes)
+        // preserves the manual scroll anchor.
+        feed.remeasure_items(119..120);
+        assert_eq!(feed.logical_scroll_top(), anchor);
     }
 }
