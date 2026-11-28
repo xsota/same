@@ -1,3 +1,4 @@
+use same_core::paths::simplify_path;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -194,6 +195,95 @@ pub fn load_git_info(root: &Path) -> GitInfo {
     }
 }
 
+/// Formats the raw argument passed to `explorer.exe` to select a file in Windows Explorer.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn windows_explorer_select_arg(path: &Path) -> String {
+    let normalized = simplify_path(&path.to_string_lossy());
+    format!("/select,\"{normalized}\"")
+}
+
+/// Resolves the directory to open with `xdg-open` on Linux/Unix for a given path.
+#[cfg_attr(not(any(all(unix, not(target_os = "macos")), test)), allow(dead_code))]
+fn unix_reveal_target(path: &Path, is_dir: bool) -> &Path {
+    if is_dir {
+        path
+    } else {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(path)
+    }
+}
+
+/// Spawns a fire-and-forget launcher process and reaps it in the background on Unix
+/// so exited `open` / `xdg-open` processes do not accumulate as zombies.
+fn spawn_file_manager_command(mut cmd: Command) {
+    #[cfg(unix)]
+    {
+        if let Ok(mut child) = cmd.spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd.spawn();
+    }
+}
+
+/// Opens a directory in the OS file manager (Windows Explorer / macOS Finder / Linux xdg-open).
+pub fn open_path_in_file_manager(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        let normalized = simplify_path(&path.to_string_lossy());
+        let mut cmd = Command::new("explorer");
+        cmd.arg(normalized);
+        spawn_file_manager_command(cmd);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("open");
+        cmd.arg(path);
+        spawn_file_manager_command(cmd);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(path);
+        spawn_file_manager_command(cmd);
+    }
+}
+
+/// Reveals a file or opens a directory in the OS file manager
+/// (Windows Explorer `/select`, macOS Finder `open -R`, Linux `xdg-open` on parent dir).
+pub fn reveal_in_file_manager(path: &Path, is_dir: bool) {
+    if is_dir {
+        open_path_in_file_manager(path);
+        return;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = Command::new("explorer");
+        cmd.raw_arg(windows_explorer_select_arg(path));
+        spawn_file_manager_command(cmd);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("open");
+        cmd.arg("-R").arg(path);
+        spawn_file_manager_command(cmd);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = unix_reveal_target(path, false);
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(target);
+        spawn_file_manager_command(cmd);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +331,37 @@ mod tests {
         assert!(entries[0].rel_path.ends_with("deep.rs"));
         assert_eq!(entries[0].depth, 0);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn windows_explorer_select_arg_handles_spaces_and_verbatim_prefix() {
+        assert_eq!(
+            windows_explorer_select_arg(Path::new(r"C:\Users\my user\file.rs")),
+            r#"/select,"C:\Users\my user\file.rs""#
+        );
+        assert_eq!(
+            windows_explorer_select_arg(Path::new(r"\\?\C:\Users\demo\main.rs")),
+            r#"/select,"C:\Users\demo\main.rs""#
+        );
+        assert_eq!(
+            windows_explorer_select_arg(Path::new(r"\\?\UNC\wsl.localhost\Ubuntu\home\main.rs")),
+            r#"/select,"\\wsl.localhost\Ubuntu\home\main.rs""#
+        );
+    }
+
+    #[test]
+    fn unix_reveal_target_uses_parent_for_files_and_self_for_dirs() {
+        assert_eq!(
+            unix_reveal_target(Path::new("/tmp/project/src/main.rs"), false),
+            Path::new("/tmp/project/src")
+        );
+        assert_eq!(
+            unix_reveal_target(Path::new("/tmp/project/src"), true),
+            Path::new("/tmp/project/src")
+        );
+        assert_eq!(
+            unix_reveal_target(Path::new("main.rs"), false),
+            Path::new("main.rs")
+        );
     }
 }

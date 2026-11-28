@@ -2955,22 +2955,6 @@ impl SameAppView {
     }
 }
 
-/// Opens a directory in the OS file manager (Windows Explorer / macOS Finder / Linux xdg-open).
-pub(super) fn open_path_in_file_manager(path: &Path) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("explorer").arg(path).spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(path).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-    }
-}
-
 #[cfg(test)]
 mod prompt_skill_tests {
     use super::*;

@@ -10,7 +10,10 @@ use crate::theme::{
     default_mono_font, default_ui_font, palette, status_amber, status_green, status_red,
 };
 use crate::updater::{self, ReleaseInfo, UpdateCheckOutcome, CURRENT_VERSION};
-use crate::workspace_fs::{load_git_info, scan_directory, FileEntry, GitInfo};
+use crate::workspace_fs::{
+    load_git_info, open_path_in_file_manager, reveal_in_file_manager, scan_directory, FileEntry,
+    GitInfo,
+};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
     actions, div, list, prelude::FluentBuilder as _, px, AnyElement, App, AppContext, ClickEvent,
@@ -24,7 +27,7 @@ use gpui_component::button::{Button, ButtonRounded, ButtonVariants as _};
 use gpui_component::input::{
     Input, InputEvent, InputState, MoveDown, MoveUp, Textarea, TextareaState,
 };
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::scroll::{Scrollbar, ScrollbarAxis, ScrollbarMode};
 use gpui_component::text::{RenderedText, TextView, TextViewState};
@@ -10200,6 +10203,7 @@ impl SameAppView {
         let lang = self.config.language;
         let filtering = !self.file_filter_input.read(cx).value().trim().is_empty();
         let file_open = self.opened_file_path.is_some();
+        let root_workdir = self.current_workspace_root();
 
         div()
             .v_flex()
@@ -10208,8 +10212,8 @@ impl SameAppView {
             .gap_2()
             .child(Input::new(&self.file_filter_input).xsmall().cleanable(true))
             // File tree
-            .child(
-                div()
+            .child({
+                let tree = div()
                     .id("files-tree-scroll")
                     .v_flex()
                     .when(file_open && !self.right_split, |d| {
@@ -10233,7 +10237,7 @@ impl SameAppView {
                                 }),
                         )
                     })
-                    .children(self.file_entries.iter().enumerate().map(|(i, entry)| {
+                    .children(self.file_entries.iter().map(|entry| {
                         let name = if filtering {
                             entry.rel_path.clone()
                         } else {
@@ -10244,6 +10248,13 @@ impl SameAppView {
                                 .unwrap_or_else(|| entry.rel_path.clone())
                         };
                         let path = entry.path.clone();
+                        let menu_path = entry.path.clone();
+                        let row_id = {
+                            use std::hash::{Hash as _, Hasher as _};
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            entry.path.hash(&mut hasher);
+                            SharedString::from(format!("file-entry-{:016x}", hasher.finish()))
+                        };
                         let is_dir = entry.is_dir;
                         let expanded = self.expanded_dirs.contains(&entry.path);
                         let selected = self.opened_file_path.as_ref() == Some(&entry.path);
@@ -10256,11 +10267,7 @@ impl SameAppView {
                         } else {
                             " "
                         };
-                        list_row(
-                            SharedString::from(format!("file-entry-{i}")),
-                            selected,
-                            &theme,
-                        )
+                        list_row(row_id, selected, &theme)
                         .py(px(2.0))
                         .text_xs()
                         .pl(px(8.0 + entry.depth as f32 * 14.0))
@@ -10279,21 +10286,53 @@ impl SameAppView {
                                 .when(is_dir, |d| d.font_weight(FontWeight::SEMIBOLD))
                                 .child(name),
                         )
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                if is_dir {
-                                    if !this.expanded_dirs.remove(&path) {
-                                        this.expanded_dirs.insert(path.clone());
-                                    }
-                                    this.reload_workspace_files_only(cx);
-                                } else {
-                                    this.open_file(path.clone(), window, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if is_dir {
+                                if !this.expanded_dirs.remove(&path) {
+                                    this.expanded_dirs.insert(path.clone());
                                 }
-                                cx.notify();
-                            },
-                        ))
-                    })),
-            )
+                                this.reload_workspace_files_only(cx);
+                            } else {
+                                this.open_file(path.clone(), window, cx);
+                            }
+                            cx.notify();
+                        }))
+                        .context_menu(move |menu, _, _| {
+                            let reveal_path = menu_path.clone();
+                            let copy_path = menu_path.clone();
+                            menu.item(
+                                PopupMenuItem::new(reveal_in_file_manager_label(lang, is_dir))
+                                    .on_click(move |_, _, _| {
+                                        reveal_in_file_manager(&reveal_path, is_dir);
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(t(lang, "パスをコピー", "Copy Path")).on_click(
+                                    move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_path.to_string_lossy().to_string(),
+                                        ));
+                                    },
+                                ),
+                            )
+                        })
+                    }));
+                if let Some(workdir) = root_workdir {
+                    tree.context_menu(move |menu, _, _| {
+                        let workdir = workdir.clone();
+                        menu.item(
+                            PopupMenuItem::new(reveal_in_file_manager_label(lang, true)).on_click(
+                                move |_, _, _| {
+                                    open_path_in_file_manager(&workdir);
+                                },
+                            ),
+                        )
+                    })
+                    .into_any_element()
+                } else {
+                    tree.into_any_element()
+                }
+            })
             // File viewer / editor when a file is open
             .when_some(self.opened_file_path.clone(), |el, path| {
                 let rel = self
@@ -10303,6 +10342,7 @@ impl SameAppView {
                     .to_string_lossy()
                     .to_string();
                 let ref_path = path.clone();
+                let header_menu_path = path.clone();
                 el.child(div().h(px(1.0)).bg(theme.border))
                     .child(
                         div()
@@ -10312,6 +10352,7 @@ impl SameAppView {
                             .gap_1()
                             .child(
                                 div()
+                                    .id("opened-file-header")
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
@@ -10321,6 +10362,30 @@ impl SameAppView {
                                         format!("● {rel}")
                                     } else {
                                         rel
+                                    })
+                                    .context_menu(move |menu, _, _| {
+                                        let reveal_path = header_menu_path.clone();
+                                        let copy_path = header_menu_path.clone();
+                                        menu.item(
+                                            PopupMenuItem::new(reveal_in_file_manager_label(
+                                                lang, false,
+                                            ))
+                                            .on_click(move |_, _, _| {
+                                                reveal_in_file_manager(&reveal_path, false);
+                                            }),
+                                        )
+                                        .item(
+                                            PopupMenuItem::new(t(
+                                                lang,
+                                                "パスをコピー",
+                                                "Copy Path",
+                                            ))
+                                            .on_click(move |_, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    copy_path.to_string_lossy().to_string(),
+                                                ));
+                                            }),
+                                        )
                                     }),
                             )
                             .child(
@@ -10540,6 +10605,33 @@ impl Focusable for SameAppView {
 /// Height of the custom title bar. Slightly taller than gpui-component's
 /// default so it reads like the Codex / Claude desktop chrome.
 const TITLE_BAR_HEIGHT: gpui::Pixels = px(40.0);
+
+fn reveal_in_file_manager_label(lang: Language, is_dir: bool) -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        if is_dir {
+            t(lang, "Finder で開く", "Open in Finder")
+        } else {
+            t(lang, "Finder で表示", "Reveal in Finder")
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if is_dir {
+            t(lang, "エクスプローラーで開く", "Open in File Explorer")
+        } else {
+            t(lang, "エクスプローラーで表示", "Reveal in File Explorer")
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if is_dir {
+            t(lang, "ファイルマネージャで開く", "Open in File Manager")
+        } else {
+            t(lang, "親フォルダを開く", "Open Containing Folder")
+        }
+    }
+}
 
 /// A borderless, icon-only button for the title bar.
 fn title_icon_button(
