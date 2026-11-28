@@ -447,6 +447,9 @@ impl SameAppView {
 
     /// Suggestions popup shown above the composer when typing `$skill` anywhere in the prompt.
     pub(super) fn render_skill_suggestions(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.prompt_is_skill_mention {
+            return None;
+        }
         let text = self.prompt_input.read(cx).value().to_string();
         let (dollar_pos, query) = detect_dollar_skill_token(&text)?;
         let q = query.to_ascii_lowercase();
@@ -532,10 +535,23 @@ impl SameAppView {
     }
 
     /// Reloads skills, assignments, deployments, and recomputes resolution for the
-    /// currently selected project.
+    /// currently selected project (refreshing hashes from disk).
     pub(super) fn reload_skills_state(&mut self) {
-        let _ = self.skills_ui.manager.refresh_from_disk();
+        self.skills_ui.skills = self
+            .skills_ui
+            .manager
+            .refresh_from_disk()
+            .unwrap_or_else(|_| self.skills_ui.manager.list_skills().unwrap_or_default());
+        self.reload_skills_project_bindings();
+    }
+
+    /// Lightweight reload from SQLite without re-hashing every skill directory on disk.
+    pub(super) fn reload_skills_state_fast(&mut self) {
         self.skills_ui.skills = self.skills_ui.manager.list_skills().unwrap_or_default();
+        self.reload_skills_project_bindings();
+    }
+
+    fn reload_skills_project_bindings(&mut self) {
         self.skills_ui.assignments = match self.selected_project_id.as_deref() {
             Some(pid) => self
                 .skills_ui

@@ -223,15 +223,22 @@ impl SameAppView {
         cx: &mut Context<Self>,
     ) {
         let target_pid = project_id.or_else(|| {
-            self.storage
-                .get_session(&session_id)
-                .ok()
-                .flatten()
-                .map(|s| s.project_id)
+            self.active_session_meta
+                .get(&session_id)
+                .map(|s| s.project_id.clone())
+                .or_else(|| {
+                    self.storage
+                        .get_session(&session_id)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.project_id)
+                })
         });
         if let Some(pid) = target_pid {
             if self.selected_project_id.as_deref() != Some(pid.as_str()) {
-                self.select_project(pid, window, cx);
+                self.select_project_with_session(pid, Some(session_id), window, cx);
+                self.prompt_input.update(cx, |s, cx| s.focus(window, cx));
+                return;
             }
         }
         self.select_session(session_id, window, cx);
@@ -277,14 +284,24 @@ impl SameAppView {
         if let Some(sw) = self.session_workdirs.get(sid) {
             return Some(PathBuf::from(&sw.path));
         }
-        if let Ok(Some(sw)) = self.storage.get_session_workdir(sid) {
-            return Some(PathBuf::from(&sw.path));
+        // `self.session_workdirs` is preloaded for all sessions in the current
+        // project, so only hit SQLite for sessions belonging to other projects.
+        let in_current_project = self.sessions.iter().any(|s| s.id == sid);
+        if !in_current_project {
+            if let Ok(Some(sw)) = self.storage.get_session_workdir(sid) {
+                return Some(PathBuf::from(&sw.path));
+            }
         }
         let project_id = self
             .sessions
             .iter()
             .find(|s| s.id == sid)
             .map(|s| s.project_id.clone())
+            .or_else(|| {
+                self.active_session_meta
+                    .get(sid)
+                    .map(|s| s.project_id.clone())
+            })
             .or_else(|| {
                 self.storage
                     .get_session(sid)
@@ -306,14 +323,12 @@ impl SameAppView {
     }
 
     pub(super) fn session_workdir_record(&self, sid: &str) -> Option<SessionWorkdir> {
-        self.session_workdirs
-            .get(sid)
-            .cloned()
-            .or_else(|| self.storage.get_session_workdir(sid).ok().flatten())
+        self.session_workdirs.get(sid).cloned()
     }
 
     pub(super) fn session_workdir_mode(&self, sid: &str) -> WorkdirMode {
-        self.session_workdir_record(sid)
+        self.session_workdirs
+            .get(sid)
             .map(|sw| sw.mode)
             .unwrap_or(WorkdirMode::Shared)
     }
@@ -513,12 +528,15 @@ impl SameAppView {
         match mode {
             WorkdirMode::Shared => {}
             WorkdirMode::ReadOnly => {
+                let branch = self
+                    .cached_branch_for_path(Path::new(project_workdir))
+                    .or_else(|| current_branch(Path::new(project_workdir)));
                 let sw = SessionWorkdir {
                     session_id: sid.to_string(),
                     mode: WorkdirMode::ReadOnly,
                     path: project_workdir.to_string(),
-                    base_branch: current_branch(Path::new(project_workdir)),
-                    branch_name: current_branch(Path::new(project_workdir)),
+                    base_branch: branch.clone(),
+                    branch_name: branch,
                     is_worktree: false,
                     created_at: Utc::now(),
                 };
@@ -623,12 +641,15 @@ impl SameAppView {
                         }
                     }
                 }
+                let branch = self
+                    .cached_branch_for_path(Path::new(&project.workdir))
+                    .or_else(|| current_branch(Path::new(&project.workdir)));
                 let sw = SessionWorkdir {
                     session_id: sid.to_string(),
                     mode,
                     path: project.workdir.clone(),
-                    base_branch: current_branch(Path::new(&project.workdir)),
-                    branch_name: current_branch(Path::new(&project.workdir)),
+                    base_branch: branch.clone(),
+                    branch_name: branch,
                     is_worktree: false,
                     created_at: Utc::now(),
                 };
@@ -950,15 +971,12 @@ impl SameAppView {
                                 .sessions
                                 .iter()
                                 .find(|s| s.id == sid)
-                                .cloned()
-                                .or_else(|| self.storage.get_session(&sid).ok().flatten());
+                                .or_else(|| self.active_session_meta.get(&sid));
                             let title = sess
-                                .as_ref()
                                 .map(|s| self.session_title(s))
                                 .unwrap_or_else(|| sid[..sid.len().min(8)].to_string());
-                            let pid = sess.as_ref().map(|s| s.project_id.clone());
+                            let pid = sess.map(|s| s.project_id.clone());
                             let provider_lbl = sess
-                                .as_ref()
                                 .map(|s| self.provider_name(&s.provider_id))
                                 .unwrap_or_default();
                             let waiting_perm =
@@ -1446,7 +1464,19 @@ impl SameAppView {
                                                 .cached_worktrees
                                                 .iter()
                                                 .find(|w| w.is_main)
-                                                .cloned();
+                                                .cloned()
+                                                .or_else(|| {
+                                                    this.current_project()
+                                                        .and_then(|p| {
+                                                            same_core::list_worktrees(Path::new(
+                                                                &p.workdir,
+                                                            ))
+                                                            .ok()
+                                                        })
+                                                        .and_then(|wts| {
+                                                            wts.into_iter().find(|w| w.is_main)
+                                                        })
+                                                });
                                             let target_dir = main_wt
                                                 .as_ref()
                                                 .map(|w| w.path.clone())

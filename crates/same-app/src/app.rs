@@ -40,7 +40,7 @@ use same_agent::{
 };
 use same_core::paths::simplify_path;
 use same_core::{
-    current_branch, AgentRun, AgentRunStatus, AppConfig, AppPaths, ApprovalMode, ColorTheme,
+    AgentRun, AgentRunStatus, AppConfig, AppPaths, ApprovalMode, ColorTheme,
     ContextEnvironment, ContextManager, EventBus, ExecMode, HandoffMode, HandoffRequest, Language,
     Message, MessageRole, ModelInfo, PermissionRequest, Project, ProviderConfig, ProviderKind,
     ProviderSession, ProviderSessionStatus, Quest, SameEvent, Session, SessionStatus,
@@ -470,6 +470,17 @@ enum UiAsyncMsg {
         request_id: u64,
         result: Result<same_agent::GeneratedSkillDraft, String>,
     },
+    WorkspaceFilesLoaded {
+        generation: u64,
+        root: PathBuf,
+        entries: Vec<FileEntry>,
+    },
+    WorkspaceGitLoaded {
+        generation: u64,
+        root: PathBuf,
+        git_info: GitInfo,
+        worktrees: Option<Vec<same_core::WorktreeInfo>>,
+    },
 }
 
 enum UpdateState {
@@ -741,6 +752,21 @@ pub struct SameAppView {
     pending_worktree_confirm: Option<parallel::PendingWorktreeConfirm>,
     session_workdirs: HashMap<String, SessionWorkdir>,
     cached_worktrees: Vec<same_core::WorktreeInfo>,
+    /// Cached metadata for running/waiting sessions (avoids SQLite lookups during render).
+    active_session_meta: HashMap<String, Session>,
+    /// Generation counters for discarding stale background workspace scans / git loads.
+    workspace_files_generation: u64,
+    workspace_git_generation: u64,
+    /// Caps concurrent background directory scans to at most one in flight.
+    workspace_files_in_flight: bool,
+    /// When true, triggers one trailing scan with the latest filter once the current scan finishes.
+    workspace_files_pending_refresh: bool,
+    /// Keeps an in-flight worktree list refresh alive even if a Git-only refresh supersedes it.
+    worktrees_refresh_pending: bool,
+    /// Effective workdir root currently loaded in `file_entries` / `git_info`.
+    loaded_workspace_root: Option<PathBuf>,
+    /// Prevents `file_filter_input` clearing during project switch from triggering a duplicate scan.
+    suppress_file_filter_reload: bool,
 }
 
 impl Drop for SameAppView {
@@ -795,12 +821,29 @@ impl SameAppView {
             });
         }
 
-        // Pump async messages into GPUI view state without polling
+        // Pump async messages into GPUI view state without polling.
+        // Drain all queued messages in one update pass to coalesce rapid
+        // streaming deltas and avoid redundant full-view re-renders.
         cx.spawn(async move |this, cx| {
-            while let Some(msg) = ui_rx.recv().await {
+            while let Some(first) = ui_rx.recv().await {
+                let mut batch = vec![first];
+                while let Ok(next) = ui_rx.try_recv() {
+                    batch.push(next);
+                }
                 let updated = this.update(cx, |view, cx| {
-                    view.handle_async_msg(msg, cx);
-                    cx.notify();
+                    let mut needs_notify = false;
+                    let mut live_md_dirty = false;
+                    for msg in batch {
+                        let (notify, md_dirty) = view.handle_async_msg(msg, cx);
+                        needs_notify |= notify;
+                        live_md_dirty |= md_dirty;
+                    }
+                    if live_md_dirty {
+                        view.sync_live_markdown_for_selected(cx);
+                    }
+                    if needs_notify {
+                        cx.notify();
+                    }
                 });
                 if updated.is_err() {
                     break;
@@ -862,9 +905,8 @@ impl SameAppView {
                 &file_filter_input,
                 window,
                 |this, _, ev: &InputEvent, _, cx| {
-                    if matches!(ev, InputEvent::Change) {
-                        this.reload_workspace_files(cx);
-                        cx.notify();
+                    if matches!(ev, InputEvent::Change) && !this.suppress_file_filter_reload {
+                        this.reload_workspace_files_only(cx);
                     }
                 },
             ),
@@ -1135,6 +1177,14 @@ impl SameAppView {
             pending_worktree_confirm: None,
             session_workdirs: HashMap::new(),
             cached_worktrees: Vec::new(),
+            active_session_meta: HashMap::new(),
+            workspace_files_generation: 0,
+            workspace_git_generation: 0,
+            workspace_files_in_flight: false,
+            workspace_files_pending_refresh: false,
+            worktrees_refresh_pending: false,
+            loaded_workspace_root: None,
+            suppress_file_filter_reload: false,
         };
         app.agent_manager
             .set_max_concurrent_sessions(app.config.max_concurrent_sessions());
@@ -1711,6 +1761,16 @@ impl SameAppView {
     }
 
     fn select_session(&mut self, session_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_session_inner(session_id, false, window, cx);
+    }
+
+    fn select_session_inner(
+        &mut self,
+        session_id: String,
+        known_empty: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let prev_sid = self.selected_session_id.clone();
         let switching = prev_sid.as_deref() != Some(session_id.as_str());
         if switching {
@@ -1724,7 +1784,17 @@ impl SameAppView {
         self.selected_session_id = Some(session_id.clone());
         self.active_view = MainView::Chat;
         self.confirm_delete = None;
-        self.reload_messages(window, cx);
+        if known_empty {
+            self.clear_turn_anchor();
+            self.session_markdown_views.clear();
+            self.selected_tool_turn_id = None;
+            self.tools_visible_limit = TOOLS_HISTORY_PAGE_SIZE;
+            self.messages.clear();
+            self.invalidate_feed();
+            self.sync_live_markdown_for_selected(cx);
+        } else {
+            self.reload_messages(window, cx);
+        }
         let saved_scroll = if switching {
             self.restore_session_ui_state(&session_id, window, cx)
         } else {
@@ -1736,7 +1806,12 @@ impl SameAppView {
         } else {
             self.scroll_feed_to_end();
         }
-        self.reload_workspace_files(cx);
+        // Only reload workspace files & git info when the effective working
+        // directory actually changed (same-workdir session switches are instant).
+        let next_root = self.current_workspace_root();
+        if next_root != self.loaded_workspace_root {
+            self.reload_workspace_files(cx);
+        }
         self.prompt_input.update(cx, |s, cx| s.focus(window, cx));
     }
 
@@ -1791,7 +1866,7 @@ impl SameAppView {
                     self.apply_default_workdir_mode(&id, &workdir);
                 }
                 self.sessions.insert(0, sess);
-                self.select_session(id, window, cx);
+                self.select_session_inner(id, true, window, cx);
             }
             Err(e) => self.note(NoteKind::Error, format!("{e:#}")),
         }
@@ -1811,13 +1886,22 @@ impl SameAppView {
             self.tools_visible_limit = TOOLS_HISTORY_PAGE_SIZE;
             self.clear_turn_anchor();
             self.invalidate_feed();
-            self.file_entries.clear();
-            self.git_info = GitInfo::default();
+            self.session_workdirs.clear();
+            self.reload_workspace_files(cx);
             return;
         };
 
         self.quests = self.storage.list_quests(&project_id).unwrap_or_default();
         self.sessions = self.storage.list_sessions(&project_id).unwrap_or_default();
+        // Preload all session workdirs for this project so `render()` never
+        // needs to hit SQLite per session row.
+        self.session_workdirs = self
+            .storage
+            .list_session_workdirs_for_project(&project_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|sw| (sw.session_id.clone(), sw))
+            .collect();
 
         if self.sessions.is_empty() {
             if let Ok(mut sess) = self.storage.create_session(
@@ -1870,20 +1954,98 @@ impl SameAppView {
         self.sync_live_markdown_for_selected(cx);
     }
 
-    fn reload_workspace_files(&mut self, cx: &Context<Self>) {
-        let filter = self.file_filter_input.read(cx).value().to_string();
-        let root_opt = self
-            .selected_session_id
+    fn current_workspace_root(&self) -> Option<PathBuf> {
+        self.selected_session_id
             .as_deref()
             .and_then(|sid| self.effective_workdir_for_session(sid))
-            .or_else(|| self.current_project().map(|p| PathBuf::from(&p.workdir)));
+            .or_else(|| self.current_project().map(|p| PathBuf::from(&p.workdir)))
+    }
+
+    pub(super) fn cached_branch_for_path(&self, path: &Path) -> Option<String> {
+        if self.git_info.is_repo
+            && self.loaded_workspace_root.as_deref() == Some(path)
+            && !self.git_info.branch.is_empty()
+            && !self.git_info.branch.starts_with('(')
+        {
+            return Some(self.git_info.branch.clone());
+        }
+        None
+    }
+
+    fn reload_workspace_files_only(&mut self, cx: &Context<Self>) {
+        let Some(root) = self.current_workspace_root() else {
+            self.workspace_files_generation = self.workspace_files_generation.wrapping_add(1);
+            self.workspace_files_in_flight = false;
+            self.workspace_files_pending_refresh = false;
+            self.file_entries.clear();
+            return;
+        };
+        if self.workspace_files_in_flight {
+            self.workspace_files_pending_refresh = true;
+            return;
+        }
+        let filter = self.file_filter_input.read(cx).value().to_string();
+        self.workspace_files_generation = self.workspace_files_generation.wrapping_add(1);
+        self.workspace_files_in_flight = true;
+        self.workspace_files_pending_refresh = false;
+        let generation = self.workspace_files_generation;
+        let expanded = self.expanded_dirs.clone();
+        let tx = self.ui_tx.clone();
+        self.rt.spawn_blocking(move || {
+            let entries = scan_directory(&root, &filter, &expanded, 2000);
+            let _ = tx.send(UiAsyncMsg::WorkspaceFilesLoaded {
+                generation,
+                root,
+                entries,
+            });
+        });
+    }
+
+    fn reload_git_and_worktrees_async(&mut self, include_worktrees: bool) {
+        let Some(root) = self.current_workspace_root() else {
+            self.workspace_git_generation = self.workspace_git_generation.wrapping_add(1);
+            self.worktrees_refresh_pending = false;
+            self.git_info = GitInfo::default();
+            self.cached_worktrees.clear();
+            return;
+        };
+        let include_worktrees = include_worktrees || self.worktrees_refresh_pending;
+        if include_worktrees {
+            self.worktrees_refresh_pending = true;
+        }
+        self.workspace_git_generation = self.workspace_git_generation.wrapping_add(1);
+        let generation = self.workspace_git_generation;
+        let project_workdir = if include_worktrees {
+            self.current_project().map(|p| PathBuf::from(&p.workdir))
+        } else {
+            None
+        };
+        let tx = self.ui_tx.clone();
+        self.rt.spawn_blocking(move || {
+            let git_info = load_git_info(&root);
+            let worktrees = project_workdir
+                .map(|pw| same_core::list_worktrees(&pw).unwrap_or_default());
+            let _ = tx.send(UiAsyncMsg::WorkspaceGitLoaded {
+                generation,
+                root,
+                git_info,
+                worktrees,
+            });
+        });
+    }
+
+    fn reload_workspace_files(&mut self, cx: &Context<Self>) {
+        let root_opt = self.current_workspace_root();
+        let root_changed = root_opt != self.loaded_workspace_root;
+        self.loaded_workspace_root = root_opt.clone();
+        if root_changed {
+            // Invalidate stale checkout data immediately so clicks or prompt
+            // handoffs cannot reference files or branches from the previous checkout.
+            self.file_entries.clear();
+            self.git_info = GitInfo::default();
+            self.cached_worktrees.clear();
+        }
         if let Some(root) = root_opt {
-            self.file_entries = scan_directory(&root, &filter, &self.expanded_dirs, 2000);
-            self.git_info = load_git_info(&root);
-            self.cached_worktrees = self
-                .current_project()
-                .map(|p| same_core::list_worktrees(Path::new(&p.workdir)).unwrap_or_default())
-                .unwrap_or_default();
             // Clear editor path if it points into a different checkout (e.g.
             // after switching between Shared and an isolated worktree) and has
             // no unsaved edits, so saving cannot write to the wrong checkout.
@@ -1893,11 +2055,22 @@ impl SameAppView {
                     self.opened_file_saved.clear();
                 }
             }
+            self.reload_workspace_files_only(cx);
+            self.reload_git_and_worktrees_async(true);
         } else {
+            self.workspace_files_generation = self.workspace_files_generation.wrapping_add(1);
+            self.workspace_git_generation = self.workspace_git_generation.wrapping_add(1);
+            self.workspace_files_in_flight = false;
+            self.workspace_files_pending_refresh = false;
+            self.worktrees_refresh_pending = false;
             self.file_entries.clear();
             self.git_info = GitInfo::default();
             self.cached_worktrees.clear();
+            self.reconcile_git_tab_visibility();
         }
+    }
+
+    fn reconcile_git_tab_visibility(&mut self) {
         if !self.git_info.is_repo {
             if self.right_tab == RightTab::Git {
                 self.right_tab = if self.right_split && self.right_bottom_tab == RightTab::Files {
@@ -2117,6 +2290,9 @@ impl SameAppView {
             .storage
             .update_session_meta(&sid, Some(&title), None, None, None, None);
         if let Some(s) = self.sessions.iter_mut().find(|s| s.id == sid) {
+            s.title = title.clone();
+        }
+        if let Some(s) = self.active_session_meta.get_mut(&sid) {
             s.title = title;
         }
     }
@@ -2158,6 +2334,7 @@ impl SameAppView {
         }
         self.agent_manager.release_session(&sid);
         self.active_runs.remove(&sid);
+        self.active_session_meta.remove(&sid);
         self.pending_permissions.retain(|p| p.session_id != sid);
         self.pending_inputs.retain(|p| p.request.session_id != sid);
         self.session_ui_states.remove(&sid);
@@ -2190,20 +2367,34 @@ impl SameAppView {
     }
 
     fn select_project(&mut self, pid: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_project_with_session(pid, None, window, cx);
+    }
+
+    pub(super) fn select_project_with_session(
+        &mut self,
+        pid: String,
+        target_session_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(old_sid) = self.selected_session_id.clone() {
             self.save_session_ui_state(&old_sid, cx);
         }
         self.selected_project_id = Some(pid);
         self.selected_quest_filter = None;
-        self.selected_session_id = None;
+        self.selected_session_id = target_session_id;
         self.pending_provider_switch = None;
         self.pending_worktree_confirm = None;
         self.opened_file_path = None;
         self.file_dirty = false;
         self.active_view = MainView::Chat;
         self.confirm_delete = None;
-        self.file_filter_input
-            .update(cx, |i, cx| i.set_value("", window, cx));
+        if !self.file_filter_input.read(cx).value().is_empty() {
+            self.suppress_file_filter_reload = true;
+            self.file_filter_input
+                .update(cx, |i, cx| i.set_value("", window, cx));
+            self.suppress_file_filter_reload = false;
+        }
         self.reload_project_state(window, cx);
         if let Some(new_sid) = self.selected_session_id.clone() {
             if let Some(offset) = self.restore_session_ui_state(&new_sid, window, cx) {
@@ -2211,7 +2402,7 @@ impl SameAppView {
                 self.feed.scroll_to(offset);
             }
         }
-        self.reload_skills_state();
+        self.reload_skills_state_fast();
         self.trigger_external_skill_discovery();
         // Another project may run its agents somewhere else (e.g. WSL).
         self.refresh_provider_checks();
@@ -2817,18 +3008,65 @@ impl SameAppView {
         });
     }
 
-    fn handle_async_msg(&mut self, msg: UiAsyncMsg, cx: &mut Context<Self>) {
+    fn is_logs_tab_visible(&self) -> bool {
+        self.show_right_panel
+            && (self.right_tab == RightTab::Logs
+                || (self.right_split && self.right_bottom_tab == RightTab::Logs))
+    }
+
+    /// Returns `(needs_notify, live_markdown_dirty)`.
+    fn handle_async_msg(&mut self, msg: UiAsyncMsg, cx: &mut Context<Self>) -> (bool, bool) {
         match msg {
+            UiAsyncMsg::WorkspaceFilesLoaded {
+                generation,
+                root,
+                entries,
+            } => {
+                let mut updated = false;
+                if self.workspace_files_generation == generation {
+                    self.workspace_files_in_flight = false;
+                    if self.loaded_workspace_root.as_ref() == Some(&root) {
+                        self.file_entries = entries;
+                        updated = true;
+                    }
+                    if self.workspace_files_pending_refresh {
+                        self.workspace_files_pending_refresh = false;
+                        self.reload_workspace_files_only(cx);
+                    }
+                }
+                return (updated, false);
+            }
+            UiAsyncMsg::WorkspaceGitLoaded {
+                generation,
+                root,
+                git_info,
+                worktrees,
+            } => {
+                if self.workspace_git_generation == generation
+                    && self.loaded_workspace_root.as_ref() == Some(&root)
+                {
+                    self.git_info = git_info;
+                    if let Some(wts) = worktrees {
+                        self.cached_worktrees = wts;
+                        self.worktrees_refresh_pending = false;
+                    }
+                    self.reconcile_git_tab_visibility();
+                    return (true, false);
+                }
+                return (false, false);
+            }
             UiAsyncMsg::ExternalSkillsDiscovered { generation, skills } => {
                 if self.skills_ui.discovery_generation == generation {
                     self.skills_ui.discovering = false;
                     self.skills_ui.external_skills = skills;
                     self.recompute_skill_resolution();
+                } else {
+                    return (false, false);
                 }
             }
             UiAsyncMsg::SkillDraftGenerated { request_id, result } => {
                 if self.skills_ui.ai_request_id != request_id {
-                    return;
+                    return (false, false);
                 }
                 let lang = self.config.language;
                 self.skills_ui.ai_generating = false;
@@ -3123,7 +3361,7 @@ impl SameAppView {
                     .as_ref()
                     .is_some_and(|(id, pid, _)| *id == attempt_id && pid == &provider_id);
                 if !is_current {
-                    return;
+                    return (false, false);
                 }
                 self.active_login = None;
                 self.setup_running.remove(&provider_id);
@@ -3152,11 +3390,13 @@ impl SameAppView {
                 self.refresh_provider_checks();
                 self.invalidate_and_refresh_quotas(Some(&pid_for_quota));
             }
-            UiAsyncMsg::Event(ev) => self.handle_same_event(ev, cx),
+            UiAsyncMsg::Event(ev) => return self.handle_same_event(ev, cx),
         }
+        (true, false)
     }
 
-    fn handle_same_event(&mut self, ev: SameEvent, cx: &mut Context<Self>) {
+    /// Returns `(needs_notify, live_markdown_dirty)`.
+    fn handle_same_event(&mut self, ev: SameEvent, cx: &mut Context<Self>) -> (bool, bool) {
         match ev {
             SameEvent::SessionStarted { session_id, .. } => {
                 self.live_drafts.entry(session_id.clone()).or_default();
@@ -3291,27 +3531,30 @@ impl SameAppView {
                 if let Some(d) = self.live_drafts.get_mut(&session_id) {
                     d.push_content(&text);
                 } else {
-                    return;
+                    return (false, false);
                 }
                 if self.is_selected_session(&session_id) {
                     self.mark_feed_tail_dirty();
-                    self.sync_live_markdown_for_selected(cx);
+                    return (true, true);
                 }
+                return (false, false);
             }
             SameEvent::ThinkingDelta { session_id, text } => {
                 if let Some(d) = self.live_drafts.get_mut(&session_id) {
                     d.thinking.push_str(&text);
                     if self.is_selected_session(&session_id) {
                         self.mark_feed_tail_dirty();
+                        return (true, false);
                     }
                 }
+                return (false, false);
             }
             SameEvent::ToolCallStarted {
                 session_id,
                 tool_call,
             } => {
                 let Some(draft) = self.live_drafts.get_mut(&session_id) else {
-                    return;
+                    return (false, false);
                 };
                 if let Some(existing) = draft.tool_calls.iter_mut().find(|t| t.id == tool_call.id) {
                     *existing = tool_call;
@@ -3320,14 +3563,16 @@ impl SameAppView {
                 }
                 if self.is_selected_session(&session_id) {
                     self.mark_feed_tail_dirty();
+                    return (true, false);
                 }
+                return (false, false);
             }
             SameEvent::ToolCallUpdated {
                 session_id,
                 tool_call,
             } => {
                 let Some(draft) = self.live_drafts.get_mut(&session_id) else {
-                    return;
+                    return (false, false);
                 };
                 if let Some(existing) = draft.tool_calls.iter_mut().find(|t| t.id == tool_call.id) {
                     if !tool_call.title.is_empty() {
@@ -3348,7 +3593,9 @@ impl SameAppView {
                 }
                 if self.is_selected_session(&session_id) {
                     self.mark_feed_tail_dirty();
+                    return (true, false);
                 }
+                return (false, false);
             }
             SameEvent::ApprovalRequested { request } => {
                 // A request that arrives after the run was stopped can't be
@@ -3358,7 +3605,7 @@ impl SameAppView {
                     let rid = request.request_id.clone();
                     self.rt
                         .spawn(async move { mgr.respond_permission(&rid, None).await });
-                    return;
+                    return (false, false);
                 }
                 if !self.is_selected_session(&request.session_id) {
                     let title = self.session_title_by_id(&request.session_id);
@@ -3381,7 +3628,7 @@ impl SameAppView {
                     let rid = request.request_id.clone();
                     self.rt
                         .spawn(async move { mgr.respond_user_input(&rid, None).await });
-                    return;
+                    return (false, false);
                 }
                 let lang = self.config.language;
                 if self.is_selected_session(&request.session_id) {
@@ -3509,8 +3756,11 @@ impl SameAppView {
                     let drain_n = self.logs.len() - 1000;
                     self.logs.drain(0..drain_n);
                 }
+                return (self.is_logs_tab_visible(), false);
             }
-            SameEvent::ProviderCapabilitiesUpdated { .. } => {}
+            SameEvent::ProviderCapabilitiesUpdated { .. } => {
+                return (false, false);
+            }
             SameEvent::SkillCreated { .. }
             | SameEvent::SkillUpdated { .. }
             | SameEvent::SkillDeleted { .. }
@@ -3542,6 +3792,7 @@ impl SameAppView {
                     .push(format!("[skills] conflict on '{skill_name}': {detail}"));
             }
         }
+        (true, false)
     }
 
     fn finalize_live_draft(
@@ -3753,13 +4004,10 @@ impl SameAppView {
             );
         }
 
-        if let Some(root) = self
-            .selected_session_id
-            .as_deref()
-            .and_then(|sid| self.effective_workdir_for_session(sid))
-            .or_else(|| self.current_project().map(|p| PathBuf::from(&p.workdir)))
-        {
-            self.git_info = load_git_info(&root);
+        self.active_session_meta.remove(session_id);
+        if self.current_workspace_root().is_some() {
+            self.reload_workspace_files_only(cx);
+            self.reload_git_and_worktrees_async(false);
             // The agent may have edited the file that is open in the panel.
             self.reload_open_file_pending = true;
         }
@@ -4003,7 +4251,9 @@ impl SameAppView {
         };
         let should_anchor = self.should_anchor_new_turn();
         let viewport = self.feed.viewport_bounds();
-        let prior_messages = self.storage.list_messages(&session.id).unwrap_or_default();
+        // `self.messages` already holds the selected session's messages in memory;
+        // avoid a synchronous SQLite full-history read + JSON parse on every send.
+        let prior_messages = self.messages.clone();
         let user_msg_id = user_msg.id.clone();
         let user_msg_content = user_msg.content.clone();
         let _ = self.storage.append_message(&user_msg);
@@ -4079,21 +4329,6 @@ impl SameAppView {
         }
 
         // Build Context Handoff (delta sync on resume, or Smart/Full handoff on new provider session).
-        let env_snapshot = ContextEnvironment {
-            workdir: norm_workdir.clone(),
-            branch: current_branch(&cwd),
-            workdir_mode,
-        };
-        let existing_cp = self
-            .storage
-            .get_latest_context_checkpoint(&session.id)
-            .ok()
-            .flatten();
-        let from_provider = prior_messages
-            .iter()
-            .rev()
-            .find_map(|m| m.provider_id.as_deref());
-
         let mut full_prompt = base_prompt.clone();
         let mut fallback_handoff_prompt: Option<String> = None;
 
@@ -4108,6 +4343,20 @@ impl SameAppView {
         };
 
         if !handoff_messages.is_empty() && !consume_fresh {
+            let env_snapshot = ContextEnvironment {
+                workdir: norm_workdir.clone(),
+                branch: same_core::current_branch(&cwd),
+                workdir_mode,
+            };
+            let existing_cp = self
+                .storage
+                .get_latest_context_checkpoint(&session.id)
+                .ok()
+                .flatten();
+            let from_provider = prior_messages
+                .iter()
+                .rev()
+                .find_map(|m| m.provider_id.as_deref());
             if external_session_id.is_some() {
                 // Reusing an existing native session: if we have a scoped
                 // ProviderSession, send only the unsynced delta since its cursor.
@@ -4198,6 +4447,14 @@ impl SameAppView {
             },
         );
 
+        let latest_session = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session.id)
+            .cloned()
+            .unwrap_or_else(|| session.clone());
+        self.active_session_meta
+            .insert(session.id.clone(), latest_session);
         let mut draft = LiveDraft::new();
         draft.exec_context = self.exec_label();
         self.live_drafts.insert(session.id.clone(), draft);
@@ -4251,6 +4508,7 @@ impl SameAppView {
         if let Err(err) = start_res {
             self.live_drafts.remove(&session.id);
             self.active_runs.remove(&session.id);
+            self.active_session_meta.remove(&session.id);
             let err_str = format!("{err:#}");
             let _ = self
                 .storage
@@ -5321,15 +5579,20 @@ impl SameAppView {
                                 cx.notify();
                             })),
                     )
-                    .children(self.quests.iter().map(|q| {
-                        let qid = q.id.clone();
-                        let qid_del = q.id.clone();
-                        let selected = self.selected_quest_filter.as_deref() == Some(q.id.as_str());
-                        let count = self
-                            .sessions
-                            .iter()
-                            .filter(|s| s.quest_id.as_deref() == Some(q.id.as_str()))
-                            .count();
+                    .children({
+                        let mut quest_counts: HashMap<&str, usize> =
+                            HashMap::with_capacity(self.quests.len());
+                        for s in &self.sessions {
+                            if let Some(qid) = s.quest_id.as_deref() {
+                                *quest_counts.entry(qid).or_insert(0) += 1;
+                            }
+                        }
+                        self.quests.iter().map(move |q| {
+                            let qid = q.id.clone();
+                            let qid_del = q.id.clone();
+                            let selected =
+                                self.selected_quest_filter.as_deref() == Some(q.id.as_str());
+                            let count = quest_counts.get(q.id.as_str()).copied().unwrap_or(0);
                         list_row(
                             SharedString::from(format!("quest-{}", q.id)),
                             selected,
@@ -5378,7 +5641,8 @@ impl SameAppView {
                                 cx.notify();
                             },
                         ))
-                    })),
+                        })
+                    }),
             )
     }
 
@@ -8573,11 +8837,14 @@ impl SameAppView {
                 .map(|q| (q.title.clone(), q.goal.clone()))
         });
 
-        let slash_cmds = self
-            .slash_commands
-            .get(&session.id)
-            .cloned()
-            .unwrap_or_default();
+        let slash_cmds = if self.prompt_is_command {
+            self.slash_commands
+                .get(&session.id)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let provider_issue = self
             .provider_checks
@@ -9022,9 +9289,9 @@ impl SameAppView {
         let theme = cx.theme().clone();
         let lang = self.config.language;
         let is_user = msg.role == MessageRole::User;
-        let copy_text = split_error(&msg.content).0.to_string();
 
         if is_user {
+            let copy_text = split_error(&msg.content).0.to_string();
             let text_view = if let Some(state) = cached_markdown {
                 TextView::new(state)
             } else {
@@ -9097,9 +9364,8 @@ impl SameAppView {
             .as_deref()
             .map(|p| self.provider_name(p))
             .unwrap_or_else(|| "Assistant".to_string());
-        let (body, error) = split_error(&msg.content);
-        let (body, plan) = split_plan(body);
-        let body = body.to_string();
+        let (raw_body, error) = split_error(&msg.content);
+        let (body, plan) = split_plan(raw_body);
         let plan = plan.map(str::to_string);
         let error = error.map(str::to_string);
         // Only the session's latest reply offers to implement its plan.
@@ -9146,6 +9412,7 @@ impl SameAppView {
                             }),
                     )
                     .when(!is_live && !body.trim().is_empty(), |el| {
+                        let copy_text = raw_body.to_string();
                         el.child(
                             div()
                                 .opacity(0.0)
@@ -9171,13 +9438,15 @@ impl SameAppView {
             )
             // Collapsible Thinking
             .when_some(
-                msg.thinking
-                    .as_ref()
-                    .filter(|s| !s.trim().is_empty())
-                    .cloned(),
+                msg.thinking.as_deref().filter(|s| !s.trim().is_empty()),
                 |el, thinking| {
                     let key = think_key.clone();
                     let thinking_now = is_live && body.is_empty() && msg.tool_calls.is_empty();
+                    let thinking_owned = if show_thinking {
+                        Some(thinking.to_string())
+                    } else {
+                        None
+                    };
                     el.child(
                         div()
                             .v_flex()
@@ -9206,7 +9475,7 @@ impl SameAppView {
                                         cx.notify();
                                     })),
                             )
-                            .when(show_thinking, |el| {
+                            .when_some(thinking_owned, |el, thinking| {
                                 el.child(
                                     div()
                                         .text_xs()
@@ -9231,7 +9500,7 @@ impl SameAppView {
                 } else if let Some(state) = self.tracked_markdown_state(msg, is_live) {
                     TextView::new(state)
                 } else {
-                    TextView::markdown(SharedString::from(format!("md-{}", msg.id)), body.clone())
+                    TextView::markdown(SharedString::from(format!("md-{}", msg.id)), body.to_string())
                 };
                 el.child(div().text_sm().child(text_view.selectable(true)))
             })
@@ -9297,7 +9566,7 @@ impl SameAppView {
             .into_any_element()
     }
 
-    fn select_right_tab(&mut self, top: bool, target: RightTab, cx: &mut Context<Self>) {
+    fn select_right_tab(&mut self, top: bool, target: RightTab, _cx: &mut Context<Self>) {
         if self.right_split {
             if top {
                 if self.right_bottom_tab == target {
@@ -9314,7 +9583,7 @@ impl SameAppView {
             self.right_tab = target;
         }
         if target == RightTab::Git {
-            self.reload_workspace_files(cx);
+            self.reload_git_and_worktrees_async(true);
         }
     }
 
@@ -9481,19 +9750,13 @@ impl SameAppView {
             )
             .when(expanded, |el| {
                 let section = |label: &str, text: &str, id: String| {
-                    let total = text.chars().count();
-                    let mut preview: String =
-                        text.chars().take(TOOL_OUTPUT_PREVIEW_CHARS).collect();
-                    if total > TOOL_OUTPUT_PREVIEW_CHARS {
+                    let mut chars = text.chars();
+                    let mut preview: String = chars.by_ref().take(TOOL_OUTPUT_PREVIEW_CHARS).collect();
+                    if chars.next().is_some() {
+                        let remaining = 1 + chars.count();
                         preview.push_str(&match lang {
-                            Language::Ja => format!(
-                                "\n… (残り {} 文字を省略)",
-                                total - TOOL_OUTPUT_PREVIEW_CHARS
-                            ),
-                            Language::En => format!(
-                                "\n… ({} more chars truncated)",
-                                total - TOOL_OUTPUT_PREVIEW_CHARS
-                            ),
+                            Language::Ja => format!("\n… (残り {remaining} 文字を省略)"),
+                            Language::En => format!("\n… ({remaining} more chars truncated)"),
                         });
                     }
                     div()
@@ -9525,17 +9788,17 @@ impl SameAppView {
                         .p_2()
                         .border_t_1()
                         .border_color(theme.border)
-                        .when_some(tc.input.clone(), |el, inp| {
+                        .when_some(tc.input.as_deref(), |el, inp| {
                             el.child(section(
                                 t(lang, "入力", "Input"),
-                                &inp,
+                                inp,
                                 format!("tci-{tc_key}"),
                             ))
                         })
-                        .when_some(tc.output.clone(), |el, out| {
+                        .when_some(tc.output.as_deref(), |el, out| {
                             el.child(section(
                                 t(lang, "出力", "Output"),
-                                &out,
+                                out,
                                 format!("tco-{tc_key}"),
                             ))
                         })
@@ -10022,7 +10285,7 @@ impl SameAppView {
                                     if !this.expanded_dirs.remove(&path) {
                                         this.expanded_dirs.insert(path.clone());
                                     }
-                                    this.reload_workspace_files(cx);
+                                    this.reload_workspace_files_only(cx);
                                 } else {
                                     this.open_file(path.clone(), window, cx);
                                 }

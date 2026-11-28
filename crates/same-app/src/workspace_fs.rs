@@ -32,25 +32,25 @@ pub fn scan_directory(
     out
 }
 
-fn sorted_entries(dir: &Path) -> Vec<fs::DirEntry> {
+fn sorted_entries(dir: &Path) -> Vec<(fs::DirEntry, bool)> {
     let Ok(read_dir) = fs::read_dir(dir) else {
         return vec![];
     };
-    let mut entries: Vec<_> = read_dir
+    let mut entries: Vec<(fs::DirEntry, bool, String)> = read_dir
         .filter_map(|e| e.ok())
-        .filter(|e| !should_skip(&e.file_name().to_string_lossy()))
-        .collect();
-    entries.sort_by(|a, b| {
-        let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        b_dir.cmp(&a_dir).then_with(|| {
-            a.file_name()
-                .to_string_lossy()
-                .to_lowercase()
-                .cmp(&b.file_name().to_string_lossy().to_lowercase())
+        .filter_map(|e| {
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let name = e.file_name();
+            let lossy = name.to_string_lossy();
+            if lossy == ".git" || (is_dir && should_skip_dir(&lossy)) {
+                return None;
+            }
+            let lower = lossy.to_lowercase();
+            Some((e, is_dir, lower))
         })
-    });
-    entries
+        .collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+    entries.into_iter().map(|(e, is_dir, _)| (e, is_dir)).collect()
 }
 
 fn rel_of(root: &Path, path: &Path) -> String {
@@ -68,12 +68,11 @@ fn walk_tree(
     max_entries: usize,
     out: &mut Vec<FileEntry>,
 ) {
-    for entry in sorted_entries(dir) {
+    for (entry, is_dir) in sorted_entries(dir) {
         if out.len() >= max_entries {
             return;
         }
         let path = entry.path();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         out.push(FileEntry {
             rel_path: rel_of(root, &path),
             path: path.clone(),
@@ -97,12 +96,11 @@ fn walk_filtered(
     if depth > 12 {
         return;
     }
-    for entry in sorted_entries(dir) {
+    for (entry, is_dir) in sorted_entries(dir) {
         if out.len() >= max_entries {
             return;
         }
         let path = entry.path();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
             walk_filtered(root, &path, depth + 1, filter_lower, max_entries, out);
             continue;
@@ -119,10 +117,22 @@ fn walk_filtered(
     }
 }
 
-fn should_skip(name: &str) -> bool {
+fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | "target" | "node_modules" | ".next" | "dist" | "__pycache__" | ".venv"
+        ".git"
+            | "target"
+            | "node_modules"
+            | ".next"
+            | ".nuxt"
+            | ".svelte-kit"
+            | ".turbo"
+            | ".cache"
+            | ".mypy_cache"
+            | ".pytest_cache"
+            | "dist"
+            | "__pycache__"
+            | ".venv"
     )
 }
 
