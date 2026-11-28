@@ -4,6 +4,11 @@
 
 # SAME (Shared Agentic Multi-provider Environment)
 
+[![Latest Release](https://img.shields.io/github/v/release/xsota/same)](https://github.com/xsota/same/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/xsota/same/total)](https://github.com/xsota/same/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/xsota/same)](https://github.com/xsota/same/stargazers)
+[![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue)](LICENSE-MIT)
+
 A lightweight, local-first, multi-provider AI agent desktop workspace written in Rust.
 
 ## Features
