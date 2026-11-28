@@ -226,6 +226,7 @@ pub(crate) struct ClaudeTurn<'a> {
     pub cwd: &'a Path,
     pub target: &'a ExecTarget,
     pub prompt: &'a str,
+    pub fallback_handoff_prompt: Option<&'a str>,
     pub skill_args: &'a [String],
     pub skill_hash: &'a str,
     pub gate: &'a PermissionGate,
@@ -235,7 +236,7 @@ pub(crate) struct ClaudeTurn<'a> {
 /// Runs one turn on the session's Claude Code process, starting (or
 /// resuming) one when there is none it can reuse.
 pub(crate) async fn run_claude_turn(
-    t: ClaudeTurn<'_>,
+    mut t: ClaudeTurn<'_>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let fingerprint = claude_fingerprint(
@@ -298,17 +299,26 @@ pub(crate) async fn run_claude_turn(
                 return Ok(());
             }
             ref failed if fresh && resume.is_some_and(|id| failed.is_missing_conversation(id)) => {
-                // The stored conversation is gone: start a fresh one. Its
-                // new id replaces the stale one through ExternalSessionBound.
+                // The stored conversation is gone: start a fresh one with
+                // context handoff if provided. Its new id replaces the stale
+                // one through ExternalSessionBound / ProviderSessionBound.
                 lease.discard().await;
+                let missing_id = resume.unwrap_or_default().to_string();
+                let reason =
+                    format!("Conversation {missing_id} not found; starting a new Claude session");
                 t.events.publish(SameEvent::AgentLog {
                     session_id: Some(t.session_id.to_string()),
                     provider_id: t.provider.id.clone(),
-                    line: format!(
-                        "Conversation {} not found; starting a new Claude session",
-                        resume.unwrap_or_default()
-                    ),
+                    line: reason.clone(),
                 });
+                t.events.publish(SameEvent::NativeSessionFallback {
+                    session_id: t.session_id.to_string(),
+                    provider_id: t.provider.id.clone(),
+                    reason,
+                });
+                if let Some(fb) = t.fallback_handoff_prompt {
+                    t.prompt = fb;
+                }
                 resume = None;
             }
             ClaudeRun::Failed {

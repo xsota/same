@@ -18,13 +18,15 @@ use same_acp::{
 use same_core::{
     ApprovalMode, EventBus, ModelInfo, PermissionOption, PermissionRequest, ProviderCapabilities,
     ProviderConfig, ProviderKind, SameEvent, SessionStatus, SlashCommandInfo, ToolCallRecord,
-    ToolCallStatus,
+    ToolCallStatus, MAX_CONCURRENT_SESSIONS, MIN_CONCURRENT_SESSIONS,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{oneshot, Mutex};
 
 /// Deferred skill staging & explicit skill activation to execute inside
@@ -65,6 +67,11 @@ pub struct PromptRequest {
     pub exec: ExecPreference,
     /// The session's approval mode.
     pub mode: ApprovalMode,
+    /// When true, the session is restricted to read-only operations.
+    pub read_only: bool,
+    /// Optional handoff-enriched prompt used automatically if resuming a stored
+    /// native provider session fails and falls back to a brand-new session.
+    pub fallback_handoff_prompt: Option<String>,
     /// Optional SAME-managed skill delivery plan prepared for this turn.
     pub skill_delivery: Option<crate::skills::SkillDeliveryPlan>,
     /// Optional deferred skill sync + explicit skill formatting performed
@@ -277,8 +284,11 @@ pub struct ProviderCheckResult {
 }
 
 struct AcpSessionHandle {
+    generation: u64,
     provider_id: String,
     target: ExecTarget,
+    cwd: PathBuf,
+    read_only: bool,
     /// Skill launch args/env used when this ACP process was spawned; if they
     /// change between turns, the pooled process is replaced so the agent sees
     /// the updated skill roots.
@@ -293,6 +303,8 @@ struct AcpSessionHandle {
     modes: Option<Value>,
     /// The last confirmed ACP mode id on this session.
     current_mode_id: Arc<std::sync::Mutex<Option<String>>>,
+    /// Last time this ACP session was used (for idle reaping).
+    last_used: Arc<std::sync::Mutex<Instant>>,
 }
 
 type SharedModelState = Arc<Mutex<Option<AcpModelState>>>;
@@ -324,6 +336,11 @@ pub struct AgentManager {
     /// which do not run inside a Tokio context.
     runtime: tokio::runtime::Handle,
     acp_sessions: Arc<Mutex<HashMap<String, AcpSessionHandle>>>,
+    /// Monotonic generation counter so an async `release_session` never shuts
+    /// down a replacement ACP client created after the release was requested.
+    acp_generation: Arc<AtomicU64>,
+    /// Pending ACP permission requests per SAME session: `(client_ptr_addr, request_id)`.
+    acp_pending_permissions: Arc<Mutex<HashMap<String, Vec<(usize, String)>>>>,
     cancellers: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     permission_responders: Arc<Mutex<HashMap<String, PermissionResponder>>>,
     /// Per ACP provider: the model and effort a fresh session starts with,
@@ -336,6 +353,24 @@ pub struct AgentManager {
     claude_pool: Arc<ClaudePool>,
     claude_controls: ClaudeControls,
     codex_pool: Arc<CodexPool>,
+    /// Currently executing SAME session IDs (prevents duplicate runs & tracks concurrency).
+    active_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Sessions locked to Read Only mode; live approval-mode changes cannot elevate them.
+    read_only_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
+    max_concurrent_sessions: Arc<AtomicUsize>,
+}
+
+struct ActiveRunGuard {
+    active_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.active_sessions.lock() {
+            guard.remove(&self.session_id);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -360,6 +395,8 @@ impl AgentManager {
             events,
             runtime,
             acp_sessions: Arc::new(Mutex::new(HashMap::new())),
+            acp_generation: Arc::new(AtomicU64::new(1)),
+            acp_pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             cancellers: Arc::new(Mutex::new(HashMap::new())),
             permission_responders,
             acp_defaults: Arc::new(Mutex::new(HashMap::new())),
@@ -369,24 +406,100 @@ impl AgentManager {
             claude_pool: Arc::new(ClaudePool::default()),
             claude_controls: ClaudeControls::default(),
             codex_pool: Arc::new(CodexPool::default()),
+            active_sessions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            read_only_sessions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            // 0 = unlimited (default).
+            max_concurrent_sessions: Arc::new(AtomicUsize::new(0)),
         };
-        // Stops CLI agent processes left idle.
+        // Stops CLI and ACP agent processes left idle.
         {
             let claude = Arc::downgrade(&manager.claude_pool);
             let codex = Arc::downgrade(&manager.codex_pool);
+            let acp = Arc::downgrade(&manager.acp_sessions);
+            let active = Arc::downgrade(&manager.active_sessions);
             manager.runtime.spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     tick.tick().await;
-                    let (Some(claude), Some(codex)) = (claude.upgrade(), codex.upgrade()) else {
+                    let (Some(claude), Some(codex), Some(acp), Some(active)) = (
+                        claude.upgrade(),
+                        codex.upgrade(),
+                        acp.upgrade(),
+                        active.upgrade(),
+                    ) else {
                         break;
                     };
                     claude.reap_idle(IDLE_TIMEOUT).await;
                     codex.reap_idle(IDLE_TIMEOUT).await;
+                    let stale_clients: Vec<Arc<AcpClient>> = {
+                        let mut guard = acp.lock().await;
+                        // Check `active` *after* acquiring `acp` lock so a newly
+                        // admitted turn cannot race with idle eviction.
+                        let active_set = active.lock().unwrap().clone();
+                        let stale_ids: Vec<String> = guard
+                            .iter()
+                            .filter(|(sid, handle)| {
+                                !active_set.contains(*sid)
+                                    && handle
+                                        .last_used
+                                        .lock()
+                                        .map(|t| t.elapsed() >= IDLE_TIMEOUT)
+                                        .unwrap_or(false)
+                            })
+                            .map(|(sid, _)| sid.clone())
+                            .collect();
+                        stale_ids
+                            .into_iter()
+                            .filter_map(|sid| guard.remove(&sid).map(|h| h.client))
+                            .collect()
+                    };
+                    for client in stale_clients {
+                        client.shutdown().await;
+                    }
                 }
             });
         }
         manager
+    }
+
+    pub fn set_max_concurrent_sessions(&self, limit: Option<usize>) {
+        let raw = limit
+            .filter(|&n| n > 0)
+            .map(|n| n.clamp(MIN_CONCURRENT_SESSIONS, MAX_CONCURRENT_SESSIONS))
+            .unwrap_or(0);
+        self.max_concurrent_sessions.store(raw, Ordering::Relaxed);
+    }
+
+    pub fn max_concurrent_sessions(&self) -> Option<usize> {
+        let raw = self.max_concurrent_sessions.load(Ordering::Relaxed);
+        (raw > 0).then_some(raw)
+    }
+
+    pub fn active_session_count(&self) -> usize {
+        self.active_sessions.lock().unwrap().len()
+    }
+
+    pub fn is_session_running(&self, session_id: &str) -> bool {
+        self.active_sessions.lock().unwrap().contains(session_id)
+    }
+
+    /// Checks whether a new prompt turn can be started for `session_id` without
+    /// mutating state (duplicate-run and concurrency-limit preflight).
+    pub fn can_start_prompt(&self, session_id: &str) -> Result<()> {
+        let active = self.active_sessions.lock().unwrap();
+        if active.contains(session_id) {
+            anyhow::bail!("Session '{session_id}' is already running");
+        }
+        if let Some(limit) = self.max_concurrent_sessions() {
+            if active.len() >= limit {
+                anyhow::bail!(
+                    "Concurrent session limit reached ({}/{}). Wait for an active session to finish or raise the limit in settings.",
+                    active.len(),
+                    limit
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Changes a session's approval mode, also for a turn already running:
@@ -394,6 +507,11 @@ impl AgentManager {
     /// ACP agent with matching modes switches too. Codex picks it up at its
     /// next turn.
     pub fn set_session_mode(&self, session_id: &str, mode: ApprovalMode) {
+        let mode = if self.read_only_sessions.lock().unwrap().contains(session_id) {
+            ApprovalMode::Plan
+        } else {
+            mode
+        };
         let previous = self
             .modes
             .lock()
@@ -460,14 +578,31 @@ impl AgentManager {
         });
     }
 
-    /// Stops a session's CLI agent process (the session was deleted or moved
-    /// to another agent).
+    /// Stops a session's agent processes (CLI and ACP) and cleans up its state
+    /// when the session is deleted or moved to another provider.
     pub fn release_session(&self, session_id: &str) {
         self.claude_controls.remove(session_id);
+        self.modes.lock().unwrap().remove(session_id);
+        self.read_only_sessions.lock().unwrap().remove(session_id);
+        let cutoff_gen = self.acp_generation.fetch_add(1, Ordering::SeqCst);
         let claude = self.claude_pool.clone();
         let codex = self.codex_pool.clone();
+        let acp_sessions = self.acp_sessions.clone();
+        let manager = self.clone();
         let sid = session_id.to_string();
         self.runtime.spawn(async move {
+            let stale_handle = {
+                let mut guard = acp_sessions.lock().await;
+                if guard.get(&sid).is_some_and(|h| h.generation <= cutoff_gen) {
+                    guard.remove(&sid)
+                } else {
+                    None
+                }
+            };
+            if let Some(handle) = stale_handle {
+                manager.withdraw_acp_permissions(&sid).await;
+                handle.client.shutdown().await;
+            }
             claude.release(&sid).await;
             codex.release(&sid).await;
         });
@@ -492,6 +627,7 @@ impl AgentManager {
                 supports_session_resume: true,
                 supports_model_select: true,
                 supports_slash_commands: true,
+                supports_read_only: true,
             },
             ProviderKind::ClaudeCli => ProviderCapabilities {
                 supports_acp: false,
@@ -503,6 +639,7 @@ impl AgentManager {
                 supports_session_resume: true,
                 supports_model_select: true,
                 supports_slash_commands: false,
+                supports_read_only: true,
             },
             ProviderKind::CodexCli => ProviderCapabilities {
                 supports_acp: false,
@@ -514,6 +651,7 @@ impl AgentManager {
                 supports_session_resume: true,
                 supports_model_select: true,
                 supports_slash_commands: false,
+                supports_read_only: true,
             },
         }
     }
@@ -1103,13 +1241,51 @@ impl AgentManager {
         })
     }
 
-    pub fn start_prompt(&self, req: PromptRequest) {
+    /// Starts a prompt turn on the given session, rejecting duplicate runs on
+    /// the same session or runs exceeding `max_concurrent_sessions`.
+    pub fn try_start_prompt(&self, req: PromptRequest) -> Result<()> {
+        {
+            let mut active = self.active_sessions.lock().unwrap();
+            if active.contains(&req.session_id) {
+                anyhow::bail!("Session '{}' is already running", req.session_id);
+            }
+            if let Some(limit) = self.max_concurrent_sessions() {
+                if active.len() >= limit {
+                    anyhow::bail!(
+                        "Concurrent session limit reached ({}/{}). Wait for an active session to finish or raise the limit in settings.",
+                        active.len(),
+                        limit
+                    );
+                }
+            }
+            active.insert(req.session_id.clone());
+        }
+
+        let guard = ActiveRunGuard {
+            active_sessions: self.active_sessions.clone(),
+            session_id: req.session_id.clone(),
+        };
+
+        {
+            let mut ro = self.read_only_sessions.lock().unwrap();
+            if req.read_only {
+                ro.insert(req.session_id.clone());
+            } else {
+                ro.remove(&req.session_id);
+            }
+        }
+        let effective_mode = if req.read_only {
+            ApprovalMode::Plan
+        } else {
+            req.mode
+        };
         let manager = self.clone();
         self.modes
             .lock()
             .unwrap()
-            .insert(req.session_id.clone(), req.mode);
+            .insert(req.session_id.clone(), effective_mode);
         self.runtime.spawn(async move {
+            let _run_guard = guard;
             let sid = req.session_id.clone();
             let pid = req.provider.id.clone();
             manager.events.publish(SameEvent::SessionStarted {
@@ -1129,6 +1305,7 @@ impl AgentManager {
                 .insert(sid.clone(), cancel_tx);
 
             let mut req = req;
+            req.mode = effective_mode;
             let target = tokio::select! {
                 _ = &mut cancel_rx => {
                     manager.cancellers.lock().await.remove(&sid);
@@ -1152,6 +1329,14 @@ impl AgentManager {
                         &req.provider,
                         &target,
                     );
+                    if let Some(fb) = req.fallback_handoff_prompt.take() {
+                        req.fallback_handoff_prompt = Some(format_explicit_skills_prompt(
+                            &fb,
+                            &sync_cfg.explicit_skills,
+                            &req.provider,
+                            &target,
+                        ));
+                    }
                 }
                 let sync_provider = req.provider.clone();
                 let sync_target = target.clone();
@@ -1214,6 +1399,10 @@ impl AgentManager {
                     }
                     ProviderKind::ClaudeCli => {
                         let prompt = claude_prompt_with_attachments(&req.prompt, &files);
+                        let fallback_prompt = req
+                            .fallback_handoff_prompt
+                            .as_deref()
+                            .map(|fb| claude_prompt_with_attachments(fb, &files));
                         let skill_args = req
                             .skill_delivery
                             .as_ref()
@@ -1236,6 +1425,7 @@ impl AgentManager {
                                 cwd: &req.cwd,
                                 target: &target,
                                 prompt: &prompt,
+                                fallback_handoff_prompt: fallback_prompt.as_deref(),
                                 skill_args,
                                 skill_hash,
                                 gate: &manager.gate,
@@ -1249,6 +1439,10 @@ impl AgentManager {
                         let images: Vec<String> =
                             files.iter().filter(|f| is_image_path(f)).cloned().collect();
                         let prompt = codex_prompt_with_attachments(&req.prompt, &files);
+                        let fallback_prompt = req
+                            .fallback_handoff_prompt
+                            .as_deref()
+                            .map(|fb| codex_prompt_with_attachments(fb, &files));
                         let skill_roots = req
                             .skill_delivery
                             .as_ref()
@@ -1270,6 +1464,8 @@ impl AgentManager {
                                 cwd: &req.cwd,
                                 target: &target,
                                 prompt: &prompt,
+                                fallback_handoff_prompt: fallback_prompt.as_deref(),
+                                read_only: req.read_only,
                                 images: &images,
                                 skill_roots,
                                 skill_hash,
@@ -1284,6 +1480,7 @@ impl AgentManager {
             };
 
             manager.cancellers.lock().await.remove(&sid);
+            manager.withdraw_acp_permissions(&sid).await;
 
             if let Err(err) = res {
                 manager.events.publish(SameEvent::SessionFailed {
@@ -1296,6 +1493,21 @@ impl AgentManager {
                 });
             }
         });
+        Ok(())
+    }
+
+    pub fn start_prompt(&self, req: PromptRequest) {
+        let sid = req.session_id.clone();
+        if let Err(err) = self.try_start_prompt(req) {
+            self.events.publish(SameEvent::SessionFailed {
+                session_id: sid.clone(),
+                error: format!("{err:#}"),
+            });
+            self.events.publish(SameEvent::SessionStatusChanged {
+                session_id: sid,
+                status: SessionStatus::Failed,
+            });
+        }
     }
 
     async fn run_acp_prompt(
@@ -1305,23 +1517,44 @@ impl AgentManager {
         files: Vec<String>,
         mut cancel_rx: oneshot::Receiver<()>,
     ) -> Result<()> {
-        let (client, acp_session_id, model_state) = self.ensure_acp_session(&req, target).await?;
-        self.apply_acp_model(&req, &client, &acp_session_id, &model_state)
-            .await;
-        self.apply_acp_effort(&req, &client, &acp_session_id, &model_state)
-            .await;
-
-        let prompt_fut = client.prompt_with_files(&acp_session_id, &req.prompt, &files);
-        tokio::pin!(prompt_fut);
-
-        tokio::select! {
+        let (client, acp_session_id, model_state, fell_back) = tokio::select! {
             _ = &mut cancel_rx => {
-                let _ = client.cancel(&acp_session_id).await;
+                self.withdraw_acp_permissions(&req.session_id).await;
                 self.events.publish(SameEvent::SessionCancelled {
                     session_id: req.session_id.clone(),
                 });
                 self.events.publish(SameEvent::SessionStatusChanged {
                     session_id: req.session_id,
+                    status: SessionStatus::Cancelled,
+                });
+                return Ok(());
+            }
+            res = self.ensure_acp_session(&req, target) => res?,
+        };
+        self.apply_acp_model(&req, &client, &acp_session_id, &model_state)
+            .await;
+        self.apply_acp_effort(&req, &client, &acp_session_id, &model_state)
+            .await;
+
+        let effective_prompt = if fell_back {
+            req.fallback_handoff_prompt
+                .as_deref()
+                .unwrap_or(&req.prompt)
+        } else {
+            &req.prompt
+        };
+        let prompt_fut = client.prompt_with_files(&acp_session_id, effective_prompt, &files);
+        tokio::pin!(prompt_fut);
+
+        let result = tokio::select! {
+            _ = &mut cancel_rx => {
+                let _ = client.cancel(&acp_session_id).await;
+                self.withdraw_acp_permissions(&req.session_id).await;
+                self.events.publish(SameEvent::SessionCancelled {
+                    session_id: req.session_id.clone(),
+                });
+                self.events.publish(SameEvent::SessionStatusChanged {
+                    session_id: req.session_id.clone(),
                     status: SessionStatus::Cancelled,
                 });
                 Ok(())
@@ -1333,12 +1566,18 @@ impl AgentManager {
                     stop_reason: prompt_res.stop_reason,
                 });
                 self.events.publish(SameEvent::SessionStatusChanged {
-                    session_id: req.session_id,
+                    session_id: req.session_id.clone(),
                     status: SessionStatus::Completed,
                 });
                 Ok(())
             }
+        };
+        if let Some(handle) = self.acp_sessions.lock().await.get(&req.session_id) {
+            if let Ok(mut ts) = handle.last_used.lock() {
+                *ts = Instant::now();
+            }
         }
+        result
     }
 
     /// Switches the ACP session to the requested model before a prompt. A
@@ -1486,7 +1725,7 @@ impl AgentManager {
         &self,
         req: &PromptRequest,
         target: ExecTarget,
-    ) -> Result<(Arc<AcpClient>, String, SharedModelState)> {
+    ) -> Result<(Arc<AcpClient>, String, SharedModelState, bool)> {
         let wanted_skill_args = req
             .skill_delivery
             .as_ref()
@@ -1501,8 +1740,15 @@ impl AgentManager {
             let existing = {
                 let guard = self.acp_sessions.lock().await;
                 guard.get(&req.session_id).and_then(|handle| {
+                    let ext_ok = req
+                        .external_session_id
+                        .as_deref()
+                        .is_none_or(|ext| ext == handle.acp_session_id);
                     if handle.provider_id == req.provider.id
                         && handle.target == target
+                        && handle.cwd == req.cwd
+                        && handle.read_only == req.read_only
+                        && ext_ok
                         && handle.skill_args == wanted_skill_args
                         && handle.skill_env == wanted_skill_env
                     {
@@ -1544,7 +1790,7 @@ impl AgentManager {
                     None => req.mode != ApprovalMode::Plan,
                 };
                 if mode_ok {
-                    return Ok((client, acp_sid, model_state));
+                    return Ok((client, acp_sid, model_state, false));
                 }
                 // Could not confirm the requested mode on the pooled session;
                 // drop it and start a fresh one.
@@ -1552,8 +1798,8 @@ impl AgentManager {
                     old.client.shutdown().await;
                 }
             } else if let Some(old) = self.acp_sessions.lock().await.remove(&req.session_id) {
-                // Provider, target, or skill delivery config changed; shut down
-                // the stale pooled process cleanly before spawning a new one.
+                // Provider, target, cwd, read-only, external session, or skill delivery config changed;
+                // shut down the stale pooled process cleanly before spawning a new one.
                 old.client.shutdown().await;
             }
         }
@@ -1567,19 +1813,24 @@ impl AgentManager {
             }
         }
 
-        let (client, mut acp_rx) = AcpClient::spawn_with_policy(
-            AcpClientConfig {
-                command: req.provider.command.clone(),
-                args: spawn_args,
-                env: spawn_env,
-                cwd: req.cwd.clone(),
-                // The approval mode is applied below, per prompt.
-                auto_approve: false,
-                target: target.clone(),
-            },
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
-        .await?;
+        let acp_cfg = AcpClientConfig {
+            command: req.provider.command.clone(),
+            args: spawn_args,
+            env: spawn_env,
+            cwd: req.cwd.clone(),
+            // The approval mode is applied below, per prompt.
+            auto_approve: false,
+            target: target.clone(),
+        };
+        let (client, mut acp_rx) = if req.read_only {
+            AcpClient::spawn_read_only(acp_cfg).await?
+        } else {
+            AcpClient::spawn_with_policy(
+                acp_cfg,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await?
+        };
 
         let client = Arc::new(client);
         let model_state: SharedModelState = Arc::new(Mutex::new(None));
@@ -1588,6 +1839,7 @@ impl AgentManager {
         {
             let events = self.events.clone();
             let responders = self.permission_responders.clone();
+            let acp_pending_permissions = self.acp_pending_permissions.clone();
             let acp_sessions = self.acp_sessions.clone();
             let this_client = client.clone();
             let model_state = model_state.clone();
@@ -1719,6 +1971,13 @@ impl AgentManager {
                                 .lock()
                                 .await
                                 .insert(request_id.clone(), responder);
+                            let client_key = Arc::as_ptr(&this_client) as usize;
+                            acp_pending_permissions
+                                .lock()
+                                .await
+                                .entry(same_session_id.clone())
+                                .or_default()
+                                .push((client_key, request_id.clone()));
                             events.publish(SameEvent::SessionStatusChanged {
                                 session_id: same_session_id.clone(),
                                 status: SessionStatus::WaitingForApproval,
@@ -1757,6 +2016,42 @@ impl AgentManager {
                             {
                                 guard.remove(&same_session_id);
                             }
+                            drop(guard);
+                            let client_key = Arc::as_ptr(&this_client) as usize;
+                            let (own_ids, remaining) = {
+                                let mut pending = acp_pending_permissions.lock().await;
+                                if let Some(list) = pending.get_mut(&same_session_id) {
+                                    let mut own = Vec::new();
+                                    list.retain(|(ck, rid)| {
+                                        if *ck == client_key {
+                                            own.push(rid.clone());
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    });
+                                    let rem = list.len();
+                                    if list.is_empty() {
+                                        pending.remove(&same_session_id);
+                                    }
+                                    (own, rem)
+                                } else {
+                                    (Vec::new(), 0)
+                                }
+                            };
+                            if !own_ids.is_empty() {
+                                let mut resp_guard = responders.lock().await;
+                                for rid in own_ids {
+                                    if let Some(r) = resp_guard.remove(&rid) {
+                                        r.respond(PermissionDecision::Cancelled);
+                                    }
+                                    events.publish(SameEvent::ApprovalWithdrawn {
+                                        session_id: same_session_id.clone(),
+                                        request_id: rid,
+                                        remaining,
+                                    });
+                                }
+                            }
                             break;
                         }
                     }
@@ -1764,12 +2059,28 @@ impl AgentManager {
             });
         }
 
+        let mut fell_back = false;
         let loaded = match req.external_session_id.as_deref() {
-            Some(ext_id) => client
-                .load_session(ext_id, &req.cwd)
-                .await
-                .ok()
-                .map(|(state, modes)| (ext_id.to_string(), state, modes)),
+            Some(ext_id) => match client.load_session(ext_id, &req.cwd).await {
+                Ok((state, modes)) => Some((ext_id.to_string(), state, modes)),
+                Err(err) => {
+                    let reason = format!(
+                        "ACP session/load failed for '{ext_id}': {err:#}; starting a new session"
+                    );
+                    self.events.publish(SameEvent::AgentLog {
+                        session_id: Some(req.session_id.clone()),
+                        provider_id: req.provider.id.clone(),
+                        line: reason.clone(),
+                    });
+                    self.events.publish(SameEvent::NativeSessionFallback {
+                        session_id: req.session_id.clone(),
+                        provider_id: req.provider.id.clone(),
+                        reason,
+                    });
+                    fell_back = true;
+                    None
+                }
+            },
             None => None,
         };
         let (acp_session_id, initial_models, modes) = match loaded {
@@ -1836,12 +2147,21 @@ impl AgentManager {
             session_id: req.session_id.clone(),
             external_session_id: acp_session_id.clone(),
         });
+        self.events.publish(SameEvent::ProviderSessionBound {
+            session_id: req.session_id.clone(),
+            provider_id: req.provider.id.clone(),
+            external_session_id: acp_session_id.clone(),
+        });
 
+        let generation = self.acp_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let displaced = self.acp_sessions.lock().await.insert(
             req.session_id.clone(),
             AcpSessionHandle {
+                generation,
                 provider_id: req.provider.id.clone(),
                 target,
+                cwd: req.cwd.clone(),
+                read_only: req.read_only,
                 skill_args: wanted_skill_args,
                 skill_env: wanted_skill_env,
                 client: client.clone(),
@@ -1849,6 +2169,7 @@ impl AgentManager {
                 model_state: model_state.clone(),
                 modes,
                 current_mode_id: Arc::new(std::sync::Mutex::new(confirmed_mode_id)),
+                last_used: Arc::new(std::sync::Mutex::new(Instant::now())),
             },
         );
         if let Some(old) = displaced {
@@ -1857,7 +2178,30 @@ impl AgentManager {
             });
         }
 
-        Ok((client, acp_session_id, model_state))
+        Ok((client, acp_session_id, model_state, fell_back))
+    }
+
+    async fn withdraw_acp_permissions(&self, session_id: &str) {
+        let req_ids = self
+            .acp_pending_permissions
+            .lock()
+            .await
+            .remove(session_id)
+            .unwrap_or_default();
+        if req_ids.is_empty() {
+            return;
+        }
+        let mut resp_guard = self.permission_responders.lock().await;
+        for (_, rid) in req_ids {
+            if let Some(r) = resp_guard.remove(&rid) {
+                r.respond(PermissionDecision::Cancelled);
+            }
+            self.events.publish(SameEvent::ApprovalWithdrawn {
+                session_id: session_id.to_string(),
+                request_id: rid,
+                remaining: 0,
+            });
+        }
     }
 
     pub async fn cancel_session(&self, session_id: &str) {
@@ -1867,6 +2211,12 @@ impl AgentManager {
     }
 
     pub async fn respond_permission(&self, request_id: &str, option_id: Option<String>) {
+        {
+            let mut pending = self.acp_pending_permissions.lock().await;
+            for ids in pending.values_mut() {
+                ids.retain(|(_, id)| id != request_id);
+            }
+        }
         if let Some(responder) = self.permission_responders.lock().await.remove(request_id) {
             match option_id {
                 Some(id) => responder.respond(PermissionDecision::Selected { option_id: id }),
@@ -2355,6 +2705,8 @@ mod tests {
             attachments: Vec::new(),
             exec: ExecPreference::Auto,
             mode: ApprovalMode::Ask,
+            read_only: false,
+            fallback_handoff_prompt: None,
             skill_delivery: None,
             skill_sync: None,
         };
@@ -2414,6 +2766,10 @@ mod tests {
                 attachments: Vec::new(),
                 exec: ExecPreference::Auto,
                 mode: ApprovalMode::FullAccess,
+                read_only: false,
+                fallback_handoff_prompt: None,
+                skill_delivery: None,
+                skill_sync: None,
             });
             async move {
                 let mut text = String::new();
@@ -2761,5 +3117,66 @@ mod tests {
             parse_opencode_auth_status(true, "   \n", ""),
             ProviderAuthStatus::Unknown
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_concurrency_limit_and_duplicate_run_guard() {
+        let events = EventBus::new(256);
+        let mgr = AgentManager::new(events.clone(), tokio::runtime::Handle::current());
+        assert_eq!(mgr.max_concurrent_sessions(), None);
+        mgr.set_max_concurrent_sessions(Some(2));
+        assert_eq!(mgr.max_concurrent_sessions(), Some(2));
+
+        // Use a command that sleeps so the turns stay active until cancelled.
+        let slow_provider = ProviderConfig {
+            id: "slow-test".into(),
+            name: "Slow Test".into(),
+            kind: ProviderKind::Acp,
+            enabled: true,
+            command: "sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env: std::collections::BTreeMap::new(),
+            default_model: None,
+            models: vec![],
+            description: String::new(),
+        };
+        let make_req = |sid: &str| PromptRequest {
+            session_id: sid.to_string(),
+            external_session_id: None,
+            provider: slow_provider.clone(),
+            model: None,
+            effort: None,
+            cwd: std::env::temp_dir(),
+            prompt: "hello".into(),
+            attachments: vec![],
+            exec: ExecPreference::Auto,
+            mode: ApprovalMode::Ask,
+            read_only: false,
+            fallback_handoff_prompt: None,
+            skill_delivery: None,
+            skill_sync: None,
+        };
+
+        // Start session 1 -> succeeds.
+        mgr.try_start_prompt(make_req("s1")).unwrap();
+        assert!(mgr.is_session_running("s1"));
+        assert_eq!(mgr.active_session_count(), 1);
+
+        // Duplicate start on session 1 -> rejected.
+        let dup = mgr.try_start_prompt(make_req("s1"));
+        assert!(dup.is_err());
+
+        // Start session 2 in parallel -> succeeds (2/2).
+        mgr.try_start_prompt(make_req("s2")).unwrap();
+        assert_eq!(mgr.active_session_count(), 2);
+
+        // Start session 3 -> rejected because concurrency limit is 2.
+        let over = mgr.try_start_prompt(make_req("s3"));
+        assert!(over.is_err());
+
+        // Cancel only s1 and s2 cleanly.
+        mgr.cancel_session("s1").await;
+        mgr.cancel_session("s2").await;
+        mgr.shutdown_all().await;
     }
 }

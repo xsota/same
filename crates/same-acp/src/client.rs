@@ -78,7 +78,7 @@ struct ManagedTerminal {
 }
 
 pub struct AcpClient {
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
     next_id: AtomicU64,
     /// Active `session/load` RPCs (`request_id -> session_id`).
@@ -167,7 +167,7 @@ impl AcpClient {
             .take()
             .ok_or_else(|| anyhow!("Failed to capture ACP stderr"))?;
 
-        let stdin = Arc::new(Mutex::new(stdin));
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let terminals: Arc<Mutex<HashMap<String, ManagedTerminal>>> =
@@ -394,9 +394,15 @@ impl AcpClient {
                     guard.insert(id, sid);
                 }
             }
-            match stdin_guard.write_all(line.as_bytes()).await {
-                Ok(()) => stdin_guard.flush().await,
-                Err(err) => Err(err),
+            match stdin_guard.as_mut() {
+                Some(stdin) => match stdin.write_all(line.as_bytes()).await {
+                    Ok(()) => stdin.flush().await,
+                    Err(err) => Err(err),
+                },
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "ACP stdin closed",
+                )),
             }
         };
         if let Err(err) = write_res {
@@ -580,20 +586,33 @@ impl AcpClient {
 
     pub async fn shutdown(&self) {
         if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.kill().await;
+            // Bound both acquiring the stdin lock (in case a writer is blocked on
+            // a full pipe) and waiting for the child to exit cleanly.
+            let stdin_arc = self.stdin.clone();
+            let graceful = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                drop(stdin_arc.lock().await.take());
+                let _ = child.wait().await;
+            })
+            .await;
+            if graceful.is_err() {
+                let _ = child.kill().await;
+            }
         }
     }
 }
 
 async fn write_json_line<T: serde::Serialize>(
-    stdin: &Arc<Mutex<ChildStdin>>,
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
     payload: &T,
 ) -> Result<()> {
     let mut line = serde_json::to_string(payload)?;
     line.push('\n');
     let mut guard = stdin.lock().await;
-    guard.write_all(line.as_bytes()).await?;
-    guard.flush().await?;
+    let stdin = guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("ACP stdin is already closed"))?;
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.flush().await?;
     Ok(())
 }
 

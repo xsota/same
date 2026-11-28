@@ -86,6 +86,8 @@ impl Session {
             attachments: vec![],
             exec: ExecPreference::Auto,
             mode: self.mode,
+            read_only: false,
+            fallback_handoff_prompt: None,
             skill_delivery: None,
             skill_sync: None,
         });

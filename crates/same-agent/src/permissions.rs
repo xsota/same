@@ -124,7 +124,7 @@ impl PermissionGate {
             *pending.entry(session_id.to_string()).or_insert(0) += 1;
             self.events.publish(SameEvent::SessionStatusChanged {
                 session_id: session_id.to_string(),
-                status: SessionStatus::WaitingForApproval,
+                status: SessionStatus::WaitingForUserInput,
             });
         }
         self.events.publish(SameEvent::UserInputRequested {

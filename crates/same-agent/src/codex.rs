@@ -182,6 +182,8 @@ pub(crate) struct CodexTurnRequest<'a> {
     pub cwd: &'a Path,
     pub target: &'a ExecTarget,
     pub prompt: &'a str,
+    pub fallback_handoff_prompt: Option<&'a str>,
+    pub read_only: bool,
     pub images: &'a [String],
     pub skill_roots: &'a [String],
     pub skill_hash: &'a str,
@@ -192,7 +194,7 @@ pub(crate) struct CodexTurnRequest<'a> {
 /// Runs one turn on the session's app-server, starting one (and resuming
 /// its thread) when there is none to reuse.
 pub(crate) async fn run_codex_turn(
-    t: CodexTurnRequest<'_>,
+    mut t: CodexTurnRequest<'_>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
     let fingerprint = codex_fingerprint(t.provider, t.cwd, t.target);
@@ -294,9 +296,17 @@ pub(crate) async fn run_codex_turn(
         }
         res = open_thread(process, &t) => res,
     };
-    if let Err(err) = open {
-        lease.discard().await;
-        return Err(err);
+    let fell_back = match open {
+        Ok(fb) => fb,
+        Err(err) => {
+            lease.discard().await;
+            return Err(err);
+        }
+    };
+    if fell_back {
+        if let Some(fb) = t.fallback_handoff_prompt {
+            t.prompt = fb;
+        }
     }
     if cancel_rx.try_recv().is_ok() {
         lease.discard().await;
@@ -339,17 +349,27 @@ pub(crate) async fn run_codex_turn(
 
 /// Makes sure the process has the session's thread open: resumes the stored
 /// one, or starts a new one when there is none or it is gone.
-async fn open_thread(process: &mut CodexProcess, t: &CodexTurnRequest<'_>) -> Result<()> {
+/// Returns `Ok(true)` if resuming a stored thread failed and fell back to a new thread.
+async fn open_thread(process: &mut CodexProcess, t: &CodexTurnRequest<'_>) -> Result<bool> {
     let wanted = t.external_session_id.filter(|s| !s.trim().is_empty());
     if process.thread_id.is_some() && (wanted.is_none() || wanted == process.thread_id.as_deref()) {
-        return Ok(());
+        return Ok(false);
     }
     let cwd = t.target.to_target_path(t.cwd);
-    let base = json!({
-        "cwd": cwd,
-        "approvalPolicy": "on-request",
-        "sandbox": "workspace-write",
-    });
+    let base = if t.read_only {
+        json!({
+            "cwd": cwd,
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+        })
+    } else {
+        json!({
+            "cwd": cwd,
+            "approvalPolicy": "on-request",
+            "sandbox": "workspace-write",
+        })
+    };
+    let mut fell_back = false;
     let result = match wanted {
         Some(thread_id) => {
             let mut params = base.clone();
@@ -357,11 +377,19 @@ async fn open_thread(process: &mut CodexProcess, t: &CodexTurnRequest<'_>) -> Re
             match process.call("thread/resume", params).await {
                 Ok(r) => r,
                 Err(err) if err.to_string().contains("no rollout found") => {
+                    let reason =
+                        format!("Codex thread {thread_id} not found; starting a new thread");
                     t.events.publish(SameEvent::AgentLog {
                         session_id: Some(t.session_id.to_string()),
                         provider_id: t.provider.id.clone(),
-                        line: format!("Codex thread {thread_id} not found; starting a new thread"),
+                        line: reason.clone(),
                     });
+                    t.events.publish(SameEvent::NativeSessionFallback {
+                        session_id: t.session_id.to_string(),
+                        provider_id: t.provider.id.clone(),
+                        reason,
+                    });
+                    fell_back = true;
                     process.call("thread/start", base).await?
                 }
                 Err(err) => return Err(err),
@@ -382,8 +410,13 @@ async fn open_thread(process: &mut CodexProcess, t: &CodexTurnRequest<'_>) -> Re
         session_id: t.session_id.to_string(),
         external_session_id: thread_id.clone(),
     });
+    t.events.publish(SameEvent::ProviderSessionBound {
+        session_id: t.session_id.to_string(),
+        provider_id: t.provider.id.clone(),
+        external_session_id: thread_id.clone(),
+    });
     process.thread_id = Some(thread_id);
-    Ok(())
+    Ok(fell_back)
 }
 
 fn turn_start_params(
@@ -399,13 +432,23 @@ fn turn_start_params(
             .map(|path| json!({"type": "localImage", "path": path})),
     );
     let settings = codex_mode_settings(mode);
+    let approval_policy = if t.read_only {
+        "never"
+    } else {
+        settings.approval_policy
+    };
+    let sandbox_policy = if t.read_only {
+        json!({ "type": "readOnly" })
+    } else {
+        settings.sandbox_policy
+    };
     let model = t.model.filter(|s| !s.trim().is_empty());
     let effort = t.effort.filter(|s| !s.trim().is_empty());
     let mut params = json!({
         "threadId": thread_id,
         "input": input,
-        "approvalPolicy": settings.approval_policy,
-        "sandboxPolicy": settings.sandbox_policy,
+        "approvalPolicy": approval_policy,
+        "sandboxPolicy": sandbox_policy,
     });
     if let Some(m) = model {
         params["model"] = json!(m);
