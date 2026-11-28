@@ -72,6 +72,7 @@ pub enum SessionStatus {
     Idle,
     Running,
     WaitingForApproval,
+    WaitingForUserInput,
     WaitingForSubagent,
     Completed,
     Failed,
@@ -85,6 +86,7 @@ impl SessionStatus {
             Self::Idle => "idle",
             Self::Running => "running",
             Self::WaitingForApproval => "waiting_for_approval",
+            Self::WaitingForUserInput => "waiting_for_user_input",
             Self::WaitingForSubagent => "waiting_for_subagent",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -97,6 +99,7 @@ impl SessionStatus {
         match s {
             "running" => Self::Running,
             "waiting_for_approval" => Self::WaitingForApproval,
+            "waiting_for_user_input" => Self::WaitingForUserInput,
             "waiting_for_subagent" => Self::WaitingForSubagent,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
@@ -109,7 +112,10 @@ impl SessionStatus {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Running | Self::WaitingForApproval | Self::WaitingForSubagent
+            Self::Running
+                | Self::WaitingForApproval
+                | Self::WaitingForUserInput
+                | Self::WaitingForSubagent
         )
     }
 }
@@ -164,6 +170,13 @@ pub struct Session {
     /// `None` uses the configured default.
     #[serde(default)]
     pub approval_mode: Option<ApprovalMode>,
+    /// Pending or per-session handoff strategy persisted across restarts.
+    #[serde(default)]
+    pub handoff_mode: Option<HandoffMode>,
+    /// Message ID boundary set by an explicit Fresh handoff; messages up to
+    /// and including this ID are never sent in subsequent handoffs or fallbacks.
+    #[serde(default)]
+    pub handoff_cutoff_message_id: Option<String>,
     pub external_session_id: Option<String>,
     pub status: SessionStatus,
     pub pinned: bool,
@@ -284,6 +297,8 @@ pub struct ProviderCapabilities {
     pub supports_session_resume: bool,
     pub supports_model_select: bool,
     pub supports_slash_commands: bool,
+    #[serde(default)]
+    pub supports_read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,4 +467,213 @@ pub enum StatsReport {
     Available(TokenStats),
     /// No usable history for this provider. The text says why.
     Unavailable(String),
+}
+
+/// Strategy for handing off conversation context when switching providers or
+/// recovering from an unavailable native session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffMode {
+    /// Structured summary + recent conversation + key tool results + environment.
+    #[default]
+    Smart,
+    /// Conversation history within the model's context budget.
+    Full,
+    /// Start a fresh provider session without passing prior conversation context
+    /// (SAME conversation history is preserved).
+    Fresh,
+}
+
+impl HandoffMode {
+    pub const ALL: [HandoffMode; 3] = [HandoffMode::Smart, HandoffMode::Full, HandoffMode::Fresh];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Smart => "smart",
+            Self::Full => "full",
+            Self::Fresh => "fresh",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_str() == s)
+    }
+}
+
+/// Working directory isolation mode for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkdirMode {
+    /// Share the project's working directory.
+    #[default]
+    Shared,
+    /// Isolate edits in a dedicated Git worktree.
+    Isolated,
+    /// Read-only investigation/review mode (enforced via provider permissions/sandbox).
+    ReadOnly,
+}
+
+impl WorkdirMode {
+    pub const ALL: [WorkdirMode; 3] = [
+        WorkdirMode::Shared,
+        WorkdirMode::Isolated,
+        WorkdirMode::ReadOnly,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Isolated => "isolated",
+            Self::ReadOnly => "read_only",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.as_str() == s)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSessionStatus {
+    #[default]
+    Active,
+    Invalidated,
+    Archived,
+}
+
+impl ProviderSessionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Invalidated => "invalidated",
+            Self::Archived => "archived",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "invalidated" => Self::Invalidated,
+            "archived" => Self::Archived,
+            _ => Self::Active,
+        }
+    }
+}
+
+/// A provider-native session associated with a SAME logical session.
+/// One SAME session may hold multiple `ProviderSession` records across
+/// different providers, execution environments, or working directories.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSession {
+    pub id: String,
+    pub session_id: String,
+    pub provider_id: String,
+    pub external_session_id: String,
+    pub model: Option<String>,
+    /// Execution environment key (e.g. "auto", "host", "wsl").
+    pub exec_mode: String,
+    pub workdir: String,
+    /// ID of the last SAME `Message` already known to this native session.
+    pub last_synced_message_id: Option<String>,
+    pub status: ProviderSessionStatus,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRunStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl AgentRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Running,
+        }
+    }
+}
+
+/// One execution turn of a provider within a SAME session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRun {
+    pub id: String,
+    pub session_id: String,
+    pub provider_session_id: Option<String>,
+    pub provider_id: String,
+    pub model: Option<String>,
+    pub status: AgentRunStatus,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+/// Environment snapshot captured in structured handoff context.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEnvironment {
+    pub workdir: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub workdir_mode: WorkdirMode,
+}
+
+/// Provider-agnostic structured summary of a session's context.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredContext {
+    pub objective: String,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub progress: Vec<String>,
+    #[serde(default)]
+    pub pending_tasks: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    #[serde(default)]
+    pub tool_results: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub environment: ContextEnvironment,
+}
+
+/// Persisted checkpoint of compacted/structured context for a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCheckpoint {
+    pub id: String,
+    pub session_id: String,
+    pub summary: StructuredContext,
+    pub covered_until_message_id: Option<String>,
+    pub token_estimate: usize,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Working directory binding for a session (shared, isolated worktree, or read-only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWorkdir {
+    pub session_id: String,
+    pub mode: WorkdirMode,
+    pub path: String,
+    pub base_branch: Option<String>,
+    pub branch_name: Option<String>,
+    pub is_worktree: bool,
+    pub created_at: DateTime<Utc>,
 }

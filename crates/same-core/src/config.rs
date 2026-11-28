@@ -1,4 +1,4 @@
-use crate::models::{ApprovalMode, ProviderConfig, ProviderKind};
+use crate::models::{ApprovalMode, HandoffMode, ProviderConfig, ProviderKind, WorkdirMode};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -160,11 +160,24 @@ pub struct AppConfig {
     /// Projects not listed use [`ExecMode::Auto`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub project_exec: BTreeMap<String, ExecMode>,
+    /// Optional maximum number of sessions that may run concurrently across all projects.
+    /// `None` (the default) means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_sessions: Option<usize>,
+    /// Default context handoff strategy when switching providers.
+    #[serde(default)]
+    pub default_handoff_mode: HandoffMode,
+    /// Default working directory isolation mode for newly created sessions.
+    #[serde(default)]
+    pub default_workdir_mode: WorkdirMode,
 }
 
 fn default_true() -> bool {
     true
 }
+
+pub const MIN_CONCURRENT_SESSIONS: usize = 1;
+pub const MAX_CONCURRENT_SESSIONS: usize = 16;
 
 fn default_provider_id() -> String {
     "opencode".to_string()
@@ -250,6 +263,9 @@ impl Default for AppConfig {
             submit_key: SubmitKey::default(),
             providers: default_providers(),
             project_exec: BTreeMap::new(),
+            max_concurrent_sessions: None,
+            default_handoff_mode: HandoffMode::default(),
+            default_workdir_mode: WorkdirMode::default(),
         }
     }
 }
@@ -312,6 +328,12 @@ impl AppConfig {
         self.font_size
             .filter(|s| s.is_finite())
             .map(|s| s.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE))
+    }
+
+    pub fn max_concurrent_sessions(&self) -> Option<usize> {
+        self.max_concurrent_sessions
+            .filter(|&n| n > 0)
+            .map(|n| n.clamp(MIN_CONCURRENT_SESSIONS, MAX_CONCURRENT_SESSIONS))
     }
 }
 

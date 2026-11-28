@@ -1,6 +1,6 @@
 use crate::models::{
-    ModelInfo, PermissionRequest, ProviderCapabilities, SessionStatus, SlashCommandInfo,
-    ToolCallRecord, UserInputRequest,
+    HandoffMode, ModelInfo, PermissionRequest, ProviderCapabilities, SessionStatus,
+    SlashCommandInfo, ToolCallRecord, UserInputRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -18,6 +18,27 @@ pub enum SameEvent {
     ExternalSessionBound {
         session_id: String,
         external_session_id: String,
+    },
+    /// A provider-specific native session was created or resumed.
+    ProviderSessionBound {
+        session_id: String,
+        provider_id: String,
+        external_session_id: String,
+    },
+    /// Context handoff was prepared and applied when switching or resuming.
+    ContextHandoffApplied {
+        session_id: String,
+        from_provider_id: Option<String>,
+        to_provider_id: String,
+        mode: HandoffMode,
+        is_delta: bool,
+    },
+    /// Resuming a native provider session failed and fell back to a fresh
+    /// session with context handoff.
+    NativeSessionFallback {
+        session_id: String,
+        provider_id: String,
+        reason: String,
     },
     MessageDelta {
         session_id: String,
@@ -153,6 +174,6 @@ impl EventBus {
 
 impl Default for EventBus {
     fn default() -> Self {
-        Self::new(1024)
+        Self::new(4096)
     }
 }
