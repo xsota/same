@@ -6,7 +6,7 @@
 
 A lightweight, local-first, multi-provider AI agent desktop workspace written in Rust.
 
-## Features (v0.1)
+## Features
 
 - **ACP First, Not ACP Only**: Built-in Agent Client Protocol (ACP) v1 client over stdio, plus native CLI adapters for agents without a standalone ACP wrapper installed.
 - **Multi-Provider Support**:
@@ -15,6 +15,9 @@ A lightweight, local-first, multi-provider AI agent desktop workspace written in
   - Codex (`codex-acp` or native `codex app-server` adapter)
   - Antigravity (`agy acp`)
   - Custom ACP agents (configurable command, args, env, cwd)
+- **Parallel Sessions**: Run multiple sessions concurrently across the same or different providers and projects, with independent per-session UI state (draft prompts, attachments, selected skills, scroll position), cross-project active session list and stop controls, and clickable background notifications.
+- **Context Handoff & Provider Session Reuse**: Switch providers or models inside the same SAME session while preserving conversation history and continuity. Native provider sessions are stored per `(provider, exec_mode, workdir)` and reused with delta sync when returning to a previous provider; when native resume is unavailable, `Smart`, `Full`, or `Fresh` context handoff restores work seamlessly.
+- **Working Environment Isolation**: Choose `Shared`, `Isolated (Git Worktree)`, or `Read Only` per session (with configurable default in Settings). Create or attach Git worktrees, inspect branch/diff status, and merge or remove worktrees with explicit confirmation and uncommitted-change protection. Non-Git projects continue to work normally.
 - **Structured Workspace**: Organize work into `Workspace -> Project -> Quest -> Session` (with quick sessions supported without forcing hierarchy).
 - **Streaming & Tool Visibility**: Real-time streaming responses, collapsible thinking/reasoning blocks, compact tool call summaries in chat with full details in the splittable right-pane **Tools** view, approval cards with diffs and keyboard answers for every provider, question and plan cards, OS notifications while in the background, and file/image attachments.
 - **Usage Dashboard**: Plan limits of Claude Code and Codex (5-hour and weekly windows, share used and left, time until reset) in one place, read from the CLIs without spending tokens.
@@ -63,6 +66,12 @@ Antigravity keeps no history SAME can read.
 ## Picking the Agent and Model
 
 The row under the prompt has an agent picker, a model picker, and a reasoning effort picker (when supported by the selected model). Providers that are not installed or not authenticated are hidden from workspace pickers, and providers whose quota is exhausted are shown disabled until reset. Models are discovered dynamically from each provider (ACP `session/new`, Claude Code `initialize`, and Codex `app-server`). You can also type `/model <name>` (or `/model default`) in the prompt; typing `/` lists the commands, and `/model ` lists the models.
+
+## Parallel Sessions, Context Handoff & Worktrees
+
+- **Parallel execution**: Sessions keep running in the background when you switch sessions or projects. Draft prompts, attachments, selected skills, and scroll positions are preserved per session. Active sessions across all projects appear at the top of the sidebar with one-click jump and individual stop controls, and background events (finished replies, approvals, user questions, errors) show clickable banners. Concurrency is unlimited by default and can optionally be capped (1–16) in **Settings → General**.
+- **Context Handoff & Provider Session Reuse**: Switching providers in a session with existing history asks for confirmation before sending context to another provider and lets you pick `Smart` (structured summary + recent turns), `Full`, or `Fresh` (no prior context sent; SAME history is preserved). Returning to a previously used provider resumes its native session and sends only unsynced delta updates.
+- **Working environments**: Pick `Shared`, `Isolated (Git Worktree)`, or `Read Only` from the chat header (`📁 Shared ▾`). Isolated sessions run in a dedicated Git worktree and branch (with the right-pane **Files** and **Git** tabs following the session's worktree), and offer confirmed merge and removal actions without discarding uncommitted changes.
 
 ## Approval Modes
 
