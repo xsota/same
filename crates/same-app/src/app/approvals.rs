@@ -246,12 +246,7 @@ impl SameAppView {
     }
 
     pub(super) fn notify_waiting(&self, session_id: &str, what: &str) {
-        let title = self
-            .sessions
-            .iter()
-            .find(|s| s.id == session_id)
-            .map(|s| self.session_title(s))
-            .unwrap_or_default();
+        let title = self.session_title_by_id(session_id);
         self.os_notify(format!("SAME — {what}"), title);
     }
 

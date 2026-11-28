@@ -1,4 +1,5 @@
 mod approvals;
+mod parallel;
 mod skills;
 mod token_stats;
 mod usage;
@@ -39,10 +40,13 @@ use same_agent::{
 };
 use same_core::paths::simplify_path;
 use same_core::{
-    AppConfig, AppPaths, ApprovalMode, ColorTheme, EventBus, ExecMode, Language, Message,
-    MessageRole, ModelInfo, PermissionRequest, Project, ProviderConfig, ProviderKind, Quest,
-    SameEvent, Session, SessionStatus, SlashCommandInfo, Storage, SubmitKey, ThemeMode,
-    ToolCallRecord, ToolCallStatus, Workspace, MAX_FONT_SIZE, MIN_FONT_SIZE,
+    current_branch, AgentRun, AgentRunStatus, AppConfig, AppPaths, ApprovalMode, ColorTheme,
+    ContextEnvironment, ContextManager, EventBus, ExecMode, HandoffMode, HandoffRequest, Language,
+    Message, MessageRole, ModelInfo, PermissionRequest, Project, ProviderConfig, ProviderKind,
+    ProviderSession, ProviderSessionStatus, Quest, SameEvent, Session, SessionStatus,
+    SessionWorkdir, SlashCommandInfo, Storage, SubmitKey, ThemeMode, ToolCallRecord,
+    ToolCallStatus, WorkdirMode, Workspace, MAX_CONCURRENT_SESSIONS, MAX_FONT_SIZE,
+    MIN_CONCURRENT_SESSIONS, MIN_FONT_SIZE,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -727,6 +731,16 @@ pub struct SameAppView {
     font_rows: Vec<Option<usize>>,
     /// Search box at the top of the font dropdown.
     font_search: Entity<InputState>,
+
+    // Parallel sessions, Context Handoff, and Workdir/Worktree
+    session_ui_states: HashMap<String, parallel::SessionUiState>,
+    /// Active run tracking per session (captures the turn's exec_mode and workdir).
+    active_runs: HashMap<String, parallel::ActiveRunInfo>,
+    background_alerts: Vec<parallel::BackgroundAlert>,
+    pending_provider_switch: Option<parallel::PendingProviderSwitch>,
+    pending_worktree_confirm: Option<parallel::PendingWorktreeConfirm>,
+    session_workdirs: HashMap<String, SessionWorkdir>,
+    cached_worktrees: Vec<same_core::WorktreeInfo>,
 }
 
 impl Drop for SameAppView {
@@ -1114,7 +1128,16 @@ impl SameAppView {
             font_menu_open: None,
             font_search,
             skills_ui,
+            session_ui_states: HashMap::new(),
+            active_runs: HashMap::new(),
+            background_alerts: Vec::new(),
+            pending_provider_switch: None,
+            pending_worktree_confirm: None,
+            session_workdirs: HashMap::new(),
+            cached_worktrees: Vec::new(),
         };
+        app.agent_manager
+            .set_max_concurrent_sessions(app.config.max_concurrent_sessions());
 
         if app.config.migrated_auto_approve {
             // Saved without the old key from now on.
@@ -1688,16 +1711,32 @@ impl SameAppView {
     }
 
     fn select_session(&mut self, session_id: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
+        let prev_sid = self.selected_session_id.clone();
+        let switching = prev_sid.as_deref() != Some(session_id.as_str());
+        if switching {
             self.commit_rename(cx);
-            self.clear_attachments();
-            self.selected_prompt_skills.clear();
+            if let Some(old_sid) = prev_sid {
+                self.save_session_ui_state(&old_sid, cx);
+            }
+            self.pending_provider_switch = None;
+            self.pending_worktree_confirm = None;
         }
-        self.selected_session_id = Some(session_id);
+        self.selected_session_id = Some(session_id.clone());
         self.active_view = MainView::Chat;
         self.confirm_delete = None;
         self.reload_messages(window, cx);
-        self.scroll_feed_to_end();
+        let saved_scroll = if switching {
+            self.restore_session_ui_state(&session_id, window, cx)
+        } else {
+            None
+        };
+        if let Some(offset) = saved_scroll {
+            self.sync_feed();
+            self.feed.scroll_to(offset);
+        } else {
+            self.scroll_feed_to_end();
+        }
+        self.reload_workspace_files(cx);
         self.prompt_input.update(cx, |s, cx| s.focus(window, cx));
     }
 
@@ -1748,6 +1787,9 @@ impl SameAppView {
                     sess.effort = effort;
                 }
                 let id = sess.id.clone();
+                if let Some(workdir) = self.current_project().map(|p| p.workdir.clone()) {
+                    self.apply_default_workdir_mode(&id, &workdir);
+                }
                 self.sessions.insert(0, sess);
                 self.select_session(id, window, cx);
             }
@@ -1790,6 +1832,9 @@ impl SameAppView {
                     .storage
                     .set_session_approval_mode(&sess.id, Some(default_mode));
                 sess.approval_mode = Some(default_mode);
+                if let Some(workdir) = self.current_project().map(|p| p.workdir.clone()) {
+                    self.apply_default_workdir_mode(&sess.id, &workdir);
+                }
                 self.sessions.push(sess);
             }
         }
@@ -1827,13 +1872,31 @@ impl SameAppView {
 
     fn reload_workspace_files(&mut self, cx: &Context<Self>) {
         let filter = self.file_filter_input.read(cx).value().to_string();
-        if let Some(proj) = self.current_project().cloned() {
-            let root = PathBuf::from(&proj.workdir);
+        let root_opt = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|sid| self.effective_workdir_for_session(sid))
+            .or_else(|| self.current_project().map(|p| PathBuf::from(&p.workdir)));
+        if let Some(root) = root_opt {
             self.file_entries = scan_directory(&root, &filter, &self.expanded_dirs, 2000);
             self.git_info = load_git_info(&root);
+            self.cached_worktrees = self
+                .current_project()
+                .map(|p| same_core::list_worktrees(Path::new(&p.workdir)).unwrap_or_default())
+                .unwrap_or_default();
+            // Clear editor path if it points into a different checkout (e.g.
+            // after switching between Shared and an isolated worktree) and has
+            // no unsaved edits, so saving cannot write to the wrong checkout.
+            if let Some(ref open_path) = self.opened_file_path {
+                if !open_path.starts_with(&root) && !self.file_dirty {
+                    self.opened_file_path = None;
+                    self.opened_file_saved.clear();
+                }
+            }
         } else {
             self.file_entries.clear();
             self.git_info = GitInfo::default();
+            self.cached_worktrees.clear();
         }
         if !self.git_info.is_repo {
             if self.right_tab == RightTab::Git {
@@ -2094,29 +2157,47 @@ impl SameAppView {
             self.live_markdown_view = None;
         }
         self.agent_manager.release_session(&sid);
+        self.active_runs.remove(&sid);
         self.pending_permissions.retain(|p| p.session_id != sid);
         self.pending_inputs.retain(|p| p.request.session_id != sid);
+        self.session_ui_states.remove(&sid);
+        self.session_workdirs.remove(&sid);
+        self.background_alerts.retain(|a| a.session_id != sid);
         let _ = self.storage.delete_session(&sid);
         self.sessions.retain(|x| x.id != sid);
         if self.selected_session_id.as_deref() == Some(sid.as_str()) {
             self.selected_session_id = self.sessions.first().map(|x| x.id.clone());
             self.clear_attachments();
             self.selected_prompt_skills.clear();
+            self.pending_provider_switch = None;
+            self.pending_worktree_confirm = None;
             if self.selected_session_id.is_none() {
                 // Always keep a session to type into.
                 self.reload_project_state(window, cx);
             } else {
                 self.reload_messages(window, cx);
+                self.reload_workspace_files(cx);
+            }
+            if let Some(new_sid) = self.selected_session_id.clone() {
+                if let Some(offset) = self.restore_session_ui_state(&new_sid, window, cx) {
+                    self.sync_feed();
+                    self.feed.scroll_to(offset);
+                } else {
+                    self.scroll_feed_to_end();
+                }
             }
         }
     }
 
     fn select_project(&mut self, pid: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(old_sid) = self.selected_session_id.clone() {
+            self.save_session_ui_state(&old_sid, cx);
+        }
         self.selected_project_id = Some(pid);
         self.selected_quest_filter = None;
         self.selected_session_id = None;
-        self.clear_attachments();
-        self.selected_prompt_skills.clear();
+        self.pending_provider_switch = None;
+        self.pending_worktree_confirm = None;
         self.opened_file_path = None;
         self.file_dirty = false;
         self.active_view = MainView::Chat;
@@ -2124,6 +2205,12 @@ impl SameAppView {
         self.file_filter_input
             .update(cx, |i, cx| i.set_value("", window, cx));
         self.reload_project_state(window, cx);
+        if let Some(new_sid) = self.selected_session_id.clone() {
+            if let Some(offset) = self.restore_session_ui_state(&new_sid, window, cx) {
+                self.sync_feed();
+                self.feed.scroll_to(offset);
+            }
+        }
         self.reload_skills_state();
         self.trigger_external_skill_discovery();
         // Another project may run its agents somewhere else (e.g. WSL).
@@ -2480,6 +2567,9 @@ impl SameAppView {
         self.save_config();
         // Agent-side sessions live in one environment; they can't be resumed
         // from the other one.
+        let _ = self
+            .storage
+            .invalidate_legacy_provider_sessions_for_project(&proj.id);
         for s in self.sessions.iter_mut() {
             if s.external_session_id.take().is_some() {
                 let _ = self
@@ -3103,8 +3193,99 @@ impl SameAppView {
                     None,
                 );
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                    s.external_session_id = Some(external_session_id);
+                    s.external_session_id = Some(external_session_id.clone());
                 }
+                if let Ok(Some(sess)) = self.storage.get_session(&session_id) {
+                    self.record_provider_session_binding(
+                        &session_id,
+                        &sess.provider_id,
+                        &external_session_id,
+                        sess.model.clone(),
+                    );
+                }
+            }
+            SameEvent::ProviderSessionBound {
+                session_id,
+                provider_id,
+                external_session_id,
+            } => {
+                let model = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .and_then(|s| s.model.clone())
+                    .or_else(|| {
+                        self.storage
+                            .get_session(&session_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.model)
+                    });
+                self.record_provider_session_binding(
+                    &session_id,
+                    &provider_id,
+                    &external_session_id,
+                    model,
+                );
+            }
+            SameEvent::ContextHandoffApplied {
+                session_id,
+                from_provider_id,
+                to_provider_id,
+                mode,
+                is_delta,
+            } => {
+                let stamp = Local::now().format("%H:%M:%S");
+                self.logs.push(format!(
+                    "{stamp} [handoff] session={} from={:?} to={} mode={} delta={}",
+                    session_id,
+                    from_provider_id,
+                    to_provider_id,
+                    mode.as_str(),
+                    is_delta
+                ));
+            }
+            SameEvent::NativeSessionFallback {
+                session_id,
+                provider_id,
+                reason,
+            } => {
+                let (exec_key, workdir) = self
+                    .active_runs
+                    .get(&session_id)
+                    .map(|r| (r.exec_mode_key.clone(), r.workdir.clone()))
+                    .unwrap_or_else(|| {
+                        (
+                            self.exec_mode_key().to_string(),
+                            self.effective_workdir_for_session(&session_id)
+                                .map(|p| simplify_path(&p.to_string_lossy()))
+                                .unwrap_or_default(),
+                        )
+                    });
+                if let Ok(Some(old_ps)) = self.storage.get_active_provider_session(
+                    &session_id,
+                    &provider_id,
+                    &exec_key,
+                    &workdir,
+                ) {
+                    let _ = self.storage.invalidate_provider_session(&old_ps.id);
+                }
+                let lang = self.config.language;
+                let pname = self.provider_name(&provider_id);
+                self.note(
+                    NoteKind::Info,
+                    match lang {
+                        Language::Ja => format!(
+                            "{pname} の既存セッションを再開できなかったため、コンテキストを引き継いで新規セッションで継続しました"
+                        ),
+                        Language::En => format!(
+                            "Could not resume {pname} native session; continued in a new session with context handoff"
+                        ),
+                    },
+                );
+                let stamp = Local::now().format("%H:%M:%S");
+                self.logs
+                    .push(format!("{stamp} [{provider_id}] fallback: {reason}"));
             }
             SameEvent::MessageDelta { session_id, text } => {
                 if let Some(d) = self.live_drafts.get_mut(&session_id) {
@@ -3180,19 +3361,10 @@ impl SameAppView {
                     return;
                 }
                 if !self.is_selected_session(&request.session_id) {
-                    let title = self
-                        .sessions
-                        .iter()
-                        .find(|s| s.id == request.session_id)
-                        .map(|s| self.session_title(s))
-                        .unwrap_or_default();
-                    self.note(
-                        NoteKind::Warning,
-                        format!(
-                            "{}: {title}",
-                            t(self.config.language, "承認待ち", "Approval needed")
-                        ),
-                    );
+                    let title = self.session_title_by_id(&request.session_id);
+                    let detail = t(self.config.language, "承認待ち", "Approval needed").to_string();
+                    self.note(NoteKind::Warning, format!("{detail}: {title}"));
+                    self.push_background_alert(&request.session_id, NoteKind::Warning, detail);
                 } else {
                     self.focus_approval = true;
                     self.mark_feed_tail_dirty();
@@ -3216,16 +3388,10 @@ impl SameAppView {
                     self.focus_approval = true;
                     self.mark_feed_tail_dirty();
                 } else {
-                    let title = self
-                        .sessions
-                        .iter()
-                        .find(|s| s.id == request.session_id)
-                        .map(|s| self.session_title(s))
-                        .unwrap_or_default();
-                    self.note(
-                        NoteKind::Warning,
-                        format!("{}: {title}", t(lang, "質問があります", "Question for you")),
-                    );
+                    let title = self.session_title_by_id(&request.session_id);
+                    let detail = t(lang, "質問があります", "Question for you").to_string();
+                    self.note(NoteKind::Warning, format!("{detail}: {title}"));
+                    self.push_background_alert(&request.session_id, NoteKind::Warning, detail);
                 }
                 self.notify_waiting(
                     &request.session_id,
@@ -3435,6 +3601,8 @@ impl SameAppView {
             }
             content.push_str(t(lang, "_(停止しました)_", "_(Stopped)_"));
         }
+        let active_run = self.active_runs.remove(session_id);
+        let mut last_msg_id: Option<String> = None;
         let has_message =
             !content.is_empty() || !draft.thinking.is_empty() || !tool_calls.is_empty();
         if has_message {
@@ -3453,6 +3621,7 @@ impl SameAppView {
                 model: sess.as_ref().and_then(|s| s.model.clone()),
                 created_at: Utc::now(),
             };
+            last_msg_id = Some(msg.id.clone());
             let _ = self.storage.append_message(&msg);
             if self.is_selected_session(session_id) {
                 if let Some(anchor) = self.feed_turn_anchor.borrow_mut().as_mut() {
@@ -3475,6 +3644,47 @@ impl SameAppView {
             if self.is_selected_session(session_id) {
                 self.clear_turn_anchor();
                 self.mark_feed_tail_dirty();
+            }
+        }
+        if let Some(run_info) = active_run {
+            let run_status = match status {
+                SessionStatus::Completed => AgentRunStatus::Completed,
+                SessionStatus::Cancelled => AgentRunStatus::Cancelled,
+                _ => AgentRunStatus::Failed,
+            };
+            let _ = self
+                .storage
+                .finish_agent_run(&run_info.run_id, run_status, error.as_deref());
+            // Only advance the provider session sync cursor on successful completion.
+            // If handoff/turn failed or was cancelled, keep the previous cursor so
+            // unsynced context is never marked as synced.
+            if status == SessionStatus::Completed {
+                let sync_msg_id = last_msg_id.or_else(|| {
+                    self.storage
+                        .list_messages(session_id)
+                        .ok()
+                        .and_then(|ms| ms.last().map(|m| m.id.clone()))
+                });
+                if let (Some(ps_id), Some(mid)) = (run_info.provider_session_id, sync_msg_id) {
+                    let model = sess.as_ref().and_then(|s| s.model.as_deref());
+                    let _ = self
+                        .storage
+                        .mark_provider_session_synced(&ps_id, &mid, model);
+                }
+                // Clear persisted Fresh handoff flag only after a turn actually
+                // succeeded so failed attempts never retry with prior history.
+                if sess.as_ref().and_then(|s| s.handoff_mode) == Some(HandoffMode::Fresh) {
+                    let _ = self.storage.set_session_handoff_mode(session_id, None);
+                    if let Some(s) = self.sessions.iter_mut().find(|x| x.id == session_id) {
+                        s.handoff_mode = None;
+                    }
+                    if let Some(st) = self.session_ui_states.get_mut(session_id) {
+                        st.pending_fresh_handoff = false;
+                        if st.handoff_mode == Some(HandoffMode::Fresh) {
+                            st.handoff_mode = None;
+                        }
+                    }
+                }
             }
         }
         if self.is_selected_session(session_id) {
@@ -3509,6 +3719,10 @@ impl SameAppView {
         }
         if let (Some(err), false) = (error, visible) {
             let first_line: String = err.lines().next().unwrap_or("").chars().take(160).collect();
+            self.session_ui_states
+                .entry(session_id.to_string())
+                .or_default()
+                .has_unread_error = true;
             self.note(
                 NoteKind::Error,
                 format!(
@@ -3516,19 +3730,112 @@ impl SameAppView {
                     t(lang, "エラー", "Error in ")
                 ),
             );
+            self.push_background_alert(
+                session_id,
+                NoteKind::Error,
+                format!("{}: {first_line}", t(lang, "エラー", "Error")),
+            );
         } else if status == SessionStatus::Completed
             && self.selected_session_id.as_deref() != Some(session_id)
         {
+            self.session_ui_states
+                .entry(session_id.to_string())
+                .or_default()
+                .has_unread_completion = true;
             self.note(
                 NoteKind::Success,
                 format!("{}: {title}", t(lang, "完了", "Finished")),
             );
+            self.push_background_alert(
+                session_id,
+                NoteKind::Success,
+                t(lang, "完了", "Finished").to_string(),
+            );
         }
 
-        if let Some(proj) = self.current_project().cloned() {
-            self.git_info = load_git_info(&PathBuf::from(&proj.workdir));
+        if let Some(root) = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|sid| self.effective_workdir_for_session(sid))
+            .or_else(|| self.current_project().map(|p| PathBuf::from(&p.workdir)))
+        {
+            self.git_info = load_git_info(&root);
             // The agent may have edited the file that is open in the panel.
             self.reload_open_file_pending = true;
+        }
+    }
+
+    fn record_provider_session_binding(
+        &mut self,
+        session_id: &str,
+        provider_id: &str,
+        external_session_id: &str,
+        model: Option<String>,
+    ) {
+        let (exec_key, workdir) = self
+            .active_runs
+            .get(session_id)
+            .map(|r| (r.exec_mode_key.clone(), r.workdir.clone()))
+            .unwrap_or_else(|| {
+                (
+                    self.exec_mode_key().to_string(),
+                    self.effective_workdir_for_session(session_id)
+                        .map(|p| simplify_path(&p.to_string_lossy()))
+                        .unwrap_or_default(),
+                )
+            });
+        let now = Utc::now();
+        let existing = self
+            .storage
+            .get_active_provider_session(session_id, provider_id, &exec_key, &workdir)
+            .ok()
+            .flatten();
+        let ps = match existing {
+            Some(mut prev) if prev.external_session_id == external_session_id => {
+                prev.model = model.or(prev.model);
+                if prev.exec_mode.is_empty() {
+                    prev.exec_mode = exec_key;
+                }
+                prev.last_used_at = now;
+                prev
+            }
+            Some(prev) => {
+                let _ = self.storage.invalidate_provider_session(&prev.id);
+                ProviderSession {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.to_string(),
+                    provider_id: provider_id.to_string(),
+                    external_session_id: external_session_id.to_string(),
+                    model,
+                    exec_mode: exec_key,
+                    workdir,
+                    last_synced_message_id: None,
+                    status: ProviderSessionStatus::Active,
+                    created_at: now,
+                    last_used_at: now,
+                }
+            }
+            None => ProviderSession {
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                provider_id: provider_id.to_string(),
+                external_session_id: external_session_id.to_string(),
+                model,
+                exec_mode: exec_key,
+                workdir,
+                last_synced_message_id: None,
+                status: ProviderSessionStatus::Active,
+                created_at: now,
+                last_used_at: now,
+            },
+        };
+        let ps_id = ps.id.clone();
+        let _ = self.storage.upsert_provider_session(&ps);
+        if let Some(run_info) = self.active_runs.get_mut(session_id) {
+            run_info.provider_session_id = Some(ps_id.clone());
+            let _ = self
+                .storage
+                .set_agent_run_provider_session(&run_info.run_id, &ps_id);
         }
     }
 
@@ -3588,6 +3895,11 @@ impl SameAppView {
                     provider.name
                 ),
             );
+            return;
+        }
+        // Preflight duplicate-run and concurrency limit before mutating the composer or DB.
+        if let Err(err) = self.agent_manager.can_start_prompt(&session.id) {
+            self.note(NoteKind::Warning, format!("{err:#}"));
             return;
         }
 
@@ -3691,6 +4003,7 @@ impl SameAppView {
         };
         let should_anchor = self.should_anchor_new_turn();
         let viewport = self.feed.viewport_bounds();
+        let prior_messages = self.storage.list_messages(&session.id).unwrap_or_default();
         let user_msg_id = user_msg.id.clone();
         let user_msg_content = user_msg.content.clone();
         let _ = self.storage.append_message(&user_msg);
@@ -3702,27 +4015,188 @@ impl SameAppView {
             self.sessions.insert(0, s);
         }
 
-        let mut full_prompt = text;
-        if session.external_session_id.is_none() {
+        let cwd = self
+            .effective_workdir_for_session(&session.id)
+            .unwrap_or_else(|| PathBuf::from(&project.workdir));
+        let workdir_mode = self.session_workdir_mode(&session.id);
+        let read_only = workdir_mode == WorkdirMode::ReadOnly;
+        let norm_workdir = simplify_path(&cwd.to_string_lossy());
+        let exec_key = self.exec_mode_key();
+        let handoff_mode = self.session_handoff_mode(&session.id);
+        let ui_fresh = self
+            .session_ui_states
+            .get(&session.id)
+            .is_some_and(|st| st.pending_fresh_handoff);
+        let persisted_fresh = session.handoff_mode == Some(HandoffMode::Fresh);
+        // Keep Fresh active until a turn succeeds (cleared in finalize_live_draft)
+        // so retries after a failed start never leak pre-Fresh history.
+        let consume_fresh = ui_fresh || persisted_fresh;
+
+        // Resolve reusable ProviderSession for `(session, provider, exec_mode, workdir)`.
+        // Only suppress reuse on the initial turn of an explicit Fresh handoff;
+        // subsequent turns on the newly created native session continue normally.
+        let active_ps = if consume_fresh {
+            None
+        } else {
+            self.storage
+                .get_active_provider_session(&session.id, &provider.id, exec_key, &norm_workdir)
+                .ok()
+                .flatten()
+        };
+        let is_default_project_workdir =
+            workdir_mode == WorkdirMode::Shared && norm_workdir == simplify_path(&project.workdir);
+        let has_any_provider_sessions = !self
+            .storage
+            .list_provider_sessions(&session.id)
+            .unwrap_or_default()
+            .is_empty();
+        let external_session_id = active_ps
+            .as_ref()
+            .map(|ps| ps.external_session_id.clone())
+            .or_else(|| {
+                // Only fall back to legacy unscoped `session.external_session_id`
+                // when still on the default project workdir and no scoped
+                // `provider_sessions` exist yet.
+                if !consume_fresh && is_default_project_workdir && !has_any_provider_sessions {
+                    session.external_session_id.clone()
+                } else {
+                    None
+                }
+            });
+
+        let mut base_prompt = text;
+        if external_session_id.is_none() && prior_messages.is_empty() {
             if let Some(qid) = session.quest_id.as_deref() {
                 if let Some(quest) = self.quests.iter().find(|q| q.id == qid) {
                     if !quest.goal.trim().is_empty() {
-                        full_prompt = format!(
+                        base_prompt = format!(
                             "[Quest: {}]\nGoal: {}\n\n{}",
-                            quest.title, quest.goal, full_prompt
+                            quest.title, quest.goal, base_prompt
                         );
                     }
                 }
             }
         }
 
-        let mode = self.session_mode(&session);
-        let cwd = PathBuf::from(&project.workdir);
+        // Build Context Handoff (delta sync on resume, or Smart/Full handoff on new provider session).
+        let env_snapshot = ContextEnvironment {
+            workdir: norm_workdir.clone(),
+            branch: current_branch(&cwd),
+            workdir_mode,
+        };
+        let existing_cp = self
+            .storage
+            .get_latest_context_checkpoint(&session.id)
+            .ok()
+            .flatten();
+        let from_provider = prior_messages
+            .iter()
+            .rev()
+            .find_map(|m| m.provider_id.as_deref());
+
+        let mut full_prompt = base_prompt.clone();
+        let mut fallback_handoff_prompt: Option<String> = None;
+
+        // Respect any persisted Fresh history cutoff so pre-Fresh messages are
+        // never disclosed on retries or later native-session fallbacks.
+        let handoff_messages: &[Message] = match session.handoff_cutoff_message_id.as_deref() {
+            Some(cutoff_id) => match prior_messages.iter().position(|m| m.id == cutoff_id) {
+                Some(pos) => &prior_messages[pos + 1..],
+                None => &prior_messages,
+            },
+            None => &prior_messages,
+        };
+
+        if !handoff_messages.is_empty() && !consume_fresh {
+            if external_session_id.is_some() {
+                // Reusing an existing native session: if we have a scoped
+                // ProviderSession, send only the unsynced delta since its cursor.
+                if let Some(ref ps) = active_ps {
+                    let delta_payload = ContextManager::build_handoff_payload(&HandoffRequest {
+                        session_id: &session.id,
+                        mode: handoff_mode,
+                        messages: handoff_messages,
+                        last_synced_message_id: ps.last_synced_message_id.as_deref(),
+                        existing_checkpoint: existing_cp.as_ref(),
+                        environment: env_snapshot.clone(),
+                        max_budget_tokens: None,
+                        from_provider_id: from_provider,
+                        to_provider_id: &provider.id,
+                    });
+                    if let Some(prefix) = delta_payload.rendered_prompt {
+                        full_prompt = format!("{prefix}{base_prompt}");
+                    }
+                }
+                // Always prepare a fallback handoff prompt when resuming any
+                // external ID (including legacy sessions) in case native resume fails.
+                let fb_payload = ContextManager::build_handoff_payload(&HandoffRequest {
+                    session_id: &session.id,
+                    mode: handoff_mode,
+                    messages: handoff_messages,
+                    last_synced_message_id: None,
+                    existing_checkpoint: existing_cp.as_ref(),
+                    environment: env_snapshot,
+                    max_budget_tokens: None,
+                    from_provider_id: from_provider,
+                    to_provider_id: &provider.id,
+                });
+                if let Some(fb_prefix) = fb_payload.rendered_prompt {
+                    fallback_handoff_prompt = Some(format!("{fb_prefix}{base_prompt}"));
+                }
+            } else {
+                let payload = ContextManager::build_handoff_payload(&HandoffRequest {
+                    session_id: &session.id,
+                    mode: handoff_mode,
+                    messages: handoff_messages,
+                    last_synced_message_id: None,
+                    existing_checkpoint: existing_cp.as_ref(),
+                    environment: env_snapshot,
+                    max_budget_tokens: None,
+                    from_provider_id: from_provider,
+                    to_provider_id: &provider.id,
+                });
+                if let Some(cp) = payload.new_checkpoint {
+                    let _ = self.storage.insert_context_checkpoint(&cp);
+                }
+                if let Some(prefix) = payload.rendered_prompt {
+                    full_prompt = format!("{prefix}{base_prompt}");
+                }
+            }
+        }
+
+        let mode = if read_only {
+            ApprovalMode::Plan
+        } else {
+            self.session_mode(&session)
+        };
         let exec = self.exec_pref();
         let explicit_skill_pairs: Vec<(String, PathBuf)> = explicit_skills
             .into_iter()
             .map(|s| (s.name, s.skill_md_path))
             .collect();
+
+        let run_id = Uuid::new_v4().to_string();
+        let run_record = AgentRun {
+            id: run_id.clone(),
+            session_id: session.id.clone(),
+            provider_session_id: active_ps.as_ref().map(|p| p.id.clone()),
+            provider_id: provider.id.clone(),
+            model: model.clone(),
+            status: AgentRunStatus::Running,
+            started_at: Utc::now(),
+            finished_at: None,
+            error: None,
+        };
+        let _ = self.storage.insert_agent_run(&run_record);
+        self.active_runs.insert(
+            session.id.clone(),
+            parallel::ActiveRunInfo {
+                run_id: run_id.clone(),
+                provider_session_id: active_ps.as_ref().map(|p| p.id.clone()),
+                exec_mode_key: exec_key.to_string(),
+                workdir: norm_workdir.clone(),
+            },
+        );
 
         let mut draft = LiveDraft::new();
         draft.exec_context = self.exec_label();
@@ -3753,9 +4227,9 @@ impl SameAppView {
         self.sync_feed();
         self.scroll_feed_to_end();
 
-        self.agent_manager.start_prompt(PromptRequest {
-            session_id: session.id,
-            external_session_id: session.external_session_id,
+        let start_res = self.agent_manager.try_start_prompt(PromptRequest {
+            session_id: session.id.clone(),
+            external_session_id,
             provider,
             model,
             effort: session.effort.clone().filter(|e| !e.trim().is_empty()),
@@ -3764,6 +4238,8 @@ impl SameAppView {
             attachments,
             exec,
             mode,
+            read_only,
+            fallback_handoff_prompt,
             skill_delivery: None,
             skill_sync: Some(same_agent::PromptSkillSync {
                 synchronizer: self.skills_ui.synchronizer.clone(),
@@ -3772,6 +4248,16 @@ impl SameAppView {
                 explicit_skills: explicit_skill_pairs,
             }),
         });
+        if let Err(err) = start_res {
+            self.live_drafts.remove(&session.id);
+            self.active_runs.remove(&session.id);
+            let err_str = format!("{err:#}");
+            let _ = self
+                .storage
+                .finish_agent_run(&run_id, AgentRunStatus::Failed, Some(&err_str));
+            self.note(NoteKind::Warning, err_str);
+            self.mark_feed_tail_dirty();
+        }
     }
 
     /// The current session's earlier prompts, newest first, without the
@@ -3996,39 +4482,9 @@ impl SameAppView {
     }
 
     fn cancel_current(&mut self) {
-        let Some(sid) = self.selected_session_id.clone() else {
-            return;
-        };
-        if !self.is_session_running(&sid) {
-            return;
+        if let Some(sid) = self.selected_session_id.clone() {
+            self.cancel_session_by_id(sid);
         }
-        // Answer any open permission prompt first, or the agent stays
-        // blocked on it and never sees the cancel.
-        let perms: Vec<String> = self
-            .pending_permissions
-            .iter()
-            .filter(|p| p.session_id == sid)
-            .map(|p| p.request_id.clone())
-            .collect();
-        self.pending_permissions.retain(|p| p.session_id != sid);
-        let inputs: Vec<String> = self
-            .pending_inputs
-            .iter()
-            .filter(|p| p.request.session_id == sid)
-            .map(|p| p.request.request_id.clone())
-            .collect();
-        self.pending_inputs.retain(|p| p.request.session_id != sid);
-        self.mark_feed_tail_dirty();
-        let mgr = self.agent_manager.clone();
-        self.rt.spawn(async move {
-            for rid in perms {
-                mgr.respond_permission(&rid, None).await;
-            }
-            for rid in inputs {
-                mgr.respond_user_input(&rid, None).await;
-            }
-            mgr.cancel_session(&sid).await;
-        });
     }
 
     fn save_config(&mut self) {
@@ -4305,7 +4761,9 @@ fn section_label(text: &str, theme: &Theme) -> Div {
 fn status_color(status: SessionStatus, theme: &Theme) -> Hsla {
     match status {
         SessionStatus::Running | SessionStatus::WaitingForSubagent => accent_indicator().into(),
-        SessionStatus::WaitingForApproval => status_amber().into(),
+        SessionStatus::WaitingForApproval | SessionStatus::WaitingForUserInput => {
+            status_amber().into()
+        }
         SessionStatus::Completed => status_green().into(),
         SessionStatus::Failed => status_red().into(),
         SessionStatus::Interrupted | SessionStatus::Cancelled => theme.muted_foreground,
@@ -4495,6 +4953,9 @@ impl SameAppView {
             .border_color(theme.border)
             .p_3()
             .gap_2()
+            .when_some(self.render_running_sessions_section(cx), |el, sec| {
+                el.child(sec)
+            })
             .child(self.render_projects_section(cx))
             .child(div().h(px(1.0)).bg(theme.border))
             .child(self.render_quests_section(cx))
@@ -4974,20 +5435,42 @@ impl SameAppView {
                         let sid = s.id.clone();
                         let sid_rename = s.id.clone();
                         let sid_del = s.id.clone();
+                        let sid_stop = s.id.clone();
                         let selected = self.selected_session_id.as_deref() == Some(s.id.as_str());
                         let running = self.is_session_running(&s.id);
-                        let waiting = self
+                        let waiting_perm = self
                             .pending_permissions
                             .iter()
                             .any(|p| p.session_id == s.id);
+                        let waiting_input = self
+                            .pending_inputs
+                            .iter()
+                            .any(|p| p.request.session_id == s.id);
+                        let unread = self
+                            .session_ui_states
+                            .get(&s.id)
+                            .is_some_and(|st| st.has_unread_completion || st.has_unread_error);
                         let renaming = self.renaming_session_id.as_deref() == Some(s.id.as_str());
-                        let dot = if waiting {
+                        let dot = if waiting_perm || waiting_input {
                             status_amber().into()
                         } else if running {
                             accent_indicator().into()
+                        } else if unread {
+                            status_green().into()
                         } else {
                             status_color(s.status, &theme)
                         };
+                        let wd_badge = match self.session_workdir_mode(&s.id) {
+                            WorkdirMode::Isolated => " ⎇",
+                            WorkdirMode::ReadOnly => " 🔒",
+                            WorkdirMode::Shared => "",
+                        };
+                        let model_tag = s
+                            .model
+                            .as_deref()
+                            .or_else(|| self.agent_current_model.get(&s.id).map(String::as_str))
+                            .map(|m| format!("/{m}"))
+                            .unwrap_or_default();
 
                         if renaming {
                             return div()
@@ -5009,25 +5492,49 @@ impl SameAppView {
                                 .v_flex()
                                 .flex_1()
                                 .min_w_0()
-                                .child(div().truncate().child(self.session_title(s)))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .child(format!("{}{wd_badge}", self.session_title(s))),
+                                )
                                 .child(
                                     div()
                                         .text_xs()
                                         .truncate()
                                         .text_color(theme.muted_foreground)
-                                        .child(if waiting {
+                                        .child(if waiting_perm {
                                             t(lang, "承認待ち", "Needs approval").to_string()
+                                        } else if waiting_input {
+                                            t(lang, "質問待ち", "Needs input").to_string()
                                         } else if running {
-                                            t(lang, "応答中…", "Responding…").to_string()
-                                        } else {
                                             format!(
                                                 "{} · {}",
+                                                t(lang, "応答中…", "Responding…"),
+                                                self.provider_name(&s.provider_id)
+                                            )
+                                        } else {
+                                            format!(
+                                                "{}{model_tag} · {}",
                                                 self.provider_name(&s.provider_id),
                                                 rel_time(s.updated_at, lang)
                                             )
                                         }),
                                 ),
                         )
+                        .when(running, |el| {
+                            el.child(
+                                Button::new(SharedString::from(format!("stop-sess-{}", s.id)))
+                                    .xsmall()
+                                    .ghost()
+                                    .tooltip(t(lang, "このセッションを停止", "Stop session"))
+                                    .label("■")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.cancel_session_by_id(sid_stop.clone());
+                                        cx.notify();
+                                    })),
+                            )
+                        })
                         .child(self.delete_button(
                             format!("del-sess-{}", s.id),
                             format!("sess:{}", s.id),
@@ -6113,6 +6620,115 @@ impl SameAppView {
             }
         };
 
+        let max_concurrent = self.config.max_concurrent_sessions();
+        let concurrency_label = match max_concurrent {
+            Some(n) => format!("{n}"),
+            None => t(lang, "無制限", "Unlimited").to_string(),
+        };
+        let concurrency_control = div()
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("set-concurrency-unlimited")
+                    .small()
+                    .label(t(lang, "無制限", "Unlimited"))
+                    .toggled(max_concurrent.is_none())
+                    .when(max_concurrent.is_none(), |b| b.primary())
+                    .when(max_concurrent.is_some(), |b| b.ghost())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.config.max_concurrent_sessions = None;
+                        this.agent_manager.set_max_concurrent_sessions(None);
+                        this.save_config();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("set-concurrency-dec")
+                    .small()
+                    .ghost()
+                    .disabled(max_concurrent.is_none())
+                    .label("−")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let next = match this.config.max_concurrent_sessions() {
+                            Some(n) if n > MIN_CONCURRENT_SESSIONS => Some(n - 1),
+                            _ => None,
+                        };
+                        this.config.max_concurrent_sessions = next;
+                        this.agent_manager.set_max_concurrent_sessions(next);
+                        this.save_config();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(concurrency_label),
+            )
+            .child(
+                Button::new("set-concurrency-inc")
+                    .small()
+                    .ghost()
+                    .disabled(max_concurrent.is_some_and(|n| n >= MAX_CONCURRENT_SESSIONS))
+                    .label("+")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let next = match this.config.max_concurrent_sessions() {
+                            None => Some(4),
+                            Some(n) => Some((n + 1).min(MAX_CONCURRENT_SESSIONS)),
+                        };
+                        this.config.max_concurrent_sessions = next;
+                        this.agent_manager.set_max_concurrent_sessions(next);
+                        this.save_config();
+                        cx.notify();
+                    })),
+            );
+
+        let default_handoff = self.config.default_handoff_mode;
+        let handoff_control = div()
+            .h_flex()
+            .gap_1()
+            .flex_wrap()
+            .children(HandoffMode::ALL.map(|mode| {
+                Button::new(SharedString::from(format!(
+                    "set-default-handoff-{}",
+                    mode.as_str()
+                )))
+                .small()
+                .label(parallel::handoff_mode_label(lang, mode))
+                .toggled(default_handoff == mode)
+                .when(default_handoff == mode, |b| b.primary())
+                .when(default_handoff != mode, |b| b.ghost())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.config.default_handoff_mode = mode;
+                    this.save_config();
+                    cx.notify();
+                }))
+            }));
+
+        let default_workdir = self.config.default_workdir_mode;
+        let workdir_control = div()
+            .h_flex()
+            .gap_1()
+            .flex_wrap()
+            .children(WorkdirMode::ALL.map(|mode| {
+                Button::new(SharedString::from(format!(
+                    "set-default-workdir-{}",
+                    mode.as_str()
+                )))
+                .small()
+                .label(parallel::workdir_mode_label(lang, mode))
+                .toggled(default_workdir == mode)
+                .when(default_workdir == mode, |b| b.primary())
+                .when(default_workdir != mode, |b| b.ghost())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.config.default_workdir_mode = mode;
+                    this.save_config();
+                    cx.notify();
+                }))
+            }));
+
         div()
             .v_flex()
             .gap_4()
@@ -6172,6 +6788,39 @@ impl SameAppView {
                             "While the window is in the background, OS notifications for approvals, questions and finished replies",
                         ),
                         notifications_control,
+                        false,
+                        &theme,
+                    ))
+                    .child(settings_row(
+                        t(lang, "並列実行数の上限", "Max concurrent sessions"),
+                        t(
+                            lang,
+                            "同時に実行できるセッション数の上限（既定は無制限、必要時のみ 1〜16 で設定）",
+                            "Optional cap on concurrently running sessions (unlimited by default, or 1–16)",
+                        ),
+                        concurrency_control,
+                        false,
+                        &theme,
+                    ))
+                    .child(settings_row(
+                        t(lang, "既定のコンテキスト引き継ぎ", "Default context handoff"),
+                        t(
+                            lang,
+                            "別プロバイダへ切り替える際の既定の引き継ぎ方式",
+                            "Default strategy when handing off context to another provider",
+                        ),
+                        handoff_control,
+                        false,
+                        &theme,
+                    ))
+                    .child(settings_row(
+                        t(lang, "新規セッションの既定の作業環境", "Default working environment"),
+                        t(
+                            lang,
+                            "新しいセッション作成時の作業環境（分離は Git リポジトリのみ自動作成、非 Git では共有を使用）",
+                            "Working environment for new sessions (Isolated auto-creates a worktree in Git repos, falls back to Shared otherwise)",
+                        ),
+                        workdir_control,
                         false,
                         &theme,
                     )),
@@ -7056,6 +7705,7 @@ impl SameAppView {
                             .items_center()
                             .gap_1()
                             .flex_shrink_0()
+                            .child(self.render_workdir_header_menu(session, running, cx))
                             .child({
                                 let active_n = self.skills_ui.resolution.active_skills.len();
                                 let ext_n = self.skills_ui.external_skills.len();
@@ -7270,7 +7920,7 @@ impl SameAppView {
                                         let pid3 = pid2.clone();
                                         let sid3 = sid2.clone();
                                         let _ = v.update(cx, |this, cx| {
-                                            this.switch_session_provider(&sid3, &pid3);
+                                            this.request_provider_switch(&sid3, &pid3);
                                             cx.notify();
                                         });
                                     }),
@@ -7980,6 +8630,15 @@ impl SameAppView {
             .h_full()
             .bg(theme.background)
             .child(self.render_chat_header(&session, running, cx))
+            .when_some(self.render_background_alerts_banner(cx), |el, banner| {
+                el.child(banner)
+            })
+            .when_some(self.render_worktree_confirm_banner(cx), |el, banner| {
+                el.child(banner)
+            })
+            .when_some(self.render_provider_switch_confirm(cx), |el, card| {
+                el.child(card)
+            })
             .when_some(provider_issue, |el, banner| {
                 el.child(
                     div()
