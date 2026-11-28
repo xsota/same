@@ -51,7 +51,10 @@ fn sorted_entries(dir: &Path) -> Vec<(fs::DirEntry, bool)> {
         })
         .collect();
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
-    entries.into_iter().map(|(e, is_dir, _)| (e, is_dir)).collect()
+    entries
+        .into_iter()
+        .map(|(e, is_dir, _)| (e, is_dir))
+        .collect()
 }
 
 fn rel_of(root: &Path, path: &Path) -> String {

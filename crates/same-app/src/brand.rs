@@ -13,10 +13,7 @@ fn svg(cell: &'static OnceLock<Arc<Image>>, bytes: &'static [u8]) -> Arc<Image> 
 
 pub fn shark_egg() -> Arc<Image> {
     static CELL: OnceLock<Arc<Image>> = OnceLock::new();
-    svg(
-        &CELL,
-        include_bytes!("../../../assets/brand/shark-egg.svg"),
-    )
+    svg(&CELL, include_bytes!("../../../assets/brand/shark-egg.svg"))
 }
 
 /// The window icon for X11 (Windows uses the icon embedded in the exe;

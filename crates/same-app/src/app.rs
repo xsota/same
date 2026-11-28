@@ -43,9 +43,9 @@ use same_agent::{
 };
 use same_core::paths::simplify_path;
 use same_core::{
-    AgentRun, AgentRunStatus, AppConfig, AppPaths, ApprovalMode, ColorTheme,
-    ContextEnvironment, ContextManager, EventBus, ExecMode, HandoffMode, HandoffRequest, Language,
-    Message, MessageRole, ModelInfo, PermissionRequest, Project, ProviderConfig, ProviderKind,
+    AgentRun, AgentRunStatus, AppConfig, AppPaths, ApprovalMode, ColorTheme, ContextEnvironment,
+    ContextManager, EventBus, ExecMode, HandoffMode, HandoffRequest, Language, Message,
+    MessageRole, ModelInfo, PermissionRequest, Project, ProviderConfig, ProviderKind,
     ProviderSession, ProviderSessionStatus, Quest, SameEvent, Session, SessionStatus,
     SessionWorkdir, SlashCommandInfo, Storage, SubmitKey, ThemeMode, ToolCallRecord,
     ToolCallStatus, WorkdirMode, Workspace, MAX_CONCURRENT_SESSIONS, MAX_FONT_SIZE,
@@ -2026,8 +2026,8 @@ impl SameAppView {
         let tx = self.ui_tx.clone();
         self.rt.spawn_blocking(move || {
             let git_info = load_git_info(&root);
-            let worktrees = project_workdir
-                .map(|pw| same_core::list_worktrees(&pw).unwrap_or_default());
+            let worktrees =
+                project_workdir.map(|pw| same_core::list_worktrees(&pw).unwrap_or_default());
             let _ = tx.send(UiAsyncMsg::WorkspaceGitLoaded {
                 generation,
                 root,
@@ -5596,54 +5596,56 @@ impl SameAppView {
                             let selected =
                                 self.selected_quest_filter.as_deref() == Some(q.id.as_str());
                             let count = quest_counts.get(q.id.as_str()).copied().unwrap_or(0);
-                        list_row(
-                            SharedString::from(format!("quest-{}", q.id)),
-                            selected,
-                            &theme,
-                        )
-                        .group("row")
-                        .child(div().text_xs().child("🎯"))
-                        .child(div().flex_1().min_w_0().truncate().child(q.title.clone()))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(count.to_string()),
-                        )
-                        .child(self.delete_button(
-                            format!("del-quest-{}", q.id),
-                            format!("quest:{}", q.id),
-                            &theme,
-                            move |this, _, _| {
-                                let _ = this.storage.delete_quest(&qid_del);
-                                this.quests.retain(|q| q.id != qid_del);
-                                for s in this.sessions.iter_mut() {
-                                    if s.quest_id.as_deref() == Some(qid_del.as_str()) {
-                                        s.quest_id = None;
+                            list_row(
+                                SharedString::from(format!("quest-{}", q.id)),
+                                selected,
+                                &theme,
+                            )
+                            .group("row")
+                            .child(div().text_xs().child("🎯"))
+                            .child(div().flex_1().min_w_0().truncate().child(q.title.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(count.to_string()),
+                            )
+                            .child(self.delete_button(
+                                format!("del-quest-{}", q.id),
+                                format!("quest:{}", q.id),
+                                &theme,
+                                move |this, _, _| {
+                                    let _ = this.storage.delete_quest(&qid_del);
+                                    this.quests.retain(|q| q.id != qid_del);
+                                    for s in this.sessions.iter_mut() {
+                                        if s.quest_id.as_deref() == Some(qid_del.as_str()) {
+                                            s.quest_id = None;
+                                        }
                                     }
-                                }
-                                if this.selected_quest_filter.as_deref() == Some(qid_del.as_str()) {
-                                    this.selected_quest_filter = None;
-                                }
-                            },
-                            cx,
-                        ))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.selected_quest_filter = Some(qid.clone());
-                                this.active_view = MainView::Chat;
-                                // Jump to the quest's most recent session.
-                                let first = this
-                                    .sessions
-                                    .iter()
-                                    .find(|s| s.quest_id.as_deref() == Some(qid.as_str()))
-                                    .map(|s| s.id.clone());
-                                if let Some(sid) = first {
-                                    this.select_session(sid, window, cx);
-                                }
-                                cx.notify();
-                            },
-                        ))
+                                    if this.selected_quest_filter.as_deref()
+                                        == Some(qid_del.as_str())
+                                    {
+                                        this.selected_quest_filter = None;
+                                    }
+                                },
+                                cx,
+                            ))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.selected_quest_filter = Some(qid.clone());
+                                    this.active_view = MainView::Chat;
+                                    // Jump to the quest's most recent session.
+                                    let first = this
+                                        .sessions
+                                        .iter()
+                                        .find(|s| s.quest_id.as_deref() == Some(qid.as_str()))
+                                        .map(|s| s.id.clone());
+                                    if let Some(sid) = first {
+                                        this.select_session(sid, window, cx);
+                                    }
+                                    cx.notify();
+                                },
+                            ))
                         })
                     }),
             )
@@ -9503,7 +9505,10 @@ impl SameAppView {
                 } else if let Some(state) = self.tracked_markdown_state(msg, is_live) {
                     TextView::new(state)
                 } else {
-                    TextView::markdown(SharedString::from(format!("md-{}", msg.id)), body.to_string())
+                    TextView::markdown(
+                        SharedString::from(format!("md-{}", msg.id)),
+                        body.to_string(),
+                    )
                 };
                 el.child(div().text_sm().child(text_view.selectable(true)))
             })
@@ -9754,7 +9759,8 @@ impl SameAppView {
             .when(expanded, |el| {
                 let section = |label: &str, text: &str, id: String| {
                     let mut chars = text.chars();
-                    let mut preview: String = chars.by_ref().take(TOOL_OUTPUT_PREVIEW_CHARS).collect();
+                    let mut preview: String =
+                        chars.by_ref().take(TOOL_OUTPUT_PREVIEW_CHARS).collect();
                     if chars.next().is_some() {
                         let remaining = 1 + chars.count();
                         preview.push_str(&match lang {
@@ -10268,54 +10274,53 @@ impl SameAppView {
                             " "
                         };
                         list_row(row_id, selected, &theme)
-                        .py(px(2.0))
-                        .text_xs()
-                        .pl(px(8.0 + entry.depth as f32 * 14.0))
-                        .child(
-                            div()
-                                .w(px(10.0))
-                                .flex_shrink_0()
-                                .text_color(theme.muted_foreground)
-                                .child(icon),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .when(is_dir, |d| d.font_weight(FontWeight::SEMIBOLD))
-                                .child(name),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if is_dir {
-                                if !this.expanded_dirs.remove(&path) {
-                                    this.expanded_dirs.insert(path.clone());
+                            .py(px(2.0))
+                            .text_xs()
+                            .pl(px(8.0 + entry.depth as f32 * 14.0))
+                            .child(
+                                div()
+                                    .w(px(10.0))
+                                    .flex_shrink_0()
+                                    .text_color(theme.muted_foreground)
+                                    .child(icon),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .when(is_dir, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                    .child(name),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if is_dir {
+                                    if !this.expanded_dirs.remove(&path) {
+                                        this.expanded_dirs.insert(path.clone());
+                                    }
+                                    this.reload_workspace_files_only(cx);
+                                } else {
+                                    this.open_file(path.clone(), window, cx);
                                 }
-                                this.reload_workspace_files_only(cx);
-                            } else {
-                                this.open_file(path.clone(), window, cx);
-                            }
-                            cx.notify();
-                        }))
-                        .context_menu(move |menu, _, _| {
-                            let reveal_path = menu_path.clone();
-                            let copy_path = menu_path.clone();
-                            menu.item(
-                                PopupMenuItem::new(reveal_in_file_manager_label(lang, is_dir))
-                                    .on_click(move |_, _, _| {
-                                        reveal_in_file_manager(&reveal_path, is_dir);
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new(t(lang, "パスをコピー", "Copy Path")).on_click(
-                                    move |_, _, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy_path.to_string_lossy().to_string(),
-                                        ));
-                                    },
-                                ),
-                            )
-                        })
+                                cx.notify();
+                            }))
+                            .context_menu(move |menu, _, _| {
+                                let reveal_path = menu_path.clone();
+                                let copy_path = menu_path.clone();
+                                menu.item(
+                                    PopupMenuItem::new(reveal_in_file_manager_label(lang, is_dir))
+                                        .on_click(move |_, _, _| {
+                                            reveal_in_file_manager(&reveal_path, is_dir);
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new(t(lang, "パスをコピー", "Copy Path"))
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy_path.to_string_lossy().to_string(),
+                                            ));
+                                        }),
+                                )
+                            })
                     }));
                 if let Some(workdir) = root_workdir {
                     tree.context_menu(move |menu, _, _| {
