@@ -7125,7 +7125,7 @@ impl SameAppView {
             .gap_4()
             .px_4()
             .py_4()
-            .child(gpui::img(crate::brand::mascot()).size(px(64.0)))
+            .child(gpui::img(crate::brand::shark_egg()).size(px(64.0)))
             .child(
                 div()
                     .v_flex()
@@ -8796,7 +8796,7 @@ impl SameAppView {
                 .items_center()
                 .gap_3()
                 .bg(theme.background)
-                .child(gpui::img(crate::brand::mascot()).size(px(112.0)))
+                .child(gpui::img(crate::brand::shark_egg()).size(px(112.0)))
                 .child(
                     div()
                         .text_2xl()
@@ -9196,7 +9196,7 @@ impl SameAppView {
                         .justify_center()
                         .py_12()
                         .gap_2()
-                        .child(gpui::img(crate::brand::mascot()).size(px(96.0)))
+                        .child(gpui::img(crate::brand::shark_egg()).size(px(96.0)))
                         .child(
                             div()
                                 .text_2xl()
@@ -9549,7 +9549,7 @@ impl SameAppView {
                         .items_center()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(crate::brand::mascot_loader(
+                        .child(crate::brand::shark_egg_loader(
                             SharedString::from(format!("loader-{}", msg.id)),
                             if idle { 36.0 } else { 18.0 },
                             theme.foreground,
@@ -10616,7 +10616,7 @@ impl SameAppView {
                             .items_center()
                             .gap_2()
                             .flex_shrink_0()
-                            .child(gpui::img(crate::brand::mascot()).size(px(22.0)))
+                            .child(gpui::img(crate::brand::shark_egg()).size(px(22.0)))
                             .child(
                                 div()
                                     .text_sm()

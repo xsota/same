@@ -1,6 +1,6 @@
-//! SAME's icon and mascot, embedded from `assets/brand`.
+//! SAME's icon and mascot (Shark Egg), embedded from `assets/brand`.
 //!
-//! In the app the transparent mascot is used; the icon with its background
+//! In the app the transparent Shark Egg is used; the icon with its background
 //! tile is embedded in the executable (see `build.rs`).
 
 use gpui::{Image, ImageFormat};
@@ -11,11 +11,11 @@ fn svg(cell: &'static OnceLock<Arc<Image>>, bytes: &'static [u8]) -> Arc<Image> 
         .clone()
 }
 
-pub fn mascot() -> Arc<Image> {
+pub fn shark_egg() -> Arc<Image> {
     static CELL: OnceLock<Arc<Image>> = OnceLock::new();
     svg(
         &CELL,
-        include_bytes!("../../../assets/brand/same-mascot.svg"),
+        include_bytes!("../../../assets/brand/shark-egg.svg"),
     )
 }
 
@@ -28,14 +28,14 @@ pub fn window_icon() -> Option<Arc<image::RgbaImage>> {
         .map(|img| Arc::new(img.into_rgba8()))
 }
 
-/// The mascot hopping in place: the loading indicator.
+/// Shark Egg hopping in place: the loading indicator.
 ///
 /// One hop per cycle with a gravity-like arc, a squash on landing and a
-/// ground shadow that shrinks while it is in the air. `size` is the mascot's
+/// ground shadow that shrinks while it is in the air. `size` is Shark Egg's
 /// width; the element is `size` wide and a little taller, to leave room for
 /// the hop. `shadow` is the shadow's color (e.g. the theme's foreground, so
 /// it shows on dark and light backgrounds alike).
-pub fn mascot_loader(
+pub fn shark_egg_loader(
     id: impl Into<gpui::ElementId>,
     size: f32,
     shadow: gpui::Hsla,
@@ -56,8 +56,8 @@ pub fn mascot_loader(
     // Squash while touching down (the start and end of each cycle).
     let squash = move |t: f32| (1.0 - hop(t) * 4.0).max(0.0) * 0.14;
 
-    let mascot = img(mascot()).object_fit(ObjectFit::Fill).with_animation(
-        "mascot",
+    let shark_egg = img(shark_egg()).object_fit(ObjectFit::Fill).with_animation(
+        "shark-egg",
         Animation::new(period).repeat_synced(),
         move |el, t| {
             let s = squash(t);
@@ -98,6 +98,6 @@ pub fn mascot_loader(
         .w(px(size))
         .h(px(height))
         .child(shadow)
-        .child(mascot)
+        .child(shark_egg)
         .into_any_element()
 }

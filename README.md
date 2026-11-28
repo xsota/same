@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/brand/same-mascot.svg" alt="SAME mascot" width="160">
+  <img src="assets/brand/shark-egg.svg" alt="Shark Egg" width="160">
 </p>
 
 # SAME (Shared Agentic Multi-provider Environment)
@@ -120,4 +120,6 @@ cargo test --workspace
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+The source code is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
+**Exception:** The brand assets and the mascot character **Shark Egg** in [`assets/brand/`](assets/brand/) are **All Rights Reserved** (`Copyright (c) 2026 xsota`) and are not covered by the MIT or Apache-2.0 license. Non-commercial fan art and referencing/showcasing SAME are permitted; see [`assets/brand/LICENSE`](assets/brand/LICENSE) for details.

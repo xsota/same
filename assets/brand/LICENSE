@@ -1,0 +1,20 @@
+Copyright (c) 2026 xsota. All Rights Reserved.
+
+The brand assets in this directory — including the mascot character "Shark Egg",
+app icons, favicons, and any derivative raster or vector exports — are NOT
+covered by the MIT or Apache-2.0 license that applies to the SAME source code.
+
+Permitted uses (without prior written permission):
+- Building and distributing unmodified releases or packages of SAME.
+- Referencing or showcasing SAME in articles, blog posts, documentation,
+  presentations, videos, or social media posts.
+- Creating and sharing non-commercial fan art featuring Shark Egg.
+
+Not permitted (without prior written permission from xsota):
+- Using Shark Egg, the SAME icons, or other assets in this directory as the
+  logo, icon, or mascot of a fork, derivative application, or another project
+  (please replace the assets in `assets/brand/` if you distribute a fork).
+- Commercial use, including merchandise, paid products, or advertising.
+- Claiming or implying official endorsement by SAME or xsota.
+
+For any other use, please contact xsota for written permission.
