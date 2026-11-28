@@ -273,10 +273,12 @@ impl SkillSynchronizer {
             .filter(|(name, _)| !active_names.contains(name.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let mut manifest_dirty = !manifest_path.is_file();
         for (name, prev_hash) in stale {
             let dir = skills_root.join(&name);
             if !dir.exists() {
                 manifest.skills.remove(&name);
+                manifest_dirty = true;
                 continue;
             }
             if dir.is_dir() {
@@ -297,12 +299,15 @@ impl SkillSynchronizer {
                     format!("Failed to remove stale staged skill {}", dir.display())
                 })?;
                 manifest.skills.remove(&name);
-                let _ = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
+                manifest_dirty =
+                    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?).is_err();
             }
         }
 
         let mut combined_hasher = Sha256::new();
         let now = Utc::now();
+        let mut deployments_to_upsert =
+            Vec::with_capacity(resolution.active_skills.len() + resolution.entries.len());
 
         for skill in &resolution.active_skills {
             let src_dir = Path::new(&skill.path);
@@ -337,14 +342,18 @@ impl SkillSynchronizer {
                         manifest
                             .skills
                             .insert(skill.name.clone(), current_src_hash.clone());
-                        let _ = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
+                        manifest_dirty =
+                            fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+                                .is_err();
                     } else if existing_hash != *prev {
                         // Unchanged staged content whose manifest entry used the legacy hash format:
                         // migrate the manifest entry to the current hash format.
                         manifest
                             .skills
                             .insert(skill.name.clone(), current_src_hash.clone());
-                        let _ = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
+                        manifest_dirty =
+                            fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+                                .is_err();
                     }
                 } else {
                     // Unmanaged directory at target path: treat as conflict and never
@@ -367,7 +376,8 @@ impl SkillSynchronizer {
                 manifest
                     .skills
                     .insert(skill.name.clone(), current_src_hash.clone());
-                let _ = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?);
+                manifest_dirty =
+                    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?).is_err();
             }
 
             if status == SkillDeploymentStatus::Synced {
@@ -378,7 +388,7 @@ impl SkillSynchronizer {
             combined_hasher.update(current_src_hash.as_bytes());
             combined_hasher.update(b"\n");
 
-            self.storage.upsert_skill_deployment(&SkillDeployment {
+            deployments_to_upsert.push(SkillDeployment {
                 skill_id: skill.id.clone(),
                 provider_id: provider.id.clone(),
                 project_id: project_db_key.to_string(),
@@ -389,7 +399,7 @@ impl SkillSynchronizer {
                 status,
                 last_error,
                 last_synced_at: Some(now),
-            })?;
+            });
         }
 
         // Record disabled/shadowed skills so the UI shows accurate status.
@@ -402,7 +412,7 @@ impl SkillSynchronizer {
             {
                 continue;
             }
-            self.storage.upsert_skill_deployment(&SkillDeployment {
+            deployments_to_upsert.push(SkillDeployment {
                 skill_id: entry.skill.id.clone(),
                 provider_id: provider.id.clone(),
                 project_id: project_db_key.to_string(),
@@ -413,8 +423,11 @@ impl SkillSynchronizer {
                 status: SkillDeploymentStatus::Disabled,
                 last_error: None,
                 last_synced_at: Some(now),
-            })?;
+            });
         }
+
+        self.storage
+            .upsert_skill_deployments_batch(&deployments_to_upsert)?;
 
         // Ensure Claude Code plugin manifest exists when using ClaudePluginDir.
         if method == SkillDeploymentMethod::ClaudePluginDir {
@@ -431,7 +444,9 @@ impl SkillSynchronizer {
             }
         }
 
-        fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+        if manifest_dirty {
+            fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+        }
 
         let deployment_hash = combined_hasher.finalize_hex();
         let target_staging_root = target.to_target_path(staging_root);
