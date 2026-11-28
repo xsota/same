@@ -145,16 +145,39 @@ pub fn unique_worktree_branch(repo_dir: &Path, base_slug: &str) -> String {
         .unwrap_or_default()
         .into_iter()
         .collect();
-    if !existing.contains(base_slug) && !default_worktree_path(repo_dir, base_slug).exists() {
+    let root = repo_root(repo_dir).unwrap_or_else(|| repo_dir.to_path_buf());
+    if !existing.contains(base_slug) && !worktree_path_for_root(&root, base_slug).exists() {
         return base_slug.to_string();
     }
     for n in 2..1000 {
         let candidate = format!("{base_slug}-{n}");
-        if !existing.contains(&candidate) && !default_worktree_path(repo_dir, &candidate).exists() {
+        if !existing.contains(&candidate) && !worktree_path_for_root(&root, &candidate).exists() {
             return candidate;
         }
     }
     format!("{base_slug}-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn worktree_path_for_root(root: &Path, branch_slug: &str) -> PathBuf {
+    let repo_name = root
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string());
+    let sanitized: String = branch_slug
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let parent = root.parent().unwrap_or(root);
+    parent
+        .join(".same-worktrees")
+        .join(repo_name)
+        .join(sanitized)
 }
 
 /// Resolves the Git repository top-level directory for `dir`, if any.
@@ -179,25 +202,7 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
 /// (even when `repo_dir` is a subdirectory of the repository).
 pub fn default_worktree_path(repo_dir: &Path, branch_slug: &str) -> PathBuf {
     let root = repo_root(repo_dir).unwrap_or_else(|| repo_dir.to_path_buf());
-    let repo_name = root
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "repo".to_string());
-    let sanitized: String = branch_slug
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let parent = root.parent().unwrap_or(&root);
-    parent
-        .join(".same-worktrees")
-        .join(repo_name)
-        .join(sanitized)
+    worktree_path_for_root(&root, branch_slug)
 }
 
 /// Creates a new Git worktree at `worktree_path` on a new branch `branch_name`

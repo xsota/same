@@ -24,6 +24,10 @@ impl Storage {
             .with_context(|| format!("Failed to open SQLite DB at {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -16000;
              PRAGMA foreign_keys = ON;",
         )?;
         let storage = Self {
@@ -238,6 +242,15 @@ impl Storage {
                 is_worktree INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_active
+                ON sessions(archived, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_sessions_project_list
+                ON sessions(project_id, archived, pinned DESC, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_session_workdirs_path
+                ON session_workdirs(path);
+            CREATE INDEX IF NOT EXISTS idx_skill_deployments_target
+                ON skill_deployments(provider_id, project_id, execution_target);
             ",
         )?;
 
@@ -708,38 +721,48 @@ impl Storage {
         external_session_id: Option<Option<&str>>,
         status: Option<SessionStatus>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        if title.is_none()
+            && provider_id.is_none()
+            && model.is_none()
+            && external_session_id.is_none()
+            && status.is_none()
+        {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let now = Utc::now().to_rfc3339();
         if let Some(t) = title {
-            conn.execute(
+            tx.execute(
                 "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
                 params![t, now, session_id],
             )?;
         }
         if let Some(p) = provider_id {
-            conn.execute(
+            tx.execute(
                 "UPDATE sessions SET provider_id = ?1, updated_at = ?2 WHERE id = ?3",
                 params![p, now, session_id],
             )?;
         }
         if let Some(m) = model {
-            conn.execute(
+            tx.execute(
                 "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
                 params![m, now, session_id],
             )?;
         }
         if let Some(ext) = external_session_id {
-            conn.execute(
+            tx.execute(
                 "UPDATE sessions SET external_session_id = ?1, updated_at = ?2 WHERE id = ?3",
                 params![ext, now, session_id],
             )?;
         }
         if let Some(st) = status {
-            conn.execute(
+            tx.execute(
                 "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
                 params![st.as_str(), now, session_id],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1116,6 +1139,32 @@ impl Storage {
         .map_err(Into::into)
     }
 
+    pub fn list_session_workdirs_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<SessionWorkdir>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT w.session_id, w.mode, w.path, w.base_branch, w.branch_name, w.is_worktree, w.created_at
+             FROM session_workdirs w
+             JOIN sessions s ON s.id = w.session_id
+             WHERE s.project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |r| {
+            Ok(SessionWorkdir {
+                session_id: r.get(0)?,
+                mode: WorkdirMode::parse(&r.get::<_, String>(1)?).unwrap_or_default(),
+                path: crate::paths::simplify_path(&r.get::<_, String>(2)?),
+                base_branch: r.get(3)?,
+                branch_name: r.get(4)?,
+                is_worktree: r.get::<_, i64>(5)? != 0,
+                created_at: parse_dt(r.get::<_, String>(6)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn delete_session_workdir(&self, session_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1142,9 +1191,10 @@ impl Storage {
     }
 
     pub fn append_message(&self, msg: &Message) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let tools_json = serde_json::to_string(&msg.tool_calls)?;
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO messages (id, session_id, role, content, thinking, tool_calls_json, provider_id, model, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -1159,10 +1209,11 @@ impl Storage {
                 msg.created_at.to_rfc3339(),
             ],
         )?;
-        conn.execute(
+        tx.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
             params![Utc::now().to_rfc3339(), msg.session_id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1349,33 +1400,46 @@ impl Storage {
     }
 
     pub fn upsert_skill_deployment(&self, dep: &SkillDeployment) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO skill_deployments (
-                skill_id, provider_id, project_id, execution_target,
-                deployment_path, deployment_method, deployed_hash,
-                status, last_error, last_synced_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(skill_id, provider_id, project_id, execution_target) DO UPDATE SET
-                deployment_path = excluded.deployment_path,
-                deployment_method = excluded.deployment_method,
-                deployed_hash = excluded.deployed_hash,
-                status = excluded.status,
-                last_error = excluded.last_error,
-                last_synced_at = excluded.last_synced_at",
-            params![
-                dep.skill_id,
-                dep.provider_id,
-                dep.project_id,
-                dep.execution_target,
-                dep.deployment_path,
-                dep.deployment_method.as_str(),
-                dep.deployed_hash,
-                dep.status.as_str(),
-                dep.last_error,
-                dep.last_synced_at.map(|d| d.to_rfc3339()),
-            ],
-        )?;
+        self.upsert_skill_deployments_batch(std::slice::from_ref(dep))
+    }
+
+    pub fn upsert_skill_deployments_batch(&self, deps: &[SkillDeployment]) -> Result<()> {
+        if deps.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO skill_deployments (
+                    skill_id, provider_id, project_id, execution_target,
+                    deployment_path, deployment_method, deployed_hash,
+                    status, last_error, last_synced_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(skill_id, provider_id, project_id, execution_target) DO UPDATE SET
+                    deployment_path = excluded.deployment_path,
+                    deployment_method = excluded.deployment_method,
+                    deployed_hash = excluded.deployed_hash,
+                    status = excluded.status,
+                    last_error = excluded.last_error,
+                    last_synced_at = excluded.last_synced_at",
+            )?;
+            for dep in deps {
+                stmt.execute(params![
+                    dep.skill_id,
+                    dep.provider_id,
+                    dep.project_id,
+                    dep.execution_target,
+                    dep.deployment_path,
+                    dep.deployment_method.as_str(),
+                    dep.deployed_hash,
+                    dep.status.as_str(),
+                    dep.last_error,
+                    dep.last_synced_at.map(|d| d.to_rfc3339()),
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
